@@ -85,7 +85,15 @@ nginx -t
 systemctl restart ratscan
 systemctl reload nginx
 
-curl --fail --silent --show-error http://127.0.0.1/health >/dev/null
+for attempt in 1 2 3 4 5; do
+    if curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null; then
+        break
+    fi
+    if [ "$attempt" -eq 5 ]; then
+        exit 1
+    fi
+    sleep 1
+done
 
 ROLLBACK_NEEDED=0
 echo "RatScan updated successfully."
