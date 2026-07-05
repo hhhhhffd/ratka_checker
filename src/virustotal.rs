@@ -6,13 +6,29 @@ use serde::Deserialize;
 use crate::{
     config::VirusTotalConfig,
     models::scan::{
-        VirusTotalEngineResult, VirusTotalReport, VirusTotalSource, VirusTotalStats,
-        VirusTotalStatus,
+        Finding, Severity, VirusTotalEngineResult, VirusTotalReport, VirusTotalSource,
+        VirusTotalStats, VirusTotalStatus,
     },
 };
 
 const API_BASE_URL: &str = "https://www.virustotal.com/api/v3";
 const FLAGGED_CATEGORIES: &[&str] = &["malicious", "suspicious"];
+const TRUSTED_ENGINES: &[&str] = &[
+    "BitDefender",
+    "ESET-NOD32",
+    "Emsisoft",
+    "F-Secure",
+    "Fortinet",
+    "Kaspersky",
+    "Malwarebytes",
+    "Microsoft",
+    "Sophos",
+    "Symantec",
+    "TrendMicro",
+    "TrendMicro-HouseCall",
+    "Webroot",
+    "Windows Defender",
+];
 
 /// Looks up a file by sha256 and uploads it only when VirusTotal has no existing report.
 pub async fn analyze_file(
@@ -64,6 +80,77 @@ pub fn error_report(message: String) -> VirusTotalReport {
         permalink: None,
         error: Some(message),
     }
+}
+
+/// Converts a completed VirusTotal report into weighted findings for the main risk score.
+pub fn findings_for_report(report: &VirusTotalReport) -> Vec<Finding> {
+    if report.status != VirusTotalStatus::Completed {
+        return Vec::new();
+    }
+
+    let malicious_engines = report
+        .flagged_engines
+        .iter()
+        .filter(|engine| engine.category == "malicious")
+        .collect::<Vec<_>>();
+    let trusted_malicious = malicious_engines
+        .iter()
+        .copied()
+        .filter(|engine| is_trusted_engine(&engine.engine_name))
+        .collect::<Vec<_>>();
+
+    if !trusted_malicious.is_empty() {
+        return vec![Finding {
+            rule_id: "VT_TRUSTED_MALICIOUS_ENGINE".to_owned(),
+            category: "virustotal".to_owned(),
+            severity: Severity::Critical,
+            message: format!(
+                "VirusTotal: trusted engine detected malware: {}",
+                engine_summary(&trusted_malicious)
+            ),
+        }];
+    }
+
+    if malicious_engines.len() >= 3 {
+        return vec![Finding {
+            rule_id: "VT_MULTIPLE_MALICIOUS_ENGINES".to_owned(),
+            category: "virustotal".to_owned(),
+            severity: Severity::High,
+            message: format!(
+                "VirusTotal: {} engines detected malware: {}",
+                malicious_engines.len(),
+                engine_summary(&malicious_engines)
+            ),
+        }];
+    }
+
+    if !malicious_engines.is_empty() {
+        return vec![Finding {
+            rule_id: "VT_SINGLE_MALICIOUS_ENGINE".to_owned(),
+            category: "virustotal".to_owned(),
+            severity: Severity::Medium,
+            message: format!(
+                "VirusTotal: single engine detected malware: {}",
+                engine_summary(&malicious_engines)
+            ),
+        }];
+    }
+
+    let suspicious_count = report
+        .flagged_engines
+        .iter()
+        .filter(|engine| engine.category == "suspicious")
+        .count();
+    if suspicious_count > 0 {
+        return vec![Finding {
+            rule_id: "VT_SUSPICIOUS_ENGINES".to_owned(),
+            category: "virustotal".to_owned(),
+            severity: Severity::Low,
+            message: format!("VirusTotal: {suspicious_count} engines marked file suspicious"),
+        }];
+    }
+
+    Vec::new()
 }
 
 enum LookupResult {
@@ -194,6 +281,24 @@ fn flagged_engines(
     engines
 }
 
+fn is_trusted_engine(engine_name: &str) -> bool {
+    TRUSTED_ENGINES
+        .iter()
+        .any(|trusted| engine_name.eq_ignore_ascii_case(trusted))
+}
+
+fn engine_summary(engines: &[&VirusTotalEngineResult]) -> String {
+    engines
+        .iter()
+        .take(5)
+        .map(|engine| match &engine.result {
+            Some(result) => format!("{} ({result})", engine.engine_name),
+            None => engine.engine_name.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[derive(Debug, Deserialize)]
 struct VirusTotalData<T> {
     data: T,
@@ -248,4 +353,50 @@ struct VirusTotalRawEngineResult {
     #[serde(default)]
     category: String,
     result: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::scan::{VirusTotalSource, VirusTotalStatus};
+
+    use super::*;
+
+    #[test]
+    fn trusted_malicious_engine_becomes_critical_finding() {
+        let report = VirusTotalReport {
+            status: VirusTotalStatus::Completed,
+            source: VirusTotalSource::Lookup,
+            stats: None,
+            flagged_engines: vec![VirusTotalEngineResult {
+                engine_name: "Kaspersky".to_owned(),
+                category: "malicious".to_owned(),
+                result: Some("Trojan-PSW.Win32.Test".to_owned()),
+            }],
+            names: Vec::new(),
+            first_submission_date: None,
+            permalink: None,
+            error: None,
+        };
+
+        let findings = findings_for_report(&report);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "VT_TRUSTED_MALICIOUS_ENGINE");
+        assert_eq!(findings[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn clean_virustotal_report_does_not_add_findings() {
+        let report = VirusTotalReport {
+            status: VirusTotalStatus::Completed,
+            source: VirusTotalSource::Lookup,
+            stats: None,
+            flagged_engines: Vec::new(),
+            names: Vec::new(),
+            first_submission_date: None,
+            permalink: None,
+            error: None,
+        };
+
+        assert!(findings_for_report(&report).is_empty());
+    }
 }

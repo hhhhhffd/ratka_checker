@@ -23,6 +23,7 @@ pub struct MetadataData {
     pub manifest_fields: Vec<String>,
     pub strings: Vec<String>,
     pub mod_ids: Vec<String>,
+    pub mod_aliases: Vec<String>,
     pub archive_signals: Vec<String>,
 }
 
@@ -33,6 +34,7 @@ pub fn extract_metadata(path: &str, bytes: &[u8]) -> MetadataData {
         manifest_fields: vec![path.to_owned()],
         strings: vec![text.clone()],
         mod_ids: Vec::new(),
+        mod_aliases: Vec::new(),
         archive_signals: Vec::new(),
     };
 
@@ -111,6 +113,9 @@ fn collect_json_mod_ids(value: &serde_json::Value, data: &mut MetadataData) {
                         data.mod_ids.push(id.to_owned());
                     }
                 }
+                if key == "provides" {
+                    collect_string_array(value, &mut data.mod_aliases);
+                }
                 collect_json_mod_ids(value, data);
             }
         }
@@ -120,6 +125,16 @@ fn collect_json_mod_ids(value: &serde_json::Value, data: &mut MetadataData) {
             }
         }
         _ => {}
+    }
+}
+
+fn collect_string_array(value: &serde_json::Value, output: &mut Vec<String>) {
+    if let serde_json::Value::Array(values) = value {
+        for value in values {
+            if let Some(text) = value.as_str() {
+                output.push(text.to_owned());
+            }
+        }
     }
 }
 

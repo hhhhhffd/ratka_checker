@@ -50,9 +50,11 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
 
     let mut method_strings = Vec::new();
     let mut archive_signals = Vec::new();
+    let has_string_byte_constructor = has_string_byte_constructor(&entries);
     parse_methods(
         &mut cursor,
         &entries,
+        has_string_byte_constructor,
         &mut method_strings,
         &mut archive_signals,
     )?;
@@ -201,6 +203,7 @@ fn skip_members(cursor: &mut ClassCursor<'_>) -> anyhow::Result<()> {
 fn parse_methods(
     cursor: &mut ClassCursor<'_>,
     entries: &[ConstantPoolEntry],
+    has_string_byte_constructor: bool,
     strings: &mut Vec<String>,
     archive_signals: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -215,7 +218,12 @@ fn parse_methods(
             let attribute_length = cursor.read_u32()? as usize;
             let attribute_bytes = cursor.read_bytes(attribute_length)?;
             if utf8(entries, attribute_name_index).is_some_and(|name| name == "Code") {
-                inspect_code_attribute(attribute_bytes, strings, archive_signals)?;
+                inspect_code_attribute(
+                    attribute_bytes,
+                    has_string_byte_constructor,
+                    strings,
+                    archive_signals,
+                )?;
             }
         }
     }
@@ -234,6 +242,7 @@ fn skip_attributes(cursor: &mut ClassCursor<'_>) -> anyhow::Result<()> {
 
 fn inspect_code_attribute(
     bytes: &[u8],
+    has_string_byte_constructor: bool,
     strings: &mut Vec<String>,
     archive_signals: &mut Vec<String>,
 ) -> anyhow::Result<()> {
@@ -244,7 +253,7 @@ fn inspect_code_attribute(
     let code = cursor.read_bytes(code_length)?;
 
     strings.extend(recover_byte_array_strings(code));
-    if has_xor_loop(code) {
+    if has_string_byte_constructor && has_xor_loop(code) {
         archive_signals.push(XOR_LOOP_SIGNAL.to_owned());
     }
     Ok(())
@@ -390,6 +399,22 @@ fn read_i32(code: &[u8], offset: usize) -> Option<i32> {
         *code.get(offset + 2)?,
         *code.get(offset + 3)?,
     ]))
+}
+
+fn has_string_byte_constructor(entries: &[ConstantPoolEntry]) -> bool {
+    entries.iter().any(|entry| {
+        let ConstantPoolEntry::Ref {
+            class_index,
+            name_and_type_index,
+        } = entry
+        else {
+            return false;
+        };
+        resolve_class_name(entries, *class_index)
+            .is_some_and(|class_name| class_name == "java/lang/String")
+            && resolve_member_name(entries, *name_and_type_index)
+                .is_some_and(|member_name| member_name == "<init>")
+    })
 }
 
 /// Resolves a class entry into its UTF-8 internal JVM class name.

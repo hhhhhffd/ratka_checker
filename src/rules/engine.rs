@@ -138,6 +138,7 @@ mod tests {
             class_major_versions: Vec::new(),
             class_names: Vec::new(),
             mod_ids: Vec::new(),
+            mod_aliases: Vec::new(),
             entry_timestamps: Vec::new(),
         };
         assert_eq!(engine.evaluate(&data).len(), 1);

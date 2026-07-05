@@ -94,10 +94,18 @@ async fn run_scan_worker(
     let limits = state.config.scan_limits;
     let rules_engine = state.rules_engine.clone();
     let scan_path = storage_path.clone();
-    let outcome =
+    let mut outcome =
         tokio::task::spawn_blocking(move || archive::scan_file(&scan_path, limits, &rules_engine))
             .await?;
-    run_virustotal(scan_id, &storage_path, &filename, &state).await?;
+    if let Some(report) = run_virustotal(scan_id, &storage_path, &filename, &state).await? {
+        outcome
+            .findings
+            .extend(virustotal::findings_for_report(&report));
+        let (verdict, risk_score, summary) = archive::finalize_findings(&outcome.findings);
+        outcome.verdict = verdict;
+        outcome.risk_score = risk_score;
+        outcome.summary = summary;
+    }
 
     db::complete_scan(
         &state.db,
@@ -117,9 +125,9 @@ async fn run_virustotal(
     storage_path: &std::path::Path,
     filename: &str,
     state: &AppState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<crate::models::scan::VirusTotalReport>> {
     if !state.config.virustotal.enabled {
-        return Ok(());
+        return Ok(None);
     }
 
     let sha256 = storage_path
@@ -127,11 +135,8 @@ async fn run_virustotal(
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("stored jar path does not contain sha256 filename"))?;
 
-    if db::find_fresh_virustotal_report(&state.db, sha256)
-        .await?
-        .is_some()
-    {
-        return Ok(());
+    if let Some(report) = db::find_fresh_virustotal_report(&state.db, sha256).await? {
+        return Ok(Some(report));
     }
 
     let report =
@@ -151,7 +156,8 @@ async fn run_virustotal(
         &report,
         state.config.virustotal.cache_ttl,
     )
-    .await
+    .await?;
+    Ok(Some(report))
 }
 
 /// Parsed upload payload from the expected `multipart/form-data` field named `file`.

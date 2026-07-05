@@ -29,6 +29,7 @@ const BASE64_DYNAMIC_CLASS_SIGNAL: &str = "base64_dynamic_class_loading";
 const ROBOT_HTTP_SIGNAL: &str = "robot_with_http";
 const CLIPBOARD_CRYPTO_SIGNAL: &str = "clipboard_crypto_address";
 const MIXIN_METADATA_SIGNAL: &str = "mixin_metadata_present";
+const HTTP_DYNAMIC_CLASSLOAD_SIGNAL: &str = "http_dynamic_class_loading";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
 const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
@@ -55,7 +56,8 @@ pub struct ScanData {
     pub class_major_versions: Vec<u16>,
     pub class_names: Vec<String>,
     pub mod_ids: Vec<String>,
-    pub entry_timestamps: Vec<String>,
+    pub mod_aliases: Vec<String>,
+    pub entry_timestamps: Vec<(String, String)>,
 }
 
 /// Complete scanner result ready to persist after risk scoring.
@@ -102,9 +104,7 @@ fn scan_bytes(
 
     context.add_derived_signals();
     let findings = rules_engine.evaluate(&context.data);
-    let risk_score = risk_score(&findings);
-    let verdict = Verdict::from_score(risk_score);
-    let summary = summarize(&findings, verdict.clone());
+    let (verdict, risk_score, summary) = finalize_findings(&findings);
 
     Ok(ScanOutcome {
         verdict,
@@ -112,6 +112,14 @@ fn scan_bytes(
         summary,
         findings,
     })
+}
+
+/// Recomputes verdict fields after callers add non-static findings such as VirusTotal signals.
+pub fn finalize_findings(findings: &[Finding]) -> (Verdict, u8, String) {
+    let risk_score = risk_score(findings);
+    let verdict = Verdict::from_score(risk_score);
+    let summary = summarize(findings, verdict.clone());
+    (verdict, risk_score, summary)
 }
 
 /// Reads the jar once before zip parsing to keep the blocking scanner self-contained.
@@ -155,7 +163,7 @@ fn parse_zip_bytes(
             context
                 .data
                 .entry_timestamps
-                .push(format!("{last_modified:?}"));
+                .push((name.clone(), format!("{last_modified:?}")));
         }
         context.observe_file(&name, uncompressed_size)?;
 
@@ -217,7 +225,9 @@ impl ArchiveContext {
     fn observe_archive_structure(&mut self, name: &str, uncompressed_size: u64) {
         let lower = name.to_ascii_lowercase();
         if lower.ends_with(".jar") {
-            self.data.archive_signals.push(NESTED_JAR_SIGNAL.to_owned());
+            if !is_fabric_declared_nested_jar(&lower) {
+                self.data.archive_signals.push(NESTED_JAR_SIGNAL.to_owned());
+            }
         }
         if lower.ends_with(".zip") {
             self.data.archive_signals.push(NESTED_ZIP_SIGNAL.to_owned());
@@ -241,7 +251,7 @@ impl ArchiveContext {
     /// Extracts content signals from metadata, class files, generic resources, and nested jars.
     fn extract_entry(&mut self, name: &str, bytes: &[u8], depth: usize) -> Result<(), ScanAbort> {
         let lower = name.to_ascii_lowercase();
-        self.observe_magic_bytes(bytes);
+        self.observe_magic_bytes(&lower, bytes);
 
         if lower.ends_with(".jar") || lower.ends_with(".zip") {
             return parse_zip_bytes(bytes, depth + 1, self);
@@ -252,6 +262,7 @@ impl ArchiveContext {
             self.data.manifest_fields.extend(metadata.manifest_fields);
             self.data.strings.extend(metadata.strings);
             self.data.mod_ids.extend(metadata.mod_ids);
+            self.data.mod_aliases.extend(metadata.mod_aliases);
             self.data.archive_signals.extend(metadata.archive_signals);
         }
 
@@ -284,13 +295,13 @@ impl ArchiveContext {
         Ok(())
     }
 
-    fn observe_magic_bytes(&mut self, bytes: &[u8]) {
+    fn observe_magic_bytes(&mut self, lower_name: &str, bytes: &[u8]) {
         if is_native_binary(bytes) {
             self.data
                 .archive_signals
                 .push(NATIVE_BINARY_SIGNAL.to_owned());
         }
-        if bytes.starts_with(b"PK\x03\x04") {
+        if bytes.starts_with(b"PK\x03\x04") && !is_fabric_declared_nested_jar(lower_name) {
             self.data.archive_signals.push(NESTED_ZIP_SIGNAL.to_owned());
         }
     }
@@ -323,16 +334,24 @@ impl ArchiveContext {
             return;
         }
         let mut counts = HashMap::<&str, usize>::new();
-        for timestamp in &self.data.entry_timestamps {
+        for (_, timestamp) in self.timestamp_candidates() {
             *counts.entry(timestamp.as_str()).or_default() += 1;
         }
         let dominant = counts.values().copied().max().unwrap_or_default();
-        let total = self.data.entry_timestamps.len();
+        let total = self.timestamp_candidates().len();
         if dominant * 100 / total >= TIMESTAMP_DOMINANT_PERCENT && total > dominant {
             self.data
                 .archive_signals
                 .push(TIMESTAMP_OUTLIER_SIGNAL.to_owned());
         }
+    }
+
+    fn timestamp_candidates(&self) -> Vec<&(String, String)> {
+        self.data
+            .entry_timestamps
+            .iter()
+            .filter(|(path, _)| !is_signature_or_manifest_path(path))
+            .collect()
     }
 
     fn add_modid_package_signal(&mut self) {
@@ -346,18 +365,27 @@ impl ArchiveContext {
             .filter_map(|class_name| class_name.rsplit_once('/').map(|(package, _)| package))
             .map(normalize_identifier)
             .collect::<Vec<_>>();
-        for mod_id in &self.data.mod_ids {
-            let normalized_mod_id = normalize_identifier(mod_id);
-            if normalized_mod_id.len() >= 4
-                && !packages
-                    .iter()
-                    .any(|package| package.contains(&normalized_mod_id))
-            {
-                self.data
-                    .archive_signals
-                    .push(MODID_PACKAGE_MISMATCH_SIGNAL.to_owned());
-                return;
-            }
+        let declared_ids = self
+            .data
+            .mod_ids
+            .iter()
+            .chain(self.data.mod_aliases.iter())
+            .map(|mod_id| normalize_identifier(mod_id))
+            .filter(|mod_id| mod_id.len() >= 4)
+            .collect::<Vec<_>>();
+        if declared_ids.is_empty() {
+            return;
+        }
+
+        let has_matching_namespace = declared_ids.iter().any(|mod_id| {
+            packages
+                .iter()
+                .any(|package| package.contains(mod_id) || mod_id.contains(package))
+        });
+        if !has_matching_namespace {
+            self.data
+                .archive_signals
+                .push(MODID_PACKAGE_MISMATCH_SIGNAL.to_owned());
         }
     }
 
@@ -426,6 +454,17 @@ impl ArchiveContext {
                 .push(BASE64_DYNAMIC_CLASS_SIGNAL.to_owned());
         }
 
+        if has_http
+            && self.has_ref_any(&[
+                "java/lang/ClassLoader.defineClass",
+                "java/net/URLClassLoader",
+            ])
+        {
+            self.data
+                .archive_signals
+                .push(HTTP_DYNAMIC_CLASSLOAD_SIGNAL.to_owned());
+        }
+
         if has_http && self.has_ref_any(&["java/awt/Robot"]) {
             self.data.archive_signals.push(ROBOT_HTTP_SIGNAL.to_owned());
         }
@@ -472,6 +511,19 @@ fn is_native_binary(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
         || bytes.starts_with(&[0xce, 0xfa, 0xed, 0xfe])
         || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+}
+
+fn is_fabric_declared_nested_jar(lower_name: &str) -> bool {
+    lower_name.starts_with("meta-inf/jars/") && lower_name.ends_with(".jar")
+}
+
+fn is_signature_or_manifest_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == "meta-inf/manifest.mf"
+        || lower.ends_with(".sf")
+        || lower.ends_with(".rsa")
+        || lower.ends_with(".dsa")
+        || lower.ends_with(".ec")
 }
 
 fn normalize_identifier(value: &str) -> String {
