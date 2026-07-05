@@ -1,0 +1,22 @@
+[Unit]
+Description=RatScan API
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=ratscan
+Group=ratscan
+WorkingDirectory=/opt/ratscan
+EnvironmentFile=/etc/ratscan/ratscan.env
+ExecStart=/opt/ratscan/bin/ratscan serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ratscan/storage
+
+[Install]
+WantedBy=multi-user.target
