@@ -49,9 +49,9 @@
 - rule_id: REFLECTION_API
   category: dangerous_api
   severity: medium
-  match_type: bytecode_ref
-  pattern: "java/lang/reflect"
-  message: "Найдено использование reflection API"
+  match_type: regex
+  pattern: "java/lang/reflect/(Method\\.invoke|Constructor\\.newInstance|AccessibleObject\\.setAccessible|Field\\.(get|set))"
+  message: "Найдено потенциально опасное использование reflection API"
 - rule_id: SOCKET_API
   category: network
   severity: medium
@@ -70,18 +70,6 @@
   match_type: bytecode_ref
   pattern: "java/net/HttpURLConnection"
   message: "Найдено использование HttpURLConnection"
-- rule_id: FILE_INPUT_STREAM
-  category: file_access
-  severity: medium
-  match_type: bytecode_ref
-  pattern: "java/io/FileInputStream"
-  message: "Найдено чтение файлов через FileInputStream"
-- rule_id: FILES_READ
-  category: file_access
-  severity: medium
-  match_type: bytecode_ref
-  pattern: "java/nio/file/Files.read"
-  message: "Найдено чтение файлов через java.nio.file.Files"
 - rule_id: DISCORD_TOKEN_PATH
   category: credential_theft
   severity: critical
