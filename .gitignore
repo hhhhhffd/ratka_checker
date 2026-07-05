@@ -1,4 +1,7 @@
 /target/
+/.cargo-cache/
+/.docker-target/
+/dist/
 /storage/*.jar
 /.env
 /.serena/
