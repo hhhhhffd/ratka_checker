@@ -103,9 +103,17 @@ systemctl status cloudflared --no-pager
 - frontend: `/var/www/ratscan`
 - nginx config: `/etc/nginx/sites-available/ratscan.conf`
 
-## 6. Update deploy
+## 6. Update an existing VPS
 
-Build locally again:
+For an already installed VPS, do not rerun the full installer unless you want to
+recreate deployment defaults. Use the update script; it preserves:
+
+- `/etc/ratscan/ratscan.env`;
+- PostgreSQL database/user/password;
+- `/root/ratscan-api-key.txt`;
+- `/opt/ratscan/storage`.
+
+Build the Linux release package locally again:
 
 ```sh
 sh scripts/package_release.sh deploy/app
@@ -116,7 +124,27 @@ Then on the VPS:
 
 ```sh
 cd /home/ubuntu/ratka-deploy
-sudo bash scripts/install_ubuntu.sh
+sudo bash scripts/update_ubuntu.sh
 ```
 
-The installer keeps the existing API key file if it already exists.
+The updater:
+
+- does not run `apt-get`;
+- does not touch PostgreSQL;
+- backs up the old binary/config/frontend under `/opt/ratscan/update-backup-*`;
+- installs the new binary, `rules.yaml`, frontend, systemd unit, and nginx config;
+- restarts `ratscan`;
+- reloads nginx;
+- checks `http://127.0.0.1/health`;
+- rolls files back if the update fails before the health check.
+
+Useful checks after update:
+
+```sh
+systemctl status ratscan --no-pager
+journalctl -u ratscan -n 100 --no-pager
+curl -s http://127.0.0.1/health
+```
+
+Use `scripts/install_ubuntu.sh` only for first install or when rebuilding the
+host from scratch.
