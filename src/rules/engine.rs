@@ -105,6 +105,8 @@ fn contains_case_insensitive(candidates: &[String], pattern: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use crate::{
         models::scan::Severity,
         rules::{
@@ -142,5 +144,13 @@ mod tests {
             entry_timestamps: Vec::new(),
         };
         assert_eq!(engine.evaluate(&data).len(), 1);
+    }
+
+    /// Verifies that the default production rules file remains loadable.
+    #[test]
+    fn default_rules_file_loads() {
+        let engine = RulesEngine::load_from_file(Path::new("config/rules.yaml"));
+
+        assert!(engine.is_ok());
     }
 }

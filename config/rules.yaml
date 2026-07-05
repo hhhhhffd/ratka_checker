@@ -96,55 +96,55 @@
   message: "Найдено использование ProcessBuilder"
 - rule_id: URL_CLASS_LOADER
   category: dangerous_api
-  severity: high
+  severity: low
   match_type: bytecode_ref
   pattern: "java/net/URLClassLoader"
-  message: "Найдено использование URLClassLoader"
+  message: "Найдено использование URLClassLoader без подтвержденной опасной цепочки"
 - rule_id: CLASS_LOADER_DEFINE_CLASS
   category: dangerous_api
-  severity: high
+  severity: medium
   match_type: bytecode_ref
   pattern: "java/lang/ClassLoader.defineClass"
   message: "Найдено динамическое определение class через ClassLoader.defineClass"
 - rule_id: FILES_WRITE
   category: dangerous_api
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/nio/file/Files.write"
-  message: "Найдено использование Files.write"
+  message: "Найдено использование Files.write без подтвержденной опасной цепочки"
 - rule_id: SOCKET_API
   category: network
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/net/Socket"
   message: "Найдено использование Socket API"
 - rule_id: URL_API
   category: network
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/net/URL"
   message: "Найдено использование URL API"
 - rule_id: HTTP_URL_CONNECTION
   category: network
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/net/HttpURLConnection"
   message: "Найдено использование HttpURLConnection"
 - rule_id: HTTPS_URL_CONNECTION
   category: network
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "javax/net/ssl/HttpsURLConnection"
   message: "Найдено использование HttpsURLConnection"
 - rule_id: JAVA_HTTP_CLIENT
   category: network
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/net/http/HttpClient"
   message: "Найдено использование Java 11 HttpClient"
 - rule_id: JAVA_HTTP_REQUEST
   category: network
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/net/http/HttpRequest"
   message: "Найдено использование Java 11 HttpRequest"
@@ -246,19 +246,19 @@
   message: "Обнаружен сбор IP/fingerprint через ipify"
 - rule_id: BASE64_API
   category: obfuscation
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/util/Base64"
-  message: "Найдено использование Base64 API"
+  message: "Найдено использование Base64 API без подтвержденной dynamic-loading цепочки"
 - rule_id: BASE64_BLOB
   category: obfuscation
-  severity: medium
+  severity: low
   match_type: regex
   pattern: "[A-Za-z0-9+/]{120,}={0,2}"
   message: "Обнаружена длинная base64-подобная строка"
 - rule_id: XOR_LOOP_HINT
   category: obfuscation
-  severity: medium
+  severity: low
   match_type: archive_structure
   pattern: "xor_loop_string_decode"
   message: "Обнаружен байткод-паттерн XOR string decoding"
@@ -360,7 +360,7 @@
   message: "Обнаружен поиск процессов анализа или антивирусов"
 - rule_id: LONG_SLEEP
   category: evasion
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/lang/Thread.sleep"
   message: "Обнаружено использование Thread.sleep"
