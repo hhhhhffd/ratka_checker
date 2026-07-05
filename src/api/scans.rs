@@ -11,6 +11,7 @@ use crate::{
     response::PrettyJson,
     scanner::archive,
     storage::{db, files},
+    virustotal,
 };
 
 /// Accepts a multipart jar upload, persists it by sha256, and enqueues a background scan.
@@ -43,7 +44,12 @@ pub async fn create_scan(
     )
     .await?;
 
-    spawn_scan_worker(scan_id, storage_path, state.clone());
+    spawn_scan_worker(
+        scan_id,
+        storage_path,
+        upload.filename.clone(),
+        state.clone(),
+    );
 
     let response = db::find_scan_by_id(&state.db, scan_id)
         .await
@@ -65,9 +71,9 @@ pub async fn get_scan(
 }
 
 /// Starts one detached worker for a scan; the worker owns all state it needs to finish DB updates.
-fn spawn_scan_worker(scan_id: Uuid, storage_path: PathBuf, state: AppState) {
+fn spawn_scan_worker(scan_id: Uuid, storage_path: PathBuf, filename: String, state: AppState) {
     tokio::spawn(async move {
-        if let Err(error) = run_scan_worker(scan_id, storage_path, state.clone()).await {
+        if let Err(error) = run_scan_worker(scan_id, storage_path, filename, state.clone()).await {
             tracing::error!(scan_id = %scan_id, %error, "scan worker failed");
             if let Err(update_error) =
                 db::fail_scan(&state.db, scan_id, "scan_worker_failed", &error.to_string()).await
@@ -82,6 +88,7 @@ fn spawn_scan_worker(scan_id: Uuid, storage_path: PathBuf, state: AppState) {
 async fn run_scan_worker(
     scan_id: Uuid,
     storage_path: PathBuf,
+    filename: String,
     state: AppState,
 ) -> anyhow::Result<()> {
     let limits = state.config.scan_limits;
@@ -90,6 +97,7 @@ async fn run_scan_worker(
     let outcome =
         tokio::task::spawn_blocking(move || archive::scan_file(&scan_path, limits, &rules_engine))
             .await?;
+    run_virustotal(scan_id, &storage_path, &filename, &state).await?;
 
     db::complete_scan(
         &state.db,
@@ -101,6 +109,49 @@ async fn run_scan_worker(
     )
     .await
     .map_err(Into::into)
+}
+
+/// Runs the optional VirusTotal phase and persists its own report without failing static analysis.
+async fn run_virustotal(
+    scan_id: Uuid,
+    storage_path: &std::path::Path,
+    filename: &str,
+    state: &AppState,
+) -> anyhow::Result<()> {
+    if !state.config.virustotal.enabled {
+        return Ok(());
+    }
+
+    let sha256 = storage_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("stored jar path does not contain sha256 filename"))?;
+
+    if db::find_fresh_virustotal_report(&state.db, sha256)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let report =
+        match virustotal::analyze_file(&state.config.virustotal, sha256, storage_path, filename)
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                tracing::warn!(scan_id = %scan_id, %error, "VirusTotal analysis failed");
+                virustotal::error_report(error.to_string())
+            }
+        };
+
+    db::upsert_virustotal_report(
+        &state.db,
+        sha256,
+        &report,
+        state.config.virustotal.cache_ttl,
+    )
+    .await
 }
 
 /// Parsed upload payload from the expected `multipart/form-data` field named `file`.

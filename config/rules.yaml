@@ -4,24 +4,84 @@
   match_type: archive_structure
   pattern: "nested_jar"
   message: "Обнаружен вложенный jar-архив"
-- rule_id: NATIVE_BINARY
+- rule_id: NESTED_ZIP
+  category: archive_structure
+  severity: medium
+  match_type: archive_structure
+  pattern: "nested_zip"
+  message: "Обнаружен вложенный zip-архив или zip payload"
+- rule_id: NATIVE_BINARY_MAGIC
   category: archive_structure
   severity: high
   match_type: archive_structure
   pattern: "native_binary"
-  message: "Обнаружен исполняемый или нативный файл внутри архива"
+  message: "Обнаружен PE/ELF/Mach-O payload по magic bytes"
+- rule_id: SCRIPT_FILE
+  category: archive_structure
+  severity: high
+  match_type: archive_structure
+  pattern: "script_file"
+  message: "Обнаружен исполняемый скрипт внутри архива"
 - rule_id: LARGE_ASSET_RESOURCE
   category: steganography
   severity: medium
   match_type: archive_structure
   pattern: "large_asset"
   message: "Обнаружен подозрительно большой ресурс в assets/"
+- rule_id: TIMESTAMP_OUTLIER
+  category: supply_chain
+  severity: high
+  match_type: archive_structure
+  pattern: "timestamp_outlier"
+  message: "Обнаружен файл с timestamp, отличающимся от основной сборки"
+- rule_id: MODID_PACKAGE_MISMATCH
+  category: supply_chain
+  severity: medium
+  match_type: archive_structure
+  pattern: "modid_package_mismatch"
+  message: "modid не похож на namespace классов мода"
+- rule_id: SHORT_NAMES_WITHOUT_MIXIN
+  category: obfuscation
+  severity: medium
+  match_type: archive_structure
+  pattern: "short_class_names_without_mixin"
+  message: "Много коротких имён классов без mixin/refmap контекста"
+- rule_id: INVALID_CLASS_CONSTANT_POOL
+  category: obfuscation
+  severity: high
+  match_type: archive_structure
+  pattern: "invalid_class_constant_pool"
+  message: "Обнаружен битый или невалидный constant pool class-файла"
+- rule_id: BYTECODE_VERSION_MISMATCH
+  category: supply_chain
+  severity: medium
+  match_type: archive_structure
+  pattern: "bytecode_version_mismatch"
+  message: "Обнаружено несоответствие bytecode-версий class-файлов"
 - rule_id: MANIFEST_MAIN_CLASS
   category: manifest
   severity: low
   match_type: manifest_field
   pattern: "Main-Class"
   message: "Manifest содержит Main-Class"
+- rule_id: MANIFEST_EXTERNAL_CLASS_PATH
+  category: manifest
+  severity: critical
+  match_type: archive_structure
+  pattern: "manifest_external_class_path"
+  message: "Manifest Class-Path указывает за пределы jar"
+- rule_id: JAVA_AGENT_PREMAIN
+  category: manifest
+  severity: high
+  match_type: manifest_field
+  pattern: "Premain-Class"
+  message: "Manifest содержит Java Agent Premain-Class hook"
+- rule_id: JAVA_AGENT_CLASS
+  category: manifest
+  severity: high
+  match_type: manifest_field
+  pattern: "Agent-Class"
+  message: "Manifest содержит Java Agent-Class hook"
 - rule_id: RUNTIME_EXEC
   category: dangerous_api
   severity: high
@@ -40,18 +100,18 @@
   match_type: bytecode_ref
   pattern: "java/net/URLClassLoader"
   message: "Найдено использование URLClassLoader"
-- rule_id: CLASS_LOADER
+- rule_id: CLASS_LOADER_DEFINE_CLASS
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/lang/ClassLoader.defineClass"
+  message: "Найдено динамическое определение class через ClassLoader.defineClass"
+- rule_id: FILES_WRITE
   category: dangerous_api
   severity: medium
   match_type: bytecode_ref
-  pattern: "java/lang/ClassLoader"
-  message: "Найдено использование ClassLoader"
-- rule_id: REFLECTION_API
-  category: dangerous_api
-  severity: medium
-  match_type: regex
-  pattern: "java/lang/reflect/(Method\\.invoke|Constructor\\.newInstance|AccessibleObject\\.setAccessible|Field\\.(get|set))"
-  message: "Найдено потенциально опасное использование reflection API"
+  pattern: "java/nio/file/Files.write"
+  message: "Найдено использование Files.write"
 - rule_id: SOCKET_API
   category: network
   severity: medium
@@ -70,6 +130,24 @@
   match_type: bytecode_ref
   pattern: "java/net/HttpURLConnection"
   message: "Найдено использование HttpURLConnection"
+- rule_id: HTTPS_URL_CONNECTION
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "javax/net/ssl/HttpsURLConnection"
+  message: "Найдено использование HttpsURLConnection"
+- rule_id: JAVA_HTTP_CLIENT
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/net/http/HttpClient"
+  message: "Найдено использование Java 11 HttpClient"
+- rule_id: JAVA_HTTP_REQUEST
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/net/http/HttpRequest"
+  message: "Найдено использование Java 11 HttpRequest"
 - rule_id: DISCORD_TOKEN_PATH
   category: credential_theft
   severity: critical
@@ -124,18 +202,42 @@
   match_type: regex
   pattern: "https://(discord(app)?\\.com/api/webhooks|hooks\\.slack\\.com/services)/[^\\s\"']+"
   message: "Обнаружена webhook-ссылка для exfiltration"
-- rule_id: PASTEBIN_URL
+- rule_id: WEBHOOK_SITE_URL
   category: exfiltration
   severity: high
   match_type: string_contains
-  pattern: "pastebin.com"
-  message: "Обнаружена ссылка на pastebin"
+  pattern: "webhook.site"
+  message: "Обнаружена ссылка на webhook.site"
+- rule_id: PASTEBIN_RAW_URL
+  category: exfiltration
+  severity: high
+  match_type: string_contains
+  pattern: "pastebin.com/raw"
+  message: "Обнаружена raw-ссылка pastebin"
+- rule_id: HASTEBIN_URL
+  category: exfiltration
+  severity: high
+  match_type: regex
+  pattern: "(hastebin\\.com|paste\\.ee)"
+  message: "Обнаружен paste-сервис для конфигов или exfiltration"
 - rule_id: RAW_GITHUB_URL
   category: exfiltration
   severity: medium
   match_type: string_contains
   pattern: "raw.githubusercontent.com"
   message: "Обнаружена ссылка на raw github"
+- rule_id: NGROK_TUNNEL
+  category: exfiltration
+  severity: high
+  match_type: regex
+  pattern: "(ngrok\\.io|ngrok-free\\.app)"
+  message: "Обнаружен ngrok tunnel endpoint"
+- rule_id: HARDCODED_INTEGER_IP
+  category: network
+  severity: medium
+  match_type: string_contains
+  pattern: "int_ip:"
+  message: "Обнаружен IP, закодированный integer-литералом"
 - rule_id: IPINFO_FINGERPRINT
   category: fingerprinting
   severity: high
@@ -154,24 +256,36 @@
   match_type: bytecode_ref
   pattern: "java/lang/System.getProperty"
   message: "Обнаружено получение системных свойств пользователя"
+- rule_id: BASE64_API
+  category: obfuscation
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/util/Base64"
+  message: "Найдено использование Base64 API"
 - rule_id: BASE64_BLOB
   category: obfuscation
   severity: medium
   match_type: regex
   pattern: "[A-Za-z0-9+/]{120,}={0,2}"
   message: "Обнаружена длинная base64-подобная строка"
-- rule_id: INVALID_CLASS_CONSTANT_POOL
-  category: obfuscation
-  severity: high
-  match_type: archive_structure
-  pattern: "invalid_class_constant_pool"
-  message: "Обнаружен битый или невалидный constant pool class-файла"
 - rule_id: XOR_LOOP_HINT
   category: obfuscation
   severity: medium
-  match_type: string_contains
-  pattern: "xor"
-  message: "Обнаружен признак XOR/rot decoding"
+  match_type: archive_structure
+  pattern: "xor_loop_string_decode"
+  message: "Обнаружен байткод-паттерн XOR string decoding"
+- rule_id: MESSAGE_DIGEST
+  category: crypto
+  severity: low
+  match_type: bytecode_ref
+  pattern: "java/security/MessageDigest"
+  message: "Найдено использование MessageDigest"
+- rule_id: UNSAFE_API
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "sun/misc/Unsafe"
+  message: "Найдено использование sun.misc.Unsafe"
 - rule_id: REGISTRY_RUN_KEY
   category: persistence
   severity: critical
@@ -274,15 +388,33 @@
   match_type: regex
   pattern: "(^|[\\s;])(?:net/minecraft|com/mojang|me/jellysquid/mods/sodium)/[^\\s;]*\\.class([\\s;]|$)"
   message: "Обнаружено имя класса, похожее на легитимный namespace"
-- rule_id: REMOTE_JAR_LOADING
-  category: supply_chain
+- rule_id: CORRELATION_DOWNLOAD_WRITE_EXEC
+  category: correlation
   severity: critical
-  match_type: string_contains
-  pattern: ".jar"
-  message: "Обнаружен признак динамической догрузки jar"
-- rule_id: BYTECODE_VERSION_MISMATCH
-  category: supply_chain
-  severity: medium
   match_type: archive_structure
-  pattern: "bytecode_version_mismatch"
-  message: "Обнаружено несоответствие bytecode-версий class-файлов"
+  pattern: "download_write_exec"
+  message: "Комбо HTTP + запись файла + запуск процесса"
+- rule_id: CORRELATION_CREDENTIAL_HTTP
+  category: correlation
+  severity: critical
+  match_type: archive_structure
+  pattern: "credential_path_with_http"
+  message: "Комбо credential paths + HTTP, похоже на exfiltration"
+- rule_id: CORRELATION_BASE64_DYNAMIC_CLASS
+  category: correlation
+  severity: critical
+  match_type: archive_structure
+  pattern: "base64_dynamic_class_loading"
+  message: "Комбо Base64 + dynamic class loading"
+- rule_id: CORRELATION_ROBOT_HTTP
+  category: correlation
+  severity: high
+  match_type: archive_structure
+  pattern: "robot_with_http"
+  message: "Комбо java.awt.Robot + HTTP"
+- rule_id: CORRELATION_CLIPBOARD_CRYPTO
+  category: correlation
+  severity: high
+  match_type: archive_structure
+  pattern: "clipboard_crypto_address"
+  message: "Комбо clipboard access + crypto address pattern"

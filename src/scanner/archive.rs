@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Cursor, Read},
     path::Path,
@@ -14,12 +14,27 @@ use crate::{
 };
 
 const NESTED_JAR_SIGNAL: &str = "nested_jar";
+const NESTED_ZIP_SIGNAL: &str = "nested_zip";
 const NATIVE_BINARY_SIGNAL: &str = "native_binary";
+const SCRIPT_FILE_SIGNAL: &str = "script_file";
 const LARGE_ASSET_SIGNAL: &str = "large_asset";
 const INVALID_CLASS_CONSTANT_POOL_SIGNAL: &str = "invalid_class_constant_pool";
 const BYTECODE_VERSION_MISMATCH_SIGNAL: &str = "bytecode_version_mismatch";
+const TIMESTAMP_OUTLIER_SIGNAL: &str = "timestamp_outlier";
+const MODID_PACKAGE_MISMATCH_SIGNAL: &str = "modid_package_mismatch";
+const SHORT_NAMES_WITHOUT_MIXIN_SIGNAL: &str = "short_class_names_without_mixin";
+const DOWNLOAD_WRITE_EXEC_SIGNAL: &str = "download_write_exec";
+const CREDENTIAL_HTTP_EXFIL_SIGNAL: &str = "credential_path_with_http";
+const BASE64_DYNAMIC_CLASS_SIGNAL: &str = "base64_dynamic_class_loading";
+const ROBOT_HTTP_SIGNAL: &str = "robot_with_http";
+const CLIPBOARD_CRYPTO_SIGNAL: &str = "clipboard_crypto_address";
+const MIXIN_METADATA_SIGNAL: &str = "mixin_metadata_present";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
+const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
+const TIMESTAMP_DOMINANT_PERCENT: usize = 90;
+const SHORT_CLASS_NAME_MIN_CLASSES: usize = 8;
+const SHORT_CLASS_NAME_PERCENT: usize = 70;
 
 /// Named zip-bomb limits loaded from environment through AppConfig.
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +53,9 @@ pub struct ScanData {
     pub manifest_fields: Vec<String>,
     pub archive_signals: Vec<String>,
     pub class_major_versions: Vec<u16>,
+    pub class_names: Vec<String>,
+    pub mod_ids: Vec<String>,
+    pub entry_timestamps: Vec<String>,
 }
 
 /// Complete scanner result ready to persist after risk scoring.
@@ -133,6 +151,12 @@ fn parse_zip_bytes(
 
         let name = entry.name().replace('\\', "/");
         let uncompressed_size = entry.size();
+        if let Some(last_modified) = entry.last_modified() {
+            context
+                .data
+                .entry_timestamps
+                .push(format!("{last_modified:?}"));
+        }
         context.observe_file(&name, uncompressed_size)?;
 
         let mut entry_bytes = Vec::new();
@@ -195,13 +219,16 @@ impl ArchiveContext {
         if lower.ends_with(".jar") {
             self.data.archive_signals.push(NESTED_JAR_SIGNAL.to_owned());
         }
-        if [".exe", ".dll", ".so", ".bat", ".cmd", ".ps1"]
+        if lower.ends_with(".zip") {
+            self.data.archive_signals.push(NESTED_ZIP_SIGNAL.to_owned());
+        }
+        if [".bat", ".cmd", ".ps1", ".vbs", ".scr"]
             .iter()
             .any(|extension| lower.ends_with(extension))
         {
             self.data
                 .archive_signals
-                .push(NATIVE_BINARY_SIGNAL.to_owned());
+                .push(SCRIPT_FILE_SIGNAL.to_owned());
         }
         if lower.starts_with("assets/") && uncompressed_size >= LARGE_ASSET_THRESHOLD_BYTES {
             self.data
@@ -214,14 +241,18 @@ impl ArchiveContext {
     /// Extracts content signals from metadata, class files, generic resources, and nested jars.
     fn extract_entry(&mut self, name: &str, bytes: &[u8], depth: usize) -> Result<(), ScanAbort> {
         let lower = name.to_ascii_lowercase();
-        if lower.ends_with(".jar") {
+        self.observe_magic_bytes(bytes);
+
+        if lower.ends_with(".jar") || lower.ends_with(".zip") {
             return parse_zip_bytes(bytes, depth + 1, self);
         }
 
         if metadata::is_metadata_file(name) {
-            let (fields, strings) = metadata::extract_metadata(name, bytes);
-            self.data.manifest_fields.extend(fields);
-            self.data.strings.extend(strings);
+            let metadata = metadata::extract_metadata(name, bytes);
+            self.data.manifest_fields.extend(metadata.manifest_fields);
+            self.data.strings.extend(metadata.strings);
+            self.data.mod_ids.extend(metadata.mod_ids);
+            self.data.archive_signals.extend(metadata.archive_signals);
         }
 
         if lower.ends_with(".class") {
@@ -229,6 +260,10 @@ impl ArchiveContext {
                 Ok(class_data) => {
                     self.data.strings.extend(class_data.strings);
                     self.data.bytecode_refs.extend(class_data.bytecode_refs);
+                    self.data.archive_signals.extend(class_data.archive_signals);
+                    if let Some(class_name) = class_data.class_name {
+                        self.data.class_names.push(class_name);
+                    }
                     self.data
                         .class_major_versions
                         .push(class_data.major_version);
@@ -249,6 +284,17 @@ impl ArchiveContext {
         Ok(())
     }
 
+    fn observe_magic_bytes(&mut self, bytes: &[u8]) {
+        if is_native_binary(bytes) {
+            self.data
+                .archive_signals
+                .push(NATIVE_BINARY_SIGNAL.to_owned());
+        }
+        if bytes.starts_with(b"PK\x03\x04") {
+            self.data.archive_signals.push(NESTED_ZIP_SIGNAL.to_owned());
+        }
+    }
+
     /// Adds aggregate signals that require seeing multiple files before deciding.
     fn add_derived_signals(&mut self) {
         let unique_versions = self
@@ -266,7 +312,174 @@ impl ArchiveContext {
                     .push(BYTECODE_VERSION_MISMATCH_SIGNAL.to_owned());
             }
         }
+        self.add_timestamp_outlier_signal();
+        self.add_modid_package_signal();
+        self.add_short_name_signal();
+        self.add_correlation_signals();
     }
+
+    fn add_timestamp_outlier_signal(&mut self) {
+        if self.data.entry_timestamps.len() < TIMESTAMP_OUTLIER_MIN_FILES {
+            return;
+        }
+        let mut counts = HashMap::<&str, usize>::new();
+        for timestamp in &self.data.entry_timestamps {
+            *counts.entry(timestamp.as_str()).or_default() += 1;
+        }
+        let dominant = counts.values().copied().max().unwrap_or_default();
+        let total = self.data.entry_timestamps.len();
+        if dominant * 100 / total >= TIMESTAMP_DOMINANT_PERCENT && total > dominant {
+            self.data
+                .archive_signals
+                .push(TIMESTAMP_OUTLIER_SIGNAL.to_owned());
+        }
+    }
+
+    fn add_modid_package_signal(&mut self) {
+        if self.data.mod_ids.is_empty() || self.data.class_names.is_empty() {
+            return;
+        }
+        let packages = self
+            .data
+            .class_names
+            .iter()
+            .filter_map(|class_name| class_name.rsplit_once('/').map(|(package, _)| package))
+            .map(normalize_identifier)
+            .collect::<Vec<_>>();
+        for mod_id in &self.data.mod_ids {
+            let normalized_mod_id = normalize_identifier(mod_id);
+            if normalized_mod_id.len() >= 4
+                && !packages
+                    .iter()
+                    .any(|package| package.contains(&normalized_mod_id))
+            {
+                self.data
+                    .archive_signals
+                    .push(MODID_PACKAGE_MISMATCH_SIGNAL.to_owned());
+                return;
+            }
+        }
+    }
+
+    fn add_short_name_signal(&mut self) {
+        if self
+            .data
+            .archive_signals
+            .iter()
+            .any(|signal| signal == MIXIN_METADATA_SIGNAL)
+        {
+            return;
+        }
+        if self.data.class_names.len() < SHORT_CLASS_NAME_MIN_CLASSES {
+            return;
+        }
+        let short_names = self
+            .data
+            .class_names
+            .iter()
+            .filter(|class_name| {
+                class_name
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.chars().count() <= 2)
+            })
+            .count();
+        if short_names * 100 / self.data.class_names.len() >= SHORT_CLASS_NAME_PERCENT {
+            self.data
+                .archive_signals
+                .push(SHORT_NAMES_WITHOUT_MIXIN_SIGNAL.to_owned());
+        }
+    }
+
+    fn add_correlation_signals(&mut self) {
+        let has_http = self.has_ref_any(&[
+            "java/net/HttpURLConnection",
+            "javax/net/ssl/HttpsURLConnection",
+            "java/net/http/HttpClient",
+            "java/net/http/HttpRequest",
+        ]);
+        let has_write =
+            self.has_ref_any(&["java/nio/file/Files.write", "java/io/FileOutputStream"]);
+        let has_exec = self.has_ref_any(&["java/lang/Runtime.exec", "java/lang/ProcessBuilder"]);
+        if has_http && has_write && has_exec {
+            self.data
+                .archive_signals
+                .push(DOWNLOAD_WRITE_EXEC_SIGNAL.to_owned());
+        }
+
+        if has_http
+            && self.has_string_any(&["discord/Local Storage/leveldb", "Local State", "Login Data"])
+        {
+            self.data
+                .archive_signals
+                .push(CREDENTIAL_HTTP_EXFIL_SIGNAL.to_owned());
+        }
+
+        if self.has_ref_any(&["java/util/Base64", "Base64.getDecoder"])
+            && self.has_ref_any(&[
+                "java/lang/ClassLoader.defineClass",
+                "java/net/URLClassLoader",
+            ])
+        {
+            self.data
+                .archive_signals
+                .push(BASE64_DYNAMIC_CLASS_SIGNAL.to_owned());
+        }
+
+        if has_http && self.has_ref_any(&["java/awt/Robot"]) {
+            self.data.archive_signals.push(ROBOT_HTTP_SIGNAL.to_owned());
+        }
+
+        if self.has_ref_any(&["java/awt/datatransfer/Clipboard"])
+            && self.has_crypto_address_string()
+        {
+            self.data
+                .archive_signals
+                .push(CLIPBOARD_CRYPTO_SIGNAL.to_owned());
+        }
+    }
+
+    fn has_ref_any(&self, patterns: &[&str]) -> bool {
+        patterns.iter().any(|pattern| {
+            self.data.bytecode_refs.iter().any(|candidate| {
+                candidate.eq_ignore_ascii_case(pattern) || candidate.contains(pattern)
+            })
+        })
+    }
+
+    fn has_string_any(&self, patterns: &[&str]) -> bool {
+        patterns.iter().any(|pattern| {
+            let pattern = pattern.to_ascii_lowercase();
+            self.data
+                .strings
+                .iter()
+                .any(|candidate| candidate.to_ascii_lowercase().contains(&pattern))
+        })
+    }
+
+    fn has_crypto_address_string(&self) -> bool {
+        self.data.strings.iter().any(|candidate| {
+            let lower = candidate.to_ascii_lowercase();
+            lower.contains("bc1q") || lower.contains("bc1p") || lower.contains("0x")
+        })
+    }
+}
+
+fn is_native_binary(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"MZ")
+        || bytes.starts_with(b"\x7fELF")
+        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xce])
+        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
+        || bytes.starts_with(&[0xce, 0xfa, 0xed, 0xfe])
+        || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
+}
+
+fn normalize_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect()
 }
 
 /// Scanner aborts that should produce `verdict: unknown` instead of a malicious score.

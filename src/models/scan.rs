@@ -135,6 +135,64 @@ impl Finding {
     }
 }
 
+/// Summary of the latest VirusTotal report cached for the scanned file hash.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VirusTotalReport {
+    pub status: VirusTotalStatus,
+    pub source: VirusTotalSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<VirusTotalStats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flagged_engines: Vec<VirusTotalEngineResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_submission_date: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permalink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Coarse VirusTotal lifecycle state exposed without leaking raw API response shape.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirusTotalStatus {
+    Completed,
+    Queued,
+    NotFound,
+    TooLargeToUpload,
+    Error,
+}
+
+/// Where the VirusTotal value came from, useful for clients deciding whether to poll again.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirusTotalSource {
+    Cache,
+    Lookup,
+    Upload,
+}
+
+/// VirusTotal aggregate engine counters.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct VirusTotalStats {
+    pub malicious: u32,
+    pub suspicious: u32,
+    pub harmless: u32,
+    pub undetected: u32,
+    pub timeout: u32,
+}
+
+/// One flagged VirusTotal engine result, limited to non-harmless categories.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VirusTotalEngineResult {
+    pub engine_name: String,
+    pub category: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+}
+
 /// Response shared by POST /v1/scans, GET /v1/scans/{id}, and hash lookups.
 #[derive(Clone, Debug, Serialize)]
 pub struct ScanResponse {
@@ -146,4 +204,6 @@ pub struct ScanResponse {
     pub risk_score: u8,
     pub summary: String,
     pub findings: Vec<FindingResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub virustotal: Option<VirusTotalReport>,
 }

@@ -136,6 +136,9 @@ mod tests {
             manifest_fields: Vec::new(),
             archive_signals: Vec::new(),
             class_major_versions: Vec::new(),
+            class_names: Vec::new(),
+            mod_ids: Vec::new(),
+            entry_timestamps: Vec::new(),
         };
         assert_eq!(engine.evaluate(&data).len(), 1);
     }

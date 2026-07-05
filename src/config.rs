@@ -11,6 +11,11 @@ const DEFAULT_MAX_NESTING_DEPTH: usize = 3;
 const DEFAULT_MAX_SINGLE_FILE_MB: u64 = 50;
 const DEFAULT_FILE_RETENTION_DAYS: u64 = 7;
 const DEFAULT_FILE_CLEANUP_INTERVAL_MINUTES: u64 = 60;
+const DEFAULT_VIRUSTOTAL_TIMEOUT_SECONDS: u64 = 20;
+const DEFAULT_VIRUSTOTAL_CACHE_TTL_HOURS: u64 = 24;
+const DEFAULT_VIRUSTOTAL_POLL_ATTEMPTS: usize = 6;
+const DEFAULT_VIRUSTOTAL_POLL_INTERVAL_SECONDS: u64 = 10;
+const VIRUSTOTAL_UPLOAD_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Runtime configuration loaded from environment variables with named defaults from the spec.
 #[derive(Clone, Debug)]
@@ -23,6 +28,19 @@ pub struct AppConfig {
     pub file_retention: Duration,
     pub cleanup_interval: Duration,
     pub upload_max_bytes: usize,
+    pub virustotal: VirusTotalConfig,
+}
+
+/// Optional VirusTotal integration settings. Disabled unless both flag and API key are present.
+#[derive(Clone, Debug)]
+pub struct VirusTotalConfig {
+    pub enabled: bool,
+    pub api_key: Option<String>,
+    pub timeout: Duration,
+    pub cache_ttl: Duration,
+    pub poll_attempts: usize,
+    pub poll_interval: Duration,
+    pub upload_limit_bytes: u64,
 }
 
 impl AppConfig {
@@ -56,6 +74,27 @@ impl AppConfig {
                 DEFAULT_FILE_CLEANUP_INTERVAL_MINUTES,
             )? * 60,
         );
+        let virustotal = VirusTotalConfig {
+            enabled: env_bool("VIRUSTOTAL_ENABLED", false)?
+                && env::var("VIRUSTOTAL_API_KEY").is_ok(),
+            api_key: env::var("VIRUSTOTAL_API_KEY").ok(),
+            timeout: Duration::from_secs(env_u64(
+                "VIRUSTOTAL_TIMEOUT_SECONDS",
+                DEFAULT_VIRUSTOTAL_TIMEOUT_SECONDS,
+            )?),
+            cache_ttl: Duration::from_secs(
+                env_u64(
+                    "VIRUSTOTAL_CACHE_TTL_HOURS",
+                    DEFAULT_VIRUSTOTAL_CACHE_TTL_HOURS,
+                )? * 3_600,
+            ),
+            poll_attempts: env_usize("VIRUSTOTAL_POLL_ATTEMPTS", DEFAULT_VIRUSTOTAL_POLL_ATTEMPTS)?,
+            poll_interval: Duration::from_secs(env_u64(
+                "VIRUSTOTAL_POLL_INTERVAL_SECONDS",
+                DEFAULT_VIRUSTOTAL_POLL_INTERVAL_SECONDS,
+            )?),
+            upload_limit_bytes: VIRUSTOTAL_UPLOAD_LIMIT_BYTES,
+        };
 
         Ok(Self {
             database_url,
@@ -66,6 +105,7 @@ impl AppConfig {
             scan_limits,
             file_retention,
             cleanup_interval,
+            virustotal,
         })
     }
 }
@@ -89,6 +129,19 @@ fn env_usize(name: &str, default: usize) -> anyhow::Result<usize> {
         .map(|value| value.parse::<usize>())
         .unwrap_or(Ok(default))
         .map_err(|error| anyhow::anyhow!("{name} must be an unsigned integer: {error}"))
+}
+
+/// Reads a boolean environment variable accepting common operator-friendly spellings.
+fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(_) => return Ok(default),
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow::anyhow!("{name} must be a boolean")),
+    }
 }
 
 /// Converts megabytes to bytes in one place to avoid anonymous numeric multipliers in scanners.

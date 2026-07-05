@@ -1,8 +1,12 @@
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::models::scan::{Finding, ScanResponse, ScanStatus, Severity, Verdict};
+use crate::models::scan::{
+    Finding, ScanResponse, ScanStatus, Severity, Verdict, VirusTotalReport, VirusTotalSource,
+};
 
 /// Database row for api_keys, intentionally exposing only fields needed by auth.
 #[derive(Debug, sqlx::FromRow)]
@@ -28,6 +32,12 @@ struct FindingRow {
     category: String,
     severity: String,
     message: String,
+}
+
+/// Database row for cached VirusTotal reports.
+#[derive(Debug, sqlx::FromRow)]
+struct VirusTotalReportRow {
+    report_json: serde_json::Value,
 }
 
 /// Candidate file selected for retention cleanup.
@@ -266,6 +276,55 @@ pub async fn mark_file_deleted(pool: &PgPool, scan_id: Uuid) -> sqlx::Result<()>
     Ok(())
 }
 
+/// Returns a fresh VirusTotal cache entry that can be reused without another external request.
+pub async fn find_fresh_virustotal_report(
+    pool: &PgPool,
+    sha256: &str,
+) -> anyhow::Result<Option<VirusTotalReport>> {
+    let row = sqlx::query_as::<_, VirusTotalReportRow>(
+        r#"
+        SELECT report_json
+        FROM virustotal_reports
+        WHERE sha256 = $1 AND expires_at > now()
+        LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(report_from_row).transpose()
+}
+
+/// Upserts a VirusTotal report with a TTL so duplicate scans do not spend quota.
+pub async fn upsert_virustotal_report(
+    pool: &PgPool,
+    sha256: &str,
+    report: &VirusTotalReport,
+    ttl: Duration,
+) -> anyhow::Result<()> {
+    let chrono_ttl = chrono::Duration::from_std(ttl)?;
+    let expires_at = Utc::now() + chrono_ttl;
+    let report_json = serde_json::to_value(report)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO virustotal_reports (sha256, report_json, fetched_at, expires_at)
+        VALUES ($1, $2, now(), $3)
+        ON CONFLICT (sha256) DO UPDATE
+        SET report_json = EXCLUDED.report_json,
+            fetched_at = now(),
+            expires_at = EXCLUDED.expires_at
+        "#,
+    )
+    .bind(sha256)
+    .bind(report_json)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Replaces findings inside an existing transaction so scan completion is atomic.
 async fn replace_findings(
     tx: &mut Transaction<'_, Postgres>,
@@ -298,6 +357,7 @@ async fn replace_findings(
 /// Converts database rows to the public response and validates enum strings at the boundary.
 async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<ScanResponse> {
     let findings = scan_findings(pool, scan.id).await?;
+    let virustotal = find_virustotal_report_for_response(pool, &scan.sha256).await?;
     Ok(ScanResponse {
         scan_id: scan.id,
         status: ScanStatus::from_db(&scan.status)?,
@@ -306,6 +366,7 @@ async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<
         risk_score: scan.risk_score.clamp(0, 100) as u8,
         summary: scan.summary,
         findings: findings.iter().map(Finding::to_response).collect(),
+        virustotal,
     })
 }
 
@@ -333,4 +394,31 @@ async fn scan_findings(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<Findi
             })
         })
         .collect()
+}
+
+/// Returns the last VirusTotal report for API responses, even when too old for quota caching.
+async fn find_virustotal_report_for_response(
+    pool: &PgPool,
+    sha256: &str,
+) -> anyhow::Result<Option<VirusTotalReport>> {
+    let row = sqlx::query_as::<_, VirusTotalReportRow>(
+        r#"
+        SELECT report_json
+        FROM virustotal_reports
+        WHERE sha256 = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(report_from_row).transpose()
+}
+
+/// Deserializes a cached report and marks it as cache-sourced for callers.
+fn report_from_row(row: VirusTotalReportRow) -> anyhow::Result<VirusTotalReport> {
+    let mut report = serde_json::from_value::<VirusTotalReport>(row.report_json)?;
+    report.source = VirusTotalSource::Cache;
+    Ok(report)
 }

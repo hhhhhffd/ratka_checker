@@ -7,6 +7,7 @@ mod response;
 mod rules;
 mod scanner;
 mod storage;
+mod virustotal;
 
 use base64::Engine;
 use clap::{Parser, Subcommand};
