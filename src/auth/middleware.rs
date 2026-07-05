@@ -4,12 +4,11 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{api::AppState, storage::db};
+use crate::{api::AppState, response::PrettyJson, storage::db};
 
 const API_KEY_HEADER: &str = "X-API-Key";
 
@@ -48,7 +47,7 @@ pub async fn require_internal_api_key(
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
-        Json(UnauthorizedResponse {
+        PrettyJson(UnauthorizedResponse {
             error: "unauthorized",
         }),
     )

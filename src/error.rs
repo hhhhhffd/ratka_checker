@@ -1,9 +1,10 @@
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
+
+use crate::response::PrettyJson;
 
 /// Public API error body used by every non-auth failure response.
 #[derive(Debug, Serialize)]
@@ -54,7 +55,7 @@ impl AppError {
 impl IntoResponse for AppError {
     /// Converts domain errors into the single JSON error envelope required by the API contract.
     fn into_response(self) -> Response {
-        let body = Json(ErrorResponse {
+        let body = PrettyJson(ErrorResponse {
             error: self.code.to_owned(),
             message: Some(self.message),
         });

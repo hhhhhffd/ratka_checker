@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod error;
 mod models;
+mod response;
 mod rules;
 mod scanner;
 mod storage;

@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 
-use axum::{
-    extract::{Multipart, Path, State},
-    Json,
-};
+use axum::extract::{Multipart, Path, State};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -11,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     api::AppState,
     error::AppError,
+    response::PrettyJson,
     scanner::archive,
     storage::{db, files},
 };
@@ -19,7 +17,7 @@ use crate::{
 pub async fn create_scan(
     State(state): State<AppState>,
     multipart: Multipart,
-) -> Result<Json<crate::models::scan::ScanResponse>, AppError> {
+) -> Result<PrettyJson<crate::models::scan::ScanResponse>, AppError> {
     let upload = extract_upload(multipart).await?;
     validate_filename(&upload.filename)?;
 
@@ -32,7 +30,7 @@ pub async fn create_scan(
         .map_err(|error| AppError::internal(error.to_string()))?
     {
         db::mark_file_available(&state.db, existing.scan_id, &storage_path_string).await?;
-        return Ok(Json(existing));
+        return Ok(PrettyJson(existing));
     }
 
     let scan_id = Uuid::new_v4();
@@ -51,19 +49,19 @@ pub async fn create_scan(
         .await
         .map_err(|error| AppError::internal(error.to_string()))?
         .ok_or_else(|| AppError::internal("created scan was not found"))?;
-    Ok(Json(response))
+    Ok(PrettyJson(response))
 }
 
 /// Returns current scan state and result by id for polling clients.
 pub async fn get_scan(
     State(state): State<AppState>,
     Path(scan_id): Path<Uuid>,
-) -> Result<Json<crate::models::scan::ScanResponse>, AppError> {
+) -> Result<PrettyJson<crate::models::scan::ScanResponse>, AppError> {
     let response = db::find_scan_by_id(&state.db, scan_id)
         .await
         .map_err(|error| AppError::internal(error.to_string()))?
         .ok_or_else(|| AppError::not_found("scan not found"))?;
-    Ok(Json(response))
+    Ok(PrettyJson(response))
 }
 
 /// Starts one detached worker for a scan; the worker owns all state it needs to finish DB updates.
