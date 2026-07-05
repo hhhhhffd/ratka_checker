@@ -127,8 +127,8 @@
 - rule_id: TELEGRAM_SESSION
   category: credential_theft
   severity: high
-  match_type: string_contains
-  pattern: "tdata"
+  match_type: regex
+  pattern: "(^|[\\\\/])tdata([\\\\/]|$)"
   message: "Обнаружен признак доступа к Telegram session-файлам"
 - rule_id: STEAM_CONFIG
   category: credential_theft
@@ -302,7 +302,7 @@
   category: supply_chain
   severity: medium
   match_type: regex
-  pattern: "(net/minecraft|com/mojang|me/jellysquid/mods/sodium)"
+  pattern: "(^|[\\s;])(?:net/minecraft|com/mojang|me/jellysquid/mods/sodium)/[^\\s;]*\\.class([\\s;]|$)"
   message: "Обнаружено имя класса, похожее на легитимный namespace"
 - rule_id: REMOTE_JAR_LOADING
   category: supply_chain
