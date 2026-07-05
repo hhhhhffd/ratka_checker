@@ -27,6 +27,16 @@ services:
     volumes:
       - ratscan-storage:/app/storage
 
+  dev-ui:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+    ports:
+      - "8081:80"
+    volumes:
+      - ./deploy/frontend:/usr/share/nginx/html:ro
+      - ./dev/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
 volumes:
   postgres-data:
   ratscan-storage:
