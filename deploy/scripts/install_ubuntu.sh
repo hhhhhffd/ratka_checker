@@ -102,6 +102,8 @@ VIRUSTOTAL_CACHE_TTL_HOURS=24
 VIRUSTOTAL_POLL_ATTEMPTS=6
 VIRUSTOTAL_POLL_INTERVAL_SECONDS=10
 EOF
+chown root:ratscan /etc/ratscan
+chmod 0750 /etc/ratscan
 chown root:ratscan /etc/ratscan/ratscan.env
 chmod 0640 /etc/ratscan/ratscan.env
 
