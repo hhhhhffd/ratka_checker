@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ratscan
+      POSTGRES_USER: ratscan
+      POSTGRES_PASSWORD: ratscan
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ratscan -d ratscan"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      DATABASE_URL: postgres://ratscan:ratscan@postgres:5432/ratscan
+      RATSCAN_BIND_ADDR: 0.0.0.0:8080
+      RATSCAN_RULES_PATH: config/rules.yaml
+      RATSCAN_STORAGE_DIR: storage
+      MAX_TOTAL_UNCOMPRESSED_MB: 200
+      MAX_FILES_IN_ARCHIVE: 5000
+      MAX_NESTING_DEPTH: 3
+      MAX_SINGLE_FILE_MB: 50
+      FILE_RETENTION_DAYS: 7
+      FILE_CLEANUP_INTERVAL_MINUTES: 60
+    ports:
+      - "8080:8080"
+    volumes:
+      - ratscan-storage:/app/storage
+
+volumes:
+  postgres-data:
+  ratscan-storage:

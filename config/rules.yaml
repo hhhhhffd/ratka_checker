@@ -1,0 +1,318 @@
+- rule_id: NESTED_JAR
+  category: archive_structure
+  severity: medium
+  match_type: archive_structure
+  pattern: "nested_jar"
+  message: "Обнаружен вложенный jar-архив"
+- rule_id: NATIVE_BINARY
+  category: archive_structure
+  severity: high
+  match_type: archive_structure
+  pattern: "native_binary"
+  message: "Обнаружен исполняемый или нативный файл внутри архива"
+- rule_id: LARGE_ASSET_RESOURCE
+  category: steganography
+  severity: medium
+  match_type: archive_structure
+  pattern: "large_asset"
+  message: "Обнаружен подозрительно большой ресурс в assets/"
+- rule_id: MANIFEST_MAIN_CLASS
+  category: manifest
+  severity: low
+  match_type: manifest_field
+  pattern: "Main-Class"
+  message: "Manifest содержит Main-Class"
+- rule_id: FABRIC_MOD_METADATA
+  category: manifest
+  severity: low
+  match_type: manifest_field
+  pattern: "fabric.mod.json"
+  message: "Обнаружены метаданные Fabric-мода"
+- rule_id: MODS_TOML_METADATA
+  category: manifest
+  severity: low
+  match_type: manifest_field
+  pattern: "mods.toml"
+  message: "Обнаружены метаданные Forge-мода"
+- rule_id: PLUGIN_YML_METADATA
+  category: manifest
+  severity: low
+  match_type: manifest_field
+  pattern: "plugin.yml"
+  message: "Обнаружены метаданные Bukkit/Spigot-плагина"
+- rule_id: RUNTIME_EXEC
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/lang/Runtime.exec"
+  message: "Найден вызов Runtime.exec"
+- rule_id: PROCESS_BUILDER
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/lang/ProcessBuilder"
+  message: "Найдено использование ProcessBuilder"
+- rule_id: URL_CLASS_LOADER
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/net/URLClassLoader"
+  message: "Найдено использование URLClassLoader"
+- rule_id: CLASS_LOADER
+  category: dangerous_api
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/lang/ClassLoader"
+  message: "Найдено использование ClassLoader"
+- rule_id: REFLECTION_API
+  category: dangerous_api
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/lang/reflect"
+  message: "Найдено использование reflection API"
+- rule_id: SOCKET_API
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/net/Socket"
+  message: "Найдено использование Socket API"
+- rule_id: URL_API
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/net/URL"
+  message: "Найдено использование URL API"
+- rule_id: HTTP_URL_CONNECTION
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/net/HttpURLConnection"
+  message: "Найдено использование HttpURLConnection"
+- rule_id: FILE_INPUT_STREAM
+  category: file_access
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/io/FileInputStream"
+  message: "Найдено чтение файлов через FileInputStream"
+- rule_id: FILES_READ
+  category: file_access
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/nio/file/Files.read"
+  message: "Найдено чтение файлов через java.nio.file.Files"
+- rule_id: DISCORD_TOKEN_PATH
+  category: credential_theft
+  severity: critical
+  match_type: string_contains
+  pattern: "discord/Local Storage/leveldb"
+  message: "Обнаружен путь к хранилищу токенов Discord"
+- rule_id: BROWSER_LOGIN_DATA
+  category: credential_theft
+  severity: critical
+  match_type: string_contains
+  pattern: "Login Data"
+  message: "Обнаружен путь к базе логинов браузера"
+- rule_id: BROWSER_LOCAL_STATE
+  category: credential_theft
+  severity: high
+  match_type: string_contains
+  pattern: "Local State"
+  message: "Обнаружен путь к Local State браузера"
+- rule_id: MINECRAFT_SESSION_PATH
+  category: credential_theft
+  severity: critical
+  match_type: string_contains
+  pattern: ".minecraft"
+  message: "Обнаружен доступ к данным Minecraft launcher/session"
+- rule_id: TELEGRAM_SESSION
+  category: credential_theft
+  severity: high
+  match_type: string_contains
+  pattern: "tdata"
+  message: "Обнаружен признак доступа к Telegram session-файлам"
+- rule_id: STEAM_CONFIG
+  category: credential_theft
+  severity: high
+  match_type: string_contains
+  pattern: "Steam/config"
+  message: "Обнаружен признак доступа к Steam config"
+- rule_id: METAMASK_PATH
+  category: credential_theft
+  severity: critical
+  match_type: string_contains
+  pattern: "MetaMask"
+  message: "Обнаружен признак доступа к MetaMask"
+- rule_id: EXODUS_PATH
+  category: credential_theft
+  severity: critical
+  match_type: string_contains
+  pattern: "Exodus"
+  message: "Обнаружен признак доступа к Exodus wallet"
+- rule_id: WEBHOOK_URL
+  category: exfiltration
+  severity: critical
+  match_type: regex
+  pattern: "https://(discord(app)?\\.com/api/webhooks|hooks\\.slack\\.com/services)/[^\\s\"']+"
+  message: "Обнаружена webhook-ссылка для exfiltration"
+- rule_id: PASTEBIN_URL
+  category: exfiltration
+  severity: high
+  match_type: string_contains
+  pattern: "pastebin.com"
+  message: "Обнаружена ссылка на pastebin"
+- rule_id: RAW_GITHUB_URL
+  category: exfiltration
+  severity: medium
+  match_type: string_contains
+  pattern: "raw.githubusercontent.com"
+  message: "Обнаружена ссылка на raw github"
+- rule_id: IPINFO_FINGERPRINT
+  category: fingerprinting
+  severity: high
+  match_type: string_contains
+  pattern: "ipinfo.io"
+  message: "Обнаружен сбор IP/fingerprint через ipinfo.io"
+- rule_id: IPIFY_FINGERPRINT
+  category: fingerprinting
+  severity: high
+  match_type: string_contains
+  pattern: "api.ipify.org"
+  message: "Обнаружен сбор IP/fingerprint через ipify"
+- rule_id: USERNAME_FINGERPRINT
+  category: fingerprinting
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/lang/System.getProperty"
+  message: "Обнаружено получение системных свойств пользователя"
+- rule_id: BASE64_BLOB
+  category: obfuscation
+  severity: medium
+  match_type: regex
+  pattern: "[A-Za-z0-9+/]{120,}={0,2}"
+  message: "Обнаружена длинная base64-подобная строка"
+- rule_id: INVALID_CLASS_CONSTANT_POOL
+  category: obfuscation
+  severity: high
+  match_type: archive_structure
+  pattern: "invalid_class_constant_pool"
+  message: "Обнаружен битый или невалидный constant pool class-файла"
+- rule_id: XOR_LOOP_HINT
+  category: obfuscation
+  severity: medium
+  match_type: string_contains
+  pattern: "xor"
+  message: "Обнаружен признак XOR/rot decoding"
+- rule_id: REGISTRY_RUN_KEY
+  category: persistence
+  severity: critical
+  match_type: string_contains
+  pattern: "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+  message: "Обнаружен persistence через Run key"
+- rule_id: REG_ADD
+  category: persistence
+  severity: critical
+  match_type: string_contains
+  pattern: "reg add"
+  message: "Обнаружена команда изменения реестра"
+- rule_id: SCHTASKS
+  category: persistence
+  severity: critical
+  match_type: string_contains
+  pattern: "schtasks"
+  message: "Обнаружено создание задачи планировщика"
+- rule_id: MODS_SELF_COPY
+  category: persistence
+  severity: high
+  match_type: string_contains
+  pattern: "mods/"
+  message: "Обнаружен признак самокопирования в каталог mods"
+- rule_id: XMRIG
+  category: mining
+  severity: critical
+  match_type: string_contains
+  pattern: "xmrig"
+  message: "Обнаружена строка XMRig"
+- rule_id: STRATUM_TCP
+  category: mining
+  severity: critical
+  match_type: string_contains
+  pattern: "stratum+tcp://"
+  message: "Обнаружен mining pool endpoint"
+- rule_id: TASK_MANAGER_THROTTLE
+  category: mining
+  severity: high
+  match_type: string_contains
+  pattern: "Taskmgr.exe"
+  message: "Обнаружен признак троттлинга при открытом диспетчере задач"
+- rule_id: AWT_ROBOT
+  category: spyware
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/awt/Robot"
+  message: "Обнаружен доступ к java.awt.Robot"
+- rule_id: MICROPHONE_ACCESS
+  category: spyware
+  severity: high
+  match_type: bytecode_ref
+  pattern: "javax/sound/sampled/TargetDataLine"
+  message: "Обнаружен доступ к микрофону"
+- rule_id: CAMERA_ACCESS
+  category: spyware
+  severity: high
+  match_type: string_contains
+  pattern: "webcam"
+  message: "Обнаружен признак доступа к камере"
+- rule_id: CLIPBOARD_ACCESS
+  category: spyware
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/awt/datatransfer/Clipboard"
+  message: "Обнаружен доступ к clipboard"
+- rule_id: VMWARE_CHECK
+  category: evasion
+  severity: high
+  match_type: string_contains
+  pattern: "vmware"
+  message: "Обнаружена проверка VMware"
+- rule_id: SANDBOXIE_CHECK
+  category: evasion
+  severity: high
+  match_type: string_contains
+  pattern: "sandboxie"
+  message: "Обнаружена проверка Sandboxie"
+- rule_id: ANTIVIRUS_PROCESS_CHECK
+  category: evasion
+  severity: medium
+  match_type: regex
+  pattern: "(avast|avg|kaspersky|defender|msmpeng|wireshark|processhacker)"
+  message: "Обнаружен поиск процессов анализа или антивирусов"
+- rule_id: LONG_SLEEP
+  category: evasion
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/lang/Thread.sleep"
+  message: "Обнаружено использование Thread.sleep"
+- rule_id: MOD_ID_TYPOSQUATTING
+  category: supply_chain
+  severity: high
+  match_type: regex
+  pattern: "(Sodiumm|OptiFinee|Sodlum|Optif1ne)"
+  message: "Обнаружен подозрительный ID/бренд мода, похожий на известный"
+- rule_id: LEGIT_CLASS_NAME_INJECTION
+  category: supply_chain
+  severity: medium
+  match_type: regex
+  pattern: "(net/minecraft|com/mojang|me/jellysquid/mods/sodium)"
+  message: "Обнаружено имя класса, похожее на легитимный namespace"
+- rule_id: REMOTE_JAR_LOADING
+  category: supply_chain
+  severity: critical
+  match_type: string_contains
+  pattern: ".jar"
+  message: "Обнаружен признак динамической догрузки jar"
+- rule_id: BYTECODE_VERSION_MISMATCH
+  category: supply_chain
+  severity: medium
+  match_type: archive_structure
+  pattern: "bytecode_version_mismatch"
+  message: "Обнаружено несоответствие bytecode-версий class-файлов"
