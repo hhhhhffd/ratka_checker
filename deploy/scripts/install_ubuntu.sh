@@ -130,10 +130,13 @@ systemctl enable --now nginx
 systemctl reload nginx
 
 API_KEY_FILE="/root/ratscan-api-key.txt"
-if [ ! -f "$API_KEY_FILE" ]; then
+if [ ! -s "$API_KEY_FILE" ]; then
+    TEMP_API_KEY_FILE="$(mktemp)"
     runuser -u ratscan -- bash -c \
         'cd /opt/ratscan && set -a && . /etc/ratscan/ratscan.env && set +a && /opt/ratscan/bin/ratscan seed-api-key --label web-test' \
-        >"$API_KEY_FILE"
+        >"$TEMP_API_KEY_FILE"
+    install -m 0600 "$TEMP_API_KEY_FILE" "$API_KEY_FILE"
+    rm -f "$TEMP_API_KEY_FILE"
     chmod 0600 "$API_KEY_FILE"
 fi
 
