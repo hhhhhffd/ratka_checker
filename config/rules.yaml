@@ -54,10 +54,10 @@
   message: "Обнаружен битый или невалидный constant pool class-файла"
 - rule_id: BYTECODE_VERSION_MISMATCH
   category: supply_chain
-  severity: medium
+  severity: low
   match_type: archive_structure
   pattern: "bytecode_version_mismatch"
-  message: "Обнаружено несоответствие bytecode-версий class-файлов"
+  message: "Обнаружена смесь bytecode-версий class-файлов; само по себе не доказывает угрозу"
 - rule_id: MANIFEST_MAIN_CLASS
   category: manifest
   severity: low
@@ -84,16 +84,16 @@
   message: "Manifest содержит Java Agent-Class hook"
 - rule_id: RUNTIME_EXEC
   category: dangerous_api
-  severity: high
+  severity: low
   match_type: bytecode_ref
   pattern: "java/lang/Runtime.exec"
-  message: "Найден вызов Runtime.exec"
+  message: "Найден Runtime.exec без подтвержденной download/execute цепочки"
 - rule_id: PROCESS_BUILDER
   category: dangerous_api
-  severity: high
+  severity: low
   match_type: bytecode_ref
   pattern: "java/lang/ProcessBuilder"
-  message: "Найдено использование ProcessBuilder"
+  message: "Найден ProcessBuilder без подтвержденной download/execute цепочки"
 - rule_id: URL_CLASS_LOADER
   category: dangerous_api
   severity: low
@@ -102,10 +102,10 @@
   message: "Найдено использование URLClassLoader без подтвержденной опасной цепочки"
 - rule_id: CLASS_LOADER_DEFINE_CLASS
   category: dangerous_api
-  severity: medium
+  severity: low
   match_type: bytecode_ref
   pattern: "java/lang/ClassLoader.defineClass"
-  message: "Найдено динамическое определение class через ClassLoader.defineClass"
+  message: "Найден defineClass без подтвержденной подкачки кода"
 - rule_id: FILES_WRITE
   category: dangerous_api
   severity: low
@@ -222,10 +222,10 @@
   message: "Обнаружен paste-сервис для конфигов или exfiltration"
 - rule_id: RAW_GITHUB_URL
   category: exfiltration
-  severity: medium
+  severity: low
   match_type: string_contains
   pattern: "raw.githubusercontent.com"
-  message: "Обнаружена ссылка на raw github"
+  message: "Найдена ссылка на raw github; само по себе часто используется для updater/assets"
 - rule_id: NGROK_TUNNEL
   category: exfiltration
   severity: high
@@ -294,10 +294,10 @@
   message: "Обнаружено создание задачи планировщика"
 - rule_id: MODS_SELF_COPY
   category: persistence
-  severity: high
+  severity: low
   match_type: string_contains
   pattern: "mods/"
-  message: "Обнаружен признак самокопирования в каталог mods"
+  message: "Найдена строка mods/; само по себе не доказывает self-copy"
 - rule_id: XMRIG
   category: mining
   severity: critical
@@ -382,6 +382,30 @@
   match_type: archive_structure
   pattern: "download_write_exec"
   message: "Комбо HTTP + запись файла + запуск процесса"
+- rule_id: REMOTE_CLASS_LOADING
+  category: correlation
+  severity: critical
+  match_type: archive_structure
+  pattern: "remote_class_loading"
+  message: "Обнаружена подкачка: сетевой API + defineClass/URLClassLoader в одном classfile"
+- rule_id: NATIVE_LIB_REMOTE_LOAD
+  category: correlation
+  severity: critical
+  match_type: archive_structure
+  pattern: "native_lib_remote_load"
+  message: "Обнаружена подкачка нативного payload: сеть + System.load/loadLibrary в одном classfile"
+- rule_id: SCRIPT_DOWNLOAD_EXEC
+  category: correlation
+  severity: critical
+  match_type: archive_structure
+  pattern: "script_download_exec"
+  message: "Обнаружена подкачка через ProcessBuilder/Runtime.exec после сетевого API в одном classfile"
+- rule_id: EXTERNAL_URLCLASSLOADER
+  category: correlation
+  severity: high
+  match_type: archive_structure
+  pattern: "urlclassloader_external_target"
+  message: "URLClassLoader связан с внешним http(s) источником, а не только с локальным jar"
 - rule_id: CORRELATION_CREDENTIAL_HTTP
   category: correlation
   severity: critical

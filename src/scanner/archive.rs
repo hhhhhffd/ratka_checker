@@ -30,12 +30,33 @@ const ROBOT_HTTP_SIGNAL: &str = "robot_with_http";
 const CLIPBOARD_CRYPTO_SIGNAL: &str = "clipboard_crypto_address";
 const MIXIN_METADATA_SIGNAL: &str = "mixin_metadata_present";
 const HTTP_DYNAMIC_CLASSLOAD_SIGNAL: &str = "http_dynamic_class_loading";
+const REMOTE_CLASS_LOADING_SIGNAL: &str = "remote_class_loading";
+const NATIVE_LIB_REMOTE_LOAD_SIGNAL: &str = "native_lib_remote_load";
+const SCRIPT_DOWNLOAD_EXEC_SIGNAL: &str = "script_download_exec";
+const EXTERNAL_URLCLASSLOADER_SIGNAL: &str = "urlclassloader_external_target";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
 const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
 const TIMESTAMP_DOMINANT_PERCENT: usize = 90;
 const SHORT_CLASS_NAME_MIN_CLASSES: usize = 8;
 const SHORT_CLASS_NAME_PERCENT: usize = 70;
+const NETWORK_APIS: &[&str] = &[
+    "java/net/Socket",
+    "java/net/URL",
+    "java/net/HttpURLConnection",
+    "javax/net/ssl/HttpsURLConnection",
+    "java/net/http/HttpClient",
+    "java/net/http/HttpRequest",
+];
+const DYNAMIC_CLASS_APIS: &[&str] =
+    &["java/lang/ClassLoader.defineClass", "java/net/URLClassLoader"];
+const NATIVE_LOAD_APIS: &[&str] = &[
+    "java/lang/Runtime.load",
+    "java/lang/Runtime.loadLibrary",
+    "java/lang/System.load",
+    "java/lang/System.loadLibrary",
+];
+const EXEC_APIS: &[&str] = &["java/lang/Runtime.exec", "java/lang/ProcessBuilder"];
 
 /// Named zip-bomb limits loaded from environment through AppConfig.
 #[derive(Clone, Copy, Debug)]
@@ -55,9 +76,17 @@ pub struct ScanData {
     pub archive_signals: Vec<String>,
     pub class_major_versions: Vec<u16>,
     pub class_names: Vec<String>,
+    pub class_files: Vec<ClassScanData>,
     pub mod_ids: Vec<String>,
     pub mod_aliases: Vec<String>,
     pub entry_timestamps: Vec<(String, String)>,
+}
+
+/// Per-class data used for lower-noise correlation signals.
+#[derive(Clone, Debug, Default)]
+pub struct ClassScanData {
+    pub strings: Vec<String>,
+    pub bytecode_refs: Vec<String>,
 }
 
 /// Complete scanner result ready to persist after risk scoring.
@@ -269,6 +298,10 @@ impl ArchiveContext {
         if lower.ends_with(".class") {
             match class_file::parse_class_file(bytes) {
                 Ok(class_data) => {
+                    self.data.class_files.push(ClassScanData {
+                        strings: class_data.strings.clone(),
+                        bytecode_refs: class_data.bytecode_refs.clone(),
+                    });
                     self.data.strings.extend(class_data.strings);
                     self.data.bytecode_refs.extend(class_data.bytecode_refs);
                     self.data.archive_signals.extend(class_data.archive_signals);
@@ -420,6 +453,8 @@ impl ArchiveContext {
     }
 
     fn add_correlation_signals(&mut self) {
+        self.add_class_correlation_signals();
+
         let has_http = self.has_ref_any(&[
             "java/net/HttpURLConnection",
             "javax/net/ssl/HttpsURLConnection",
@@ -478,12 +513,40 @@ impl ArchiveContext {
         }
     }
 
+    fn add_class_correlation_signals(&mut self) {
+        for class_file in &self.data.class_files {
+            let has_network = refs_contain_any(&class_file.bytecode_refs, NETWORK_APIS);
+            if !has_network {
+                continue;
+            }
+
+            if refs_contain_any(&class_file.bytecode_refs, DYNAMIC_CLASS_APIS) {
+                self.data
+                    .archive_signals
+                    .push(REMOTE_CLASS_LOADING_SIGNAL.to_owned());
+            }
+            if refs_contain_any(&class_file.bytecode_refs, NATIVE_LOAD_APIS) {
+                self.data
+                    .archive_signals
+                    .push(NATIVE_LIB_REMOTE_LOAD_SIGNAL.to_owned());
+            }
+            if refs_contain_any(&class_file.bytecode_refs, EXEC_APIS) {
+                self.data
+                    .archive_signals
+                    .push(SCRIPT_DOWNLOAD_EXEC_SIGNAL.to_owned());
+            }
+            if refs_contain_any(&class_file.bytecode_refs, &["java/net/URLClassLoader"])
+                && strings_contain_external_url(&class_file.strings)
+            {
+                self.data
+                    .archive_signals
+                    .push(EXTERNAL_URLCLASSLOADER_SIGNAL.to_owned());
+            }
+        }
+    }
+
     fn has_ref_any(&self, patterns: &[&str]) -> bool {
-        patterns.iter().any(|pattern| {
-            self.data.bytecode_refs.iter().any(|candidate| {
-                candidate.eq_ignore_ascii_case(pattern) || candidate.contains(pattern)
-            })
-        })
+        refs_contain_any(&self.data.bytecode_refs, patterns)
     }
 
     fn has_string_any(&self, patterns: &[&str]) -> bool {
@@ -502,6 +565,21 @@ impl ArchiveContext {
             lower.contains("bc1q") || lower.contains("bc1p") || lower.contains("0x")
         })
     }
+}
+
+fn refs_contain_any(refs: &[String], patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| {
+        refs.iter().any(|candidate| {
+            candidate.eq_ignore_ascii_case(pattern) || candidate.contains(pattern)
+        })
+    })
+}
+
+fn strings_contain_external_url(strings: &[String]) -> bool {
+    strings.iter().any(|candidate| {
+        let lower = candidate.to_ascii_lowercase();
+        lower.contains("http://") || lower.contains("https://")
+    })
 }
 
 fn is_native_binary(bytes: &[u8]) -> bool {
@@ -612,10 +690,12 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        models::scan::{Finding, Severity, Verdict},
-        scanner::archive::{risk_score, summarize},
+    use super::{
+        risk_score, summarize, ArchiveContext, ClassScanData, ScanData, ScanLimits,
+        EXTERNAL_URLCLASSLOADER_SIGNAL, REMOTE_CLASS_LOADING_SIGNAL,
     };
+
+    use crate::models::scan::{Finding, Severity, Verdict};
 
     /// Verifies the fixed severity weights are capped at 100.
     #[test]
@@ -648,5 +728,79 @@ mod tests {
     fn clean_summary_is_not_absolute() {
         let summary = summarize(&[], Verdict::Clean);
         assert!(summary.contains("не гарантия"));
+    }
+
+    /// Verifies remote class loading requires network and loader APIs in one class file.
+    #[test]
+    fn class_correlation_detects_remote_class_loading_in_one_class() {
+        let mut context = test_context(vec![ClassScanData {
+            strings: Vec::new(),
+            bytecode_refs: vec![
+                "java/net/http/HttpClient".to_owned(),
+                "java/lang/ClassLoader.defineClass".to_owned(),
+            ],
+        }]);
+
+        context.add_correlation_signals();
+
+        assert!(context
+            .data
+            .archive_signals
+            .contains(&REMOTE_CLASS_LOADING_SIGNAL.to_owned()));
+    }
+
+    /// Verifies unrelated classes do not produce the lower-noise class correlation.
+    #[test]
+    fn class_correlation_ignores_refs_split_across_classes() {
+        let mut context = test_context(vec![
+            ClassScanData {
+                strings: Vec::new(),
+                bytecode_refs: vec!["java/net/http/HttpClient".to_owned()],
+            },
+            ClassScanData {
+                strings: Vec::new(),
+                bytecode_refs: vec!["java/lang/ClassLoader.defineClass".to_owned()],
+            },
+        ]);
+
+        context.add_class_correlation_signals();
+
+        assert!(!context
+            .data
+            .archive_signals
+            .contains(&REMOTE_CLASS_LOADING_SIGNAL.to_owned()));
+    }
+
+    /// Verifies URLClassLoader with an external URL is emitted as a separate high signal.
+    #[test]
+    fn class_correlation_detects_external_urlclassloader_target() {
+        let mut context = test_context(vec![ClassScanData {
+            strings: vec!["https://example.invalid/payload.jar".to_owned()],
+            bytecode_refs: vec!["java/net/URL".to_owned(), "java/net/URLClassLoader".to_owned()],
+        }]);
+
+        context.add_class_correlation_signals();
+
+        assert!(context
+            .data
+            .archive_signals
+            .contains(&EXTERNAL_URLCLASSLOADER_SIGNAL.to_owned()));
+    }
+
+    fn test_context(class_files: Vec<ClassScanData>) -> ArchiveContext {
+        ArchiveContext {
+            limits: ScanLimits {
+                max_total_uncompressed_bytes: 1,
+                max_files_in_archive: 1,
+                max_nesting_depth: 1,
+                max_single_file_bytes: 1,
+            },
+            total_uncompressed_bytes: 0,
+            file_count: 0,
+            data: ScanData {
+                class_files,
+                ..Default::default()
+            },
+        }
     }
 }

@@ -139,6 +139,7 @@ mod tests {
             archive_signals: Vec::new(),
             class_major_versions: Vec::new(),
             class_names: Vec::new(),
+            class_files: Vec::new(),
             mod_ids: Vec::new(),
             mod_aliases: Vec::new(),
             entry_timestamps: Vec::new(),
