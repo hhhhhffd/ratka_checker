@@ -2,6 +2,7 @@
 set -eu
 
 RUST_IMAGE="${RUST_IMAGE:-rust:1.88-bookworm}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 OUT_DIR="${1:-dist/ratscan}"
 CARGO_CACHE_DIR="${CARGO_CACHE_DIR:-.cargo-cache}"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-.docker-target}"
@@ -17,6 +18,7 @@ mkdir -p "$OUT_DIR" "$CARGO_CACHE_DIR" "$CARGO_TARGET_DIR"
 
 # Cargo runs in Docker, but cache/target/output are mounted into the repo and owned by the host user.
 docker run --rm \
+    --platform "$DOCKER_PLATFORM" \
     --user "$(id -u):$(id -g)" \
     -v "$PWD":/app \
     -w /app \
