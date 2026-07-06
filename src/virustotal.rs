@@ -6,8 +6,8 @@ use serde::Deserialize;
 use crate::{
     config::VirusTotalConfig,
     models::scan::{
-        Finding, Severity, VirusTotalEngineResult, VirusTotalReport, VirusTotalSource,
-        VirusTotalStats, VirusTotalStatus,
+        Finding, Severity, VirusTotalBehaviorInfo, VirusTotalEngineResult, VirusTotalReport,
+        VirusTotalSource, VirusTotalStats, VirusTotalStatus,
     },
 };
 
@@ -58,6 +58,7 @@ pub async fn analyze_file(
             names: Vec::new(),
             first_submission_date: None,
             permalink: None,
+            behavior: behavior_info(None),
             error: Some(
                 "file is unknown to VirusTotal and exceeds the 32MB upload limit".to_owned(),
             ),
@@ -78,6 +79,7 @@ pub fn error_report(message: String) -> VirusTotalReport {
         names: Vec::new(),
         first_submission_date: None,
         permalink: None,
+        behavior: behavior_info(None),
         error: Some(message),
     }
 }
@@ -234,12 +236,14 @@ async fn poll_analysis(
         names: Vec::new(),
         first_submission_date: None,
         permalink: None,
+        behavior: behavior_info(None),
         error: None,
     })
 }
 
 fn file_report(file: FileObject, source: VirusTotalSource) -> VirusTotalReport {
     let permalink = file.links.and_then(|links| links.self_url);
+    let behavior_available = file.attributes.behavior_available();
     VirusTotalReport {
         status: VirusTotalStatus::Completed,
         source,
@@ -248,6 +252,7 @@ fn file_report(file: FileObject, source: VirusTotalSource) -> VirusTotalReport {
         names: file.attributes.names,
         first_submission_date: file.attributes.first_submission_date,
         permalink,
+        behavior: behavior_info(behavior_available),
         error: None,
     }
 }
@@ -261,8 +266,13 @@ fn analysis_report(analysis: AnalysisObject) -> VirusTotalReport {
         names: Vec::new(),
         first_submission_date: None,
         permalink: None,
+        behavior: behavior_info(None),
         error: None,
     }
+}
+
+fn behavior_info(available: Option<bool>) -> Option<VirusTotalBehaviorInfo> {
+    Some(VirusTotalBehaviorInfo::minecraft_mod_note(available))
 }
 
 fn flagged_engines(
@@ -319,6 +329,41 @@ struct FileAttributes {
     #[serde(default)]
     names: Vec<String>,
     first_submission_date: Option<i64>,
+    #[serde(default)]
+    sandbox_verdicts: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    threat_severity: Option<ThreatSeverity>,
+}
+
+impl FileAttributes {
+    fn behavior_available(&self) -> Option<bool> {
+        self.threat_severity
+            .as_ref()
+            .and_then(|severity| {
+                severity
+                    .threat_severity_data
+                    .as_ref()
+                    .and_then(|data| data.can_be_detonated)
+            })
+            .or_else(|| {
+                if self.sandbox_verdicts.is_empty() {
+                    None
+                } else {
+                    Some(true)
+                }
+            })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThreatSeverity {
+    #[serde(default)]
+    threat_severity_data: Option<ThreatSeverityData>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ThreatSeverityData {
+    can_be_detonated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,6 +420,7 @@ mod tests {
             names: Vec::new(),
             first_submission_date: None,
             permalink: None,
+            behavior: behavior_info(None),
             error: None,
         };
 
@@ -394,9 +440,24 @@ mod tests {
             names: Vec::new(),
             first_submission_date: None,
             permalink: None,
+            behavior: behavior_info(None),
             error: None,
         };
 
         assert!(findings_for_report(&report).is_empty());
+    }
+
+    #[test]
+    fn file_attributes_report_behavior_availability() {
+        let attributes = FileAttributes {
+            threat_severity: Some(ThreatSeverity {
+                threat_severity_data: Some(ThreatSeverityData {
+                    can_be_detonated: Some(true),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(attributes.behavior_available(), Some(true));
     }
 }

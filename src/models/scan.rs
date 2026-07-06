@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+const MINECRAFT_BEHAVIOR_NOTE: &str = "VirusTotal behavior/sandbox используется как внешний дополнительный сигнал. Для Minecraft Fabric/Forge модов это нельзя считать главным verdict, потому что песочница может не запустить jar внутри реального Minecraft-клиента с нужным loader, Java, версией игры, конфигом и действиями пользователя. Учитывайте конкретные артефакты поведения, например contacted URLs/IPs, dropped files или bad sandbox verdicts, только как подтверждение вместе со статическим анализом мода.";
+
 /// Persistent scan lifecycle state exposed by API responses.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -150,8 +152,36 @@ pub struct VirusTotalReport {
     pub first_submission_date: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<VirusTotalBehaviorInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl VirusTotalReport {
+    /// Ensures all VirusTotal API responses explain how to interpret sandbox behaviour data.
+    pub fn ensure_behavior_note(&mut self) {
+        if self.behavior.is_none() {
+            self.behavior = Some(VirusTotalBehaviorInfo::minecraft_mod_note(None));
+        }
+    }
+}
+
+/// Advisory dynamic-analysis context from VirusTotal sandbox/behaviour data.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VirusTotalBehaviorInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    pub note: String,
+}
+
+impl VirusTotalBehaviorInfo {
+    pub fn minecraft_mod_note(available: Option<bool>) -> Self {
+        Self {
+            available,
+            note: MINECRAFT_BEHAVIOR_NOTE.to_owned(),
+        }
+    }
 }
 
 /// Coarse VirusTotal lifecycle state exposed without leaking raw API response shape.

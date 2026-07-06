@@ -52,3 +52,7 @@ VirusTotal is optional and disabled by default. Set `VIRUSTOTAL_ENABLED=true`
 and provide `VIRUSTOTAL_API_KEY` to add the `virustotal` field to scan
 responses. Reports are cached by sha256 in PostgreSQL using
 `VIRUSTOTAL_CACHE_TTL_HOURS` to avoid repeated quota usage for the same jar.
+The `virustotal.behavior` field is advisory for Minecraft mods: sandbox data
+can support the static verdict when concrete artifacts exist, but it is not used
+as the primary signal because VirusTotal may not detonate Fabric/Forge jars in a
+real Minecraft client context.
