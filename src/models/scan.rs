@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const MINECRAFT_BEHAVIOR_NOTE: &str = "VirusTotal behavior/sandbox используется как внешний дополнительный сигнал. Для Minecraft Fabric/Forge модов это нельзя считать главным verdict, потому что песочница может не запустить jar внутри реального Minecraft-клиента с нужным loader, Java, версией игры, конфигом и действиями пользователя. Учитывайте конкретные артефакты поведения, например contacted URLs/IPs, dropped files или bad sandbox verdicts, только как подтверждение вместе со статическим анализом мода.";
-
 /// Persistent scan lifecycle state exposed by API responses.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -159,10 +157,10 @@ pub struct VirusTotalReport {
 }
 
 impl VirusTotalReport {
-    /// Ensures all VirusTotal API responses explain how to interpret sandbox behaviour data.
-    pub fn ensure_behavior_note(&mut self) {
+    /// Ensures cached legacy VirusTotal API responses have the current behavior shape.
+    pub fn ensure_behavior_shape(&mut self) {
         if self.behavior.is_none() {
-            self.behavior = Some(VirusTotalBehaviorInfo::minecraft_mod_note(None));
+            self.behavior = Some(VirusTotalBehaviorInfo::empty(None));
         }
     }
 }
@@ -172,14 +170,66 @@ impl VirusTotalReport {
 pub struct VirusTotalBehaviorInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
-    pub note: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<VirusTotalBehaviorReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacted_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacted_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacted_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_written: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes_created: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_executions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_lookups: Vec<String>,
+}
+
+/// One VirusTotal sandbox/behaviour report condensed for API consumers.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct VirusTotalBehaviorReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_date: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacted_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacted_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacted_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files_written: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes_created: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_executions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_lookups: Vec<String>,
 }
 
 impl VirusTotalBehaviorInfo {
-    pub fn minecraft_mod_note(available: Option<bool>) -> Self {
+    pub fn empty(available: Option<bool>) -> Self {
         Self {
             available,
-            note: MINECRAFT_BEHAVIOR_NOTE.to_owned(),
+            reports: Vec::new(),
+            contacted_ips: Vec::new(),
+            contacted_domains: Vec::new(),
+            contacted_urls: Vec::new(),
+            dropped_files: Vec::new(),
+            files_written: Vec::new(),
+            processes_created: Vec::new(),
+            command_executions: Vec::new(),
+            dns_lookups: Vec::new(),
         }
     }
 }

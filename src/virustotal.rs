@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use reqwest::{multipart, StatusCode};
 use serde::Deserialize;
@@ -6,12 +9,15 @@ use serde::Deserialize;
 use crate::{
     config::VirusTotalConfig,
     models::scan::{
-        Finding, Severity, VirusTotalBehaviorInfo, VirusTotalEngineResult, VirusTotalReport,
-        VirusTotalSource, VirusTotalStats, VirusTotalStatus,
+        Finding, Severity, VirusTotalBehaviorInfo, VirusTotalBehaviorReport,
+        VirusTotalEngineResult, VirusTotalReport, VirusTotalSource, VirusTotalStats,
+        VirusTotalStatus,
     },
 };
 
 const API_BASE_URL: &str = "https://www.virustotal.com/api/v3";
+const BEHAVIOR_VALUE_LIMIT: usize = 50;
+const BEHAVIOR_STRING_LIMIT: usize = 300;
 const FLAGGED_CATEGORIES: &[&str] = &["malicious", "suspicious"];
 const TRUSTED_ENGINES: &[&str] = &[
     "BitDefender",
@@ -66,7 +72,7 @@ pub async fn analyze_file(
     }
 
     let analysis_id = upload_file(&client, api_key, file_path, filename).await?;
-    poll_analysis(&client, api_key, &analysis_id, config).await
+    poll_analysis(&client, api_key, &analysis_id, sha256, config).await
 }
 
 /// Builds a public error report without exposing credentials or internal request details.
@@ -176,10 +182,45 @@ async fn lookup_file(
     }
     let response = response.error_for_status()?;
     let payload = response.json::<VirusTotalData<FileObject>>().await?;
-    Ok(LookupResult::Found(file_report(
-        payload.data,
-        VirusTotalSource::Lookup,
-    )))
+    let mut report = file_report(payload.data, VirusTotalSource::Lookup);
+    match lookup_file_behaviours(client, api_key, sha256).await {
+        Ok(Some(behavior)) => {
+            report.behavior = Some(behavior);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(sha256, %error, "VirusTotal behaviour lookup failed");
+        }
+    }
+    Ok(LookupResult::Found(report))
+}
+
+async fn lookup_file_behaviours(
+    client: &reqwest::Client,
+    api_key: &str,
+    sha256: &str,
+) -> anyhow::Result<Option<VirusTotalBehaviorInfo>> {
+    let response = client
+        .get(format!("{API_BASE_URL}/files/{sha256}/behaviours"))
+        .header("x-apikey", api_key)
+        .send()
+        .await?;
+
+    if matches!(
+        response.status(),
+        StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return Ok(None);
+    }
+
+    let response = response.error_for_status()?;
+    let payload = response
+        .json::<VirusTotalData<Vec<VirusTotalBehaviorObject>>>()
+        .await?;
+    if payload.data.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(behavior_info_from_reports(payload.data)))
 }
 
 async fn upload_file(
@@ -208,6 +249,7 @@ async fn poll_analysis(
     client: &reqwest::Client,
     api_key: &str,
     analysis_id: &str,
+    sha256: &str,
     config: &VirusTotalConfig,
 ) -> anyhow::Result<VirusTotalReport> {
     for attempt in 0..config.poll_attempts {
@@ -221,7 +263,11 @@ async fn poll_analysis(
             .await?;
 
         if response.data.attributes.status == "completed" {
-            return Ok(analysis_report(response.data));
+            let mut report = analysis_report(response.data);
+            if let Ok(Some(behavior)) = lookup_file_behaviours(client, api_key, sha256).await {
+                report.behavior = Some(behavior);
+            }
+            return Ok(report);
         }
         if attempt + 1 < config.poll_attempts {
             tokio::time::sleep(config.poll_interval).await;
@@ -272,7 +318,160 @@ fn analysis_report(analysis: AnalysisObject) -> VirusTotalReport {
 }
 
 fn behavior_info(available: Option<bool>) -> Option<VirusTotalBehaviorInfo> {
-    Some(VirusTotalBehaviorInfo::minecraft_mod_note(available))
+    Some(VirusTotalBehaviorInfo::empty(available))
+}
+
+fn behavior_info_from_reports(
+    behavior_reports: Vec<VirusTotalBehaviorObject>,
+) -> VirusTotalBehaviorInfo {
+    let mut behavior = VirusTotalBehaviorInfo::empty(Some(true));
+    for raw_report in behavior_reports {
+        let report = behavior_report_from_attributes(raw_report.attributes);
+        extend_unique(&mut behavior.contacted_ips, &report.contacted_ips);
+        extend_unique(&mut behavior.contacted_domains, &report.contacted_domains);
+        extend_unique(&mut behavior.contacted_urls, &report.contacted_urls);
+        extend_unique(&mut behavior.dropped_files, &report.dropped_files);
+        extend_unique(&mut behavior.files_written, &report.files_written);
+        extend_unique(&mut behavior.processes_created, &report.processes_created);
+        extend_unique(&mut behavior.command_executions, &report.command_executions);
+        extend_unique(&mut behavior.dns_lookups, &report.dns_lookups);
+        behavior.reports.push(report);
+    }
+    behavior
+}
+
+fn behavior_report_from_attributes(attributes: serde_json::Value) -> VirusTotalBehaviorReport {
+    VirusTotalBehaviorReport {
+        sandbox_name: string_field(&attributes, &["sandbox_name", "sandbox", "environment_id"]),
+        analysis_date: integer_field(&attributes, &["analysis_date", "date"]),
+        verdict: string_field(
+            &attributes,
+            &["verdict", "sandbox_verdict", "classification", "category"],
+        ),
+        contacted_ips: field_strings(
+            &attributes,
+            &["contacted_ips", "ip_traffic", "network", "hosts"],
+        ),
+        contacted_domains: field_strings(
+            &attributes,
+            &["contacted_domains", "domains", "dns_lookups", "hosts"],
+        ),
+        contacted_urls: field_strings(
+            &attributes,
+            &["contacted_urls", "http_conversations", "urls"],
+        ),
+        dropped_files: field_strings(&attributes, &["dropped_files", "files_dropped"]),
+        files_written: field_strings(
+            &attributes,
+            &["files_written", "files_created", "files_deleted"],
+        ),
+        processes_created: field_strings(
+            &attributes,
+            &[
+                "processes_created",
+                "processes_terminated",
+                "process_tree",
+                "processes",
+            ],
+        ),
+        command_executions: field_strings(
+            &attributes,
+            &[
+                "command_executions",
+                "commands_executed",
+                "cmd",
+                "command_line",
+            ],
+        ),
+        dns_lookups: field_strings(&attributes, &["dns_lookups", "dns_requests"]),
+    }
+}
+
+fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(json_string)
+        .map(truncate_behavior_string)
+}
+
+fn integer_field(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(serde_json::Value::as_i64)
+}
+
+fn field_strings(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    let mut output = Vec::new();
+    for key in keys {
+        if let Some(field_value) = value.get(*key) {
+            collect_json_strings(field_value, &mut output);
+        }
+    }
+    unique_limited(output)
+}
+
+fn collect_json_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    if output.len() >= BEHAVIOR_VALUE_LIMIT {
+        return;
+    }
+    match value {
+        serde_json::Value::String(text) => output.push(truncate_behavior_string(text)),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, output);
+                if output.len() >= BEHAVIOR_VALUE_LIMIT {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values() {
+                collect_json_strings(value, output);
+                if output.len() >= BEHAVIOR_VALUE_LIMIT {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Number(number) => output.push(number.to_string()),
+        _ => {}
+    }
+}
+
+fn json_string(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, values: &[String]) {
+    let mut seen = target.iter().cloned().collect::<HashSet<_>>();
+    for value in values {
+        if target.len() >= BEHAVIOR_VALUE_LIMIT {
+            break;
+        }
+        if seen.insert(value.clone()) {
+            target.push(value.clone());
+        }
+    }
+}
+
+fn unique_limited(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for value in values {
+        if output.len() >= BEHAVIOR_VALUE_LIMIT {
+            break;
+        }
+        if seen.insert(value.clone()) {
+            output.push(value);
+        }
+    }
+    output
+}
+
+fn truncate_behavior_string(value: &str) -> String {
+    value.chars().take(BEHAVIOR_STRING_LIMIT).collect()
 }
 
 fn flagged_engines(
@@ -318,6 +517,11 @@ struct VirusTotalData<T> {
 struct FileObject {
     attributes: FileAttributes,
     links: Option<FileLinks>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VirusTotalBehaviorObject {
+    attributes: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -459,5 +663,33 @@ mod tests {
         };
 
         assert_eq!(attributes.behavior_available(), Some(true));
+    }
+
+    #[test]
+    fn behavior_reports_are_condensed_into_artifacts() {
+        let behavior = behavior_info_from_reports(vec![VirusTotalBehaviorObject {
+            attributes: serde_json::json!({
+                "sandbox_name": "Zenbox",
+                "verdict": "malicious",
+                "contacted_ips": ["203.0.113.10"],
+                "contacted_domains": ["example.invalid"],
+                "contacted_urls": ["https://example.invalid/payload"],
+                "dropped_files": [{"sha256": "abc123", "path": "C:\\\\Temp\\\\x.dll"}],
+                "files_written": ["C:\\\\Temp\\\\x.dll"],
+                "processes_created": [{"command_line": "java -jar sample.jar"}],
+                "command_executions": ["cmd.exe /c whoami"],
+                "dns_lookups": ["example.invalid"]
+            }),
+        }]);
+
+        assert_eq!(behavior.available, Some(true));
+        assert_eq!(behavior.reports.len(), 1);
+        assert!(behavior.contacted_ips.contains(&"203.0.113.10".to_owned()));
+        assert!(behavior
+            .contacted_domains
+            .contains(&"example.invalid".to_owned()));
+        assert!(behavior
+            .command_executions
+            .contains(&"cmd.exe /c whoami".to_owned()));
     }
 }

@@ -375,6 +375,6 @@ async fn find_virustotal_report_for_response(
 fn report_from_row(row: VirusTotalReportRow) -> anyhow::Result<VirusTotalReport> {
     let mut report = serde_json::from_value::<VirusTotalReport>(row.report_json)?;
     report.source = VirusTotalSource::Cache;
-    report.ensure_behavior_note();
+    report.ensure_behavior_shape();
     Ok(report)
 }
