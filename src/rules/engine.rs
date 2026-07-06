@@ -69,11 +69,15 @@ impl RulesEngine {
                 contains_case_insensitive(&data.strings, &compiled.rule.pattern)
             }
             MatchType::Regex => compiled.regex.as_ref().is_some_and(|regex| {
-                data.strings
+                data.first_party_strings
                     .iter()
                     .any(|candidate| regex.is_match(candidate))
                     || data
-                        .bytecode_refs
+                        .metadata_strings
+                        .iter()
+                        .any(|candidate| regex.is_match(candidate))
+                    || data
+                        .first_party_bytecode_refs
                         .iter()
                         .any(|candidate| regex.is_match(candidate))
                     || data
@@ -82,7 +86,7 @@ impl RulesEngine {
                         .any(|candidate| regex.is_match(candidate))
             }),
             MatchType::BytecodeRef => {
-                contains_case_insensitive(&data.bytecode_refs, &compiled.rule.pattern)
+                contains_case_insensitive(&data.first_party_bytecode_refs, &compiled.rule.pattern)
             }
             MatchType::ManifestField => {
                 contains_case_insensitive(&data.manifest_fields, &compiled.rule.pattern)
@@ -134,7 +138,10 @@ mod tests {
         };
         let data = ScanData {
             strings: vec!["secret one".to_owned(), "secret two".to_owned()],
+            metadata_strings: Vec::new(),
+            first_party_strings: Vec::new(),
             bytecode_refs: Vec::new(),
+            first_party_bytecode_refs: Vec::new(),
             manifest_fields: Vec::new(),
             archive_signals: Vec::new(),
             class_major_versions: Vec::new(),
@@ -142,8 +149,58 @@ mod tests {
             class_files: Vec::new(),
             mod_ids: Vec::new(),
             mod_aliases: Vec::new(),
+            entrypoint_classes: Vec::new(),
             entry_timestamps: Vec::new(),
         };
+        assert_eq!(engine.evaluate(&data).len(), 1);
+    }
+
+    /// Verifies bytecode API rules use scoped first-party references, not vendored deps.
+    #[test]
+    fn bytecode_rules_ignore_unscoped_dependency_refs() {
+        let engine = RulesEngine {
+            rules: vec![super::CompiledRule {
+                rule: Rule {
+                    rule_id: "PROCESS_BUILDER".to_owned(),
+                    category: "dangerous_api".to_owned(),
+                    severity: Severity::Low,
+                    match_type: MatchType::BytecodeRef,
+                    pattern: "java/lang/ProcessBuilder".to_owned(),
+                    message: "found".to_owned(),
+                },
+                regex: None,
+            }],
+        };
+        let data = ScanData {
+            bytecode_refs: vec!["java/lang/ProcessBuilder".to_owned()],
+            first_party_bytecode_refs: Vec::new(),
+            ..Default::default()
+        };
+
+        assert!(engine.evaluate(&data).is_empty());
+    }
+
+    /// Verifies regex rules still inspect mod metadata after dependency scoping.
+    #[test]
+    fn regex_rules_still_match_metadata_strings() {
+        let engine = RulesEngine {
+            rules: vec![super::CompiledRule {
+                rule: Rule {
+                    rule_id: "TYPO".to_owned(),
+                    category: "supply_chain".to_owned(),
+                    severity: Severity::High,
+                    match_type: MatchType::Regex,
+                    pattern: "OptiFinee".to_owned(),
+                    message: "found".to_owned(),
+                },
+                regex: Some(regex::Regex::new("(?i)OptiFinee").expect("valid regex")),
+            }],
+        };
+        let data = ScanData {
+            metadata_strings: vec![r#"{"id":"OptiFinee"}"#.to_owned()],
+            ..Default::default()
+        };
+
         assert_eq!(engine.evaluate(&data).len(), 1);
     }
 

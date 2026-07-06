@@ -48,8 +48,10 @@ const NETWORK_APIS: &[&str] = &[
     "java/net/http/HttpClient",
     "java/net/http/HttpRequest",
 ];
-const DYNAMIC_CLASS_APIS: &[&str] =
-    &["java/lang/ClassLoader.defineClass", "java/net/URLClassLoader"];
+const DYNAMIC_CLASS_APIS: &[&str] = &[
+    "java/lang/ClassLoader.defineClass",
+    "java/net/URLClassLoader",
+];
 const NATIVE_LOAD_APIS: &[&str] = &[
     "java/lang/Runtime.load",
     "java/lang/Runtime.loadLibrary",
@@ -71,7 +73,10 @@ pub struct ScanLimits {
 #[derive(Clone, Debug, Default)]
 pub struct ScanData {
     pub strings: Vec<String>,
+    pub metadata_strings: Vec<String>,
+    pub first_party_strings: Vec<String>,
     pub bytecode_refs: Vec<String>,
+    pub first_party_bytecode_refs: Vec<String>,
     pub manifest_fields: Vec<String>,
     pub archive_signals: Vec<String>,
     pub class_major_versions: Vec<u16>,
@@ -79,12 +84,16 @@ pub struct ScanData {
     pub class_files: Vec<ClassScanData>,
     pub mod_ids: Vec<String>,
     pub mod_aliases: Vec<String>,
+    pub entrypoint_classes: Vec<String>,
     pub entry_timestamps: Vec<(String, String)>,
 }
 
 /// Per-class data used for lower-noise correlation signals.
 #[derive(Clone, Debug, Default)]
 pub struct ClassScanData {
+    pub path: String,
+    pub class_name: Option<String>,
+    pub major_version: u16,
     pub strings: Vec<String>,
     pub bytecode_refs: Vec<String>,
 }
@@ -289,9 +298,13 @@ impl ArchiveContext {
         if metadata::is_metadata_file(name) {
             let metadata = metadata::extract_metadata(name, bytes);
             self.data.manifest_fields.extend(metadata.manifest_fields);
+            self.data.metadata_strings.extend(metadata.strings.clone());
             self.data.strings.extend(metadata.strings);
             self.data.mod_ids.extend(metadata.mod_ids);
             self.data.mod_aliases.extend(metadata.mod_aliases);
+            self.data
+                .entrypoint_classes
+                .extend(metadata.entrypoint_classes);
             self.data.archive_signals.extend(metadata.archive_signals);
         }
 
@@ -299,6 +312,9 @@ impl ArchiveContext {
             match class_file::parse_class_file(bytes) {
                 Ok(class_data) => {
                     self.data.class_files.push(ClassScanData {
+                        path: name.to_owned(),
+                        class_name: class_data.class_name.clone(),
+                        major_version: class_data.major_version,
                         strings: class_data.strings.clone(),
                         bytecode_refs: class_data.bytecode_refs.clone(),
                     });
@@ -329,7 +345,7 @@ impl ArchiveContext {
     }
 
     fn observe_magic_bytes(&mut self, lower_name: &str, bytes: &[u8]) {
-        if is_native_binary(bytes) {
+        if is_native_binary(bytes) && !is_known_dependency_native_path(lower_name) {
             self.data
                 .archive_signals
                 .push(NATIVE_BINARY_SIGNAL.to_owned());
@@ -341,12 +357,14 @@ impl ArchiveContext {
 
     /// Adds aggregate signals that require seeing multiple files before deciding.
     fn add_derived_signals(&mut self) {
-        let unique_versions = self
-            .data
-            .class_major_versions
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
+        self.add_first_party_scope();
+        let scoped_versions = self.first_party_class_versions();
+        let version_source = if scoped_versions.is_empty() {
+            self.data.class_major_versions.as_slice()
+        } else {
+            scoped_versions.as_slice()
+        };
+        let unique_versions = version_source.iter().copied().collect::<HashSet<_>>();
         if unique_versions.len() > 1 {
             let min_version = unique_versions.iter().min().copied().unwrap_or_default();
             let max_version = unique_versions.iter().max().copied().unwrap_or_default();
@@ -360,6 +378,30 @@ impl ArchiveContext {
         self.add_modid_package_signal();
         self.add_short_name_signal();
         self.add_correlation_signals();
+    }
+
+    fn add_first_party_scope(&mut self) {
+        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
+        for class_file in &self.data.class_files {
+            if is_first_party_class(class_file, &first_party_prefixes) {
+                self.data
+                    .first_party_strings
+                    .extend(class_file.strings.clone());
+                self.data
+                    .first_party_bytecode_refs
+                    .extend(class_file.bytecode_refs.clone());
+            }
+        }
+    }
+
+    fn first_party_class_versions(&self) -> Vec<u16> {
+        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
+        self.data
+            .class_files
+            .iter()
+            .filter(|class_file| is_first_party_class(class_file, &first_party_prefixes))
+            .map(|class_file| class_file.major_version)
+            .collect()
     }
 
     fn add_timestamp_outlier_signal(&mut self) {
@@ -391,13 +433,19 @@ impl ArchiveContext {
         if self.data.mod_ids.is_empty() || self.data.class_names.is_empty() {
             return;
         }
+        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
         let packages = self
             .data
-            .class_names
+            .class_files
             .iter()
+            .filter(|class_file| is_first_party_class(class_file, &first_party_prefixes))
+            .filter_map(|class_file| class_file.class_name.as_deref())
             .filter_map(|class_name| class_name.rsplit_once('/').map(|(package, _)| package))
             .map(normalize_identifier)
             .collect::<Vec<_>>();
+        if packages.is_empty() {
+            return;
+        }
         let declared_ids = self
             .data
             .mod_ids
@@ -514,7 +562,11 @@ impl ArchiveContext {
     }
 
     fn add_class_correlation_signals(&mut self) {
+        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
         for class_file in &self.data.class_files {
+            if !is_first_party_class(class_file, &first_party_prefixes) {
+                continue;
+            }
             let has_network = refs_contain_any(&class_file.bytecode_refs, NETWORK_APIS);
             if !has_network {
                 continue;
@@ -569,9 +621,8 @@ impl ArchiveContext {
 
 fn refs_contain_any(refs: &[String], patterns: &[&str]) -> bool {
     patterns.iter().any(|pattern| {
-        refs.iter().any(|candidate| {
-            candidate.eq_ignore_ascii_case(pattern) || candidate.contains(pattern)
-        })
+        refs.iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(pattern) || candidate.contains(pattern))
     })
 }
 
@@ -593,6 +644,66 @@ fn is_native_binary(bytes: &[u8]) -> bool {
 
 fn is_fabric_declared_nested_jar(lower_name: &str) -> bool {
     lower_name.starts_with("meta-inf/jars/") && lower_name.ends_with(".jar")
+}
+
+fn is_known_dependency_native_path(lower_name: &str) -> bool {
+    (lower_name.starts_with("jni/") && lower_name.contains("jffi"))
+        || lower_name.starts_with("mediaplayerinfo/natives/")
+}
+
+fn first_party_prefixes(entrypoint_classes: &[String]) -> Vec<String> {
+    let mut prefixes = HashSet::new();
+    for entrypoint in entrypoint_classes {
+        let class_name = entrypoint
+            .split_once(':')
+            .map_or(entrypoint.as_str(), |(_, class_name)| class_name)
+            .replace('.', "/");
+        let Some((package, _)) = class_name.rsplit_once('/') else {
+            continue;
+        };
+        let segments = package.split('/').collect::<Vec<_>>();
+        if segments.len() >= 3 {
+            prefixes.insert(segments[..3].join("/"));
+        }
+        if segments.len() >= 4 {
+            prefixes.insert(segments[..4].join("/"));
+        }
+    }
+    prefixes.into_iter().collect()
+}
+
+fn is_first_party_class(class_file: &ClassScanData, first_party_prefixes: &[String]) -> bool {
+    let class_name = class_file
+        .class_name
+        .as_deref()
+        .unwrap_or(class_file.path.as_str())
+        .trim_end_matches(".class");
+    if is_known_dependency_class_path(class_name)
+        || is_known_dependency_class_path(&class_file.path)
+    {
+        return false;
+    }
+    first_party_prefixes.is_empty()
+        || first_party_prefixes
+            .iter()
+            .any(|prefix| class_name == prefix || class_name.starts_with(&format!("{prefix}/")))
+}
+
+fn is_known_dependency_class_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        "com/kenai/",
+        "dev/redstones/mediaplayerinfo/",
+        "jnr/",
+        "kotlin/",
+        "kotlinx/",
+        "org/freedesktop/dbus/",
+        "org/intellij/",
+        "org/jetbrains/",
+        "org/slf4j/",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 fn is_signature_or_manifest_path(path: &str) -> bool {
@@ -734,6 +845,9 @@ mod tests {
     #[test]
     fn class_correlation_detects_remote_class_loading_in_one_class() {
         let mut context = test_context(vec![ClassScanData {
+            path: "com/example/mod/Loader.class".to_owned(),
+            class_name: Some("com/example/mod/Loader".to_owned()),
+            major_version: 65,
             strings: Vec::new(),
             bytecode_refs: vec![
                 "java/net/http/HttpClient".to_owned(),
@@ -754,10 +868,16 @@ mod tests {
     fn class_correlation_ignores_refs_split_across_classes() {
         let mut context = test_context(vec![
             ClassScanData {
+                path: "com/example/mod/Net.class".to_owned(),
+                class_name: Some("com/example/mod/Net".to_owned()),
+                major_version: 65,
                 strings: Vec::new(),
                 bytecode_refs: vec!["java/net/http/HttpClient".to_owned()],
             },
             ClassScanData {
+                path: "com/example/mod/Loader.class".to_owned(),
+                class_name: Some("com/example/mod/Loader".to_owned()),
+                major_version: 65,
                 strings: Vec::new(),
                 bytecode_refs: vec!["java/lang/ClassLoader.defineClass".to_owned()],
             },
@@ -775,8 +895,14 @@ mod tests {
     #[test]
     fn class_correlation_detects_external_urlclassloader_target() {
         let mut context = test_context(vec![ClassScanData {
+            path: "com/example/mod/Loader.class".to_owned(),
+            class_name: Some("com/example/mod/Loader".to_owned()),
+            major_version: 65,
             strings: vec!["https://example.invalid/payload.jar".to_owned()],
-            bytecode_refs: vec!["java/net/URL".to_owned(), "java/net/URLClassLoader".to_owned()],
+            bytecode_refs: vec![
+                "java/net/URL".to_owned(),
+                "java/net/URLClassLoader".to_owned(),
+            ],
         }]);
 
         context.add_class_correlation_signals();
@@ -785,6 +911,29 @@ mod tests {
             .data
             .archive_signals
             .contains(&EXTERNAL_URLCLASSLOADER_SIGNAL.to_owned()));
+    }
+
+    /// Verifies vendored runtime libraries do not trigger remote-loader correlations.
+    #[test]
+    fn class_correlation_ignores_known_dependency_classes() {
+        let mut context = test_context(vec![ClassScanData {
+            path: "jnr/ffi/provider/jffi/AsmLibraryLoader.class".to_owned(),
+            class_name: Some("jnr/ffi/provider/jffi/AsmLibraryLoader".to_owned()),
+            major_version: 52,
+            strings: Vec::new(),
+            bytecode_refs: vec![
+                "java/net/URL".to_owned(),
+                "java/net/URLClassLoader".to_owned(),
+                "java/lang/ClassLoader.defineClass".to_owned(),
+            ],
+        }]);
+
+        context.add_class_correlation_signals();
+
+        assert!(!context
+            .data
+            .archive_signals
+            .contains(&REMOTE_CLASS_LOADING_SIGNAL.to_owned()));
     }
 
     fn test_context(class_files: Vec<ClassScanData>) -> ArchiveContext {
@@ -799,6 +948,7 @@ mod tests {
             file_count: 0,
             data: ScanData {
                 class_files,
+                entrypoint_classes: vec!["com.example.mod.Loader".to_owned()],
                 ..Default::default()
             },
         }

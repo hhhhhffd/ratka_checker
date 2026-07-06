@@ -24,6 +24,7 @@ pub struct MetadataData {
     pub strings: Vec<String>,
     pub mod_ids: Vec<String>,
     pub mod_aliases: Vec<String>,
+    pub entrypoint_classes: Vec<String>,
     pub archive_signals: Vec<String>,
 }
 
@@ -35,6 +36,7 @@ pub fn extract_metadata(path: &str, bytes: &[u8]) -> MetadataData {
         strings: vec![text.clone()],
         mod_ids: Vec::new(),
         mod_aliases: Vec::new(),
+        entrypoint_classes: Vec::new(),
         archive_signals: Vec::new(),
     };
 
@@ -116,6 +118,9 @@ fn collect_json_mod_ids(value: &serde_json::Value, data: &mut MetadataData) {
                 if key == "provides" {
                     collect_string_array(value, &mut data.mod_aliases);
                 }
+                if key == "entrypoints" {
+                    collect_json_strings(value, &mut data.entrypoint_classes);
+                }
                 collect_json_mod_ids(value, data);
             }
         }
@@ -135,6 +140,23 @@ fn collect_string_array(value: &serde_json::Value, output: &mut Vec<String>) {
                 output.push(text.to_owned());
             }
         }
+    }
+}
+
+fn collect_json_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => output.push(text.to_owned()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_strings(value, output);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values() {
+                collect_json_strings(value, output);
+            }
+        }
+        _ => {}
     }
 }
 
