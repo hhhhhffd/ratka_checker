@@ -8,12 +8,6 @@ use crate::models::scan::{
     Finding, ScanResponse, ScanStatus, Severity, Verdict, VirusTotalReport, VirusTotalSource,
 };
 
-/// Database row for api_keys, intentionally exposing only fields needed by auth.
-#[derive(Debug, sqlx::FromRow)]
-pub struct ApiKeyRow {
-    pub role: String,
-}
-
 /// Database row for scans before conversion into the public API response.
 #[derive(Debug, sqlx::FromRow)]
 pub struct ScanRow {
@@ -51,45 +45,6 @@ pub struct ExpiredFileRow {
 pub async fn run_migrations(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::migrate!("./migrations").run(pool).await?;
     Ok(())
-}
-
-/// Inserts an API key hash with a role; raw key material never enters the database.
-pub async fn insert_api_key(
-    pool: &PgPool,
-    label: &str,
-    key_hash: &str,
-    role: &str,
-    rate_limit: Option<i32>,
-) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO api_keys (id, key_hash, role, label, rate_limit)
-        VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
-    .bind(Uuid::new_v4())
-    .bind(key_hash)
-    .bind(role)
-    .bind(label)
-    .bind(rate_limit)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Finds a non-revoked API key by sha256 hash without returning the stored hash to callers.
-pub async fn find_active_api_key(pool: &PgPool, key_hash: &str) -> sqlx::Result<Option<ApiKeyRow>> {
-    sqlx::query_as::<_, ApiKeyRow>(
-        r#"
-        SELECT role
-        FROM api_keys
-        WHERE key_hash = $1 AND revoked_at IS NULL
-        LIMIT 1
-        "#,
-    )
-    .bind(key_hash)
-    .fetch_optional(pool)
-    .await
 }
 
 /// Creates the pending scan row before the worker starts so clients can poll immediately.

@@ -1,9 +1,7 @@
 const API_BASE = "/api";
 const POLL_INTERVAL_MS = 1500;
-const API_KEY_STORAGE_KEY = "ratscan_api_key";
 
 const form = document.querySelector("#scanForm");
-const apiKeyInput = document.querySelector("#apiKey");
 const fileInput = document.querySelector("#fileInput");
 const dropzone = document.querySelector("#dropzone");
 const fileTitle = document.querySelector("#fileTitle");
@@ -24,16 +22,11 @@ const healthStatus = document.querySelector("#healthStatus");
 
 let activePollController = null;
 
-apiKeyInput.value = localStorage.getItem(API_KEY_STORAGE_KEY) || "";
 checkHealth();
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   await uploadScan();
-});
-
-apiKeyInput.addEventListener("input", () => {
-  localStorage.setItem(API_KEY_STORAGE_KEY, apiKeyInput.value.trim());
 });
 
 fileInput.addEventListener("change", updateSelectedFile);
@@ -89,11 +82,10 @@ function updateSelectedFile() {
 }
 
 async function uploadScan() {
-  const apiKey = apiKeyInput.value.trim();
   const file = fileInput.files[0];
 
-  if (!apiKey || !file) {
-    renderError("API key and .jar file are required.");
+  if (!file) {
+    renderError(".jar file is required.");
     return;
   }
   if (!file.name.toLowerCase().endsWith(".jar")) {
@@ -111,12 +103,11 @@ async function uploadScan() {
   try {
     const scan = await requestJson(`${API_BASE}/scans`, {
       method: "POST",
-      headers: { "X-API-Key": apiKey },
       body,
     });
     renderScan(scan);
     if (scan.status === "pending") {
-      pollScan(apiKey, scan.scan_id);
+      pollScan(scan.scan_id);
     }
   } catch (error) {
     renderError(error.message);
@@ -126,7 +117,7 @@ async function uploadScan() {
   }
 }
 
-async function pollScan(apiKey, scanId) {
+async function pollScan(scanId) {
   activePollController = new AbortController();
   while (!activePollController.signal.aborted) {
     await delay(POLL_INTERVAL_MS);
@@ -136,7 +127,6 @@ async function pollScan(apiKey, scanId) {
 
     try {
       const scan = await requestJson(`${API_BASE}/scans/${scanId}`, {
-        headers: { "X-API-Key": apiKey },
         signal: activePollController.signal,
       });
       renderScan(scan);
@@ -250,7 +240,6 @@ function clearState() {
   updateSelectedFile();
   resultPanel.hidden = true;
   rawPanel.hidden = true;
-  apiKeyInput.value = localStorage.getItem(API_KEY_STORAGE_KEY) || "";
 }
 
 async function copyJson() {

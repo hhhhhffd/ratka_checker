@@ -52,11 +52,10 @@ set -a
 . ./.env
 set +a
 
-./ratscan seed-api-key --label discord-bot-prod
-./ratscan serve
+./ratscan
 ```
 
-All endpoints except `/health` require `X-API-Key`.
+The API is open by default. Put nginx, a tunnel, or firewall rules in front of it if public access needs to be restricted.
 RUN_DOC
 
 echo "Release package written to $OUT_DIR"

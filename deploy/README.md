@@ -41,16 +41,7 @@ The installer will:
 - copy the frontend to `/var/www/ratscan`;
 - create `/etc/ratscan/ratscan.env`;
 - create the PostgreSQL database and user;
-- enable `ratscan.service` and nginx;
-- write the one-time web API key to `/root/ratscan-api-key.txt`.
-
-Open the API key:
-
-```sh
-sudo cat /root/ratscan-api-key.txt
-```
-
-Use that key in the frontend field.
+- enable `ratscan.service` and nginx.
 
 ## 3. Check service state
 
@@ -110,7 +101,6 @@ recreate deployment defaults. Use the update script; it preserves:
 
 - `/etc/ratscan/ratscan.env`;
 - PostgreSQL database/user/password;
-- `/root/ratscan-api-key.txt`;
 - `/opt/ratscan/storage`.
 
 Build the Linux release package locally again:

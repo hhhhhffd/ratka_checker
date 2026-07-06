@@ -34,17 +34,15 @@ set -a
 . ./.env
 set +a
 
-./ratscan seed-api-key --label discord-bot-prod
-./ratscan serve
+./ratscan
 ```
 
-Save the printed API key. It is shown once; only its sha256 hash is stored in PostgreSQL.
+The API is open by default. Put nginx, a tunnel, or firewall rules in front of it if public access needs to be restricted.
 
 ## Upload
 
 ```sh
-curl -H "X-API-Key: $RATSCAN_KEY" \
-  -F "file=@mod.jar" \
+curl -F "file=@mod.jar" \
   http://127.0.0.1:8080/v1/scans
 ```
 

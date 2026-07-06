@@ -17,4 +17,4 @@ RUN mkdir -p /app/storage && chown -R ratscan:ratscan /app
 USER ratscan
 
 EXPOSE 8080
-CMD ["ratscan", "serve"]
+CMD ["ratscan"]

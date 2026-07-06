@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::response::PrettyJson;
 
-/// Public API error body used by every non-auth failure response.
+/// Public API error body used by failure responses.
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
