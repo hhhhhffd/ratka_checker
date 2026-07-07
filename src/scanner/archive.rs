@@ -34,6 +34,7 @@ const REMOTE_CLASS_LOADING_SIGNAL: &str = "remote_class_loading";
 const NATIVE_LIB_REMOTE_LOAD_SIGNAL: &str = "native_lib_remote_load";
 const SCRIPT_DOWNLOAD_EXEC_SIGNAL: &str = "script_download_exec";
 const EXTERNAL_URLCLASSLOADER_SIGNAL: &str = "urlclassloader_external_target";
+const PRIVACY_NETWORK_SYNC_RULE_ID: &str = "PRIVACY_NETWORK_SYNC";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
 const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
@@ -141,7 +142,8 @@ fn scan_bytes(
     }
 
     context.add_derived_signals();
-    let findings = rules_engine.evaluate(&context.data);
+    let mut findings = rules_engine.evaluate(&context.data);
+    add_contextual_findings(&mut findings, &context.data);
     let (verdict, risk_score, summary) = finalize_findings(&findings);
 
     Ok(ScanOutcome {
@@ -459,9 +461,11 @@ impl ArchiveContext {
         }
 
         let has_matching_namespace = declared_ids.iter().any(|mod_id| {
-            packages
-                .iter()
-                .any(|package| package.contains(mod_id) || mod_id.contains(package))
+            packages.iter().any(|package| {
+                package.contains(mod_id)
+                    || mod_id.contains(package)
+                    || has_significant_identifier_overlap(mod_id, package)
+            })
         });
         if !has_matching_namespace {
             self.data
@@ -723,6 +727,76 @@ fn normalize_identifier(value: &str) -> String {
         .collect()
 }
 
+fn has_significant_identifier_overlap(left: &str, right: &str) -> bool {
+    const MIN_OVERLAP: usize = 6;
+
+    if left.len() < MIN_OVERLAP || right.len() < MIN_OVERLAP {
+        return false;
+    }
+
+    let (shorter, longer) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+
+    (0..=shorter.len() - MIN_OVERLAP)
+        .map(|start| &shorter[start..start + MIN_OVERLAP])
+        .any(|part| longer.contains(part))
+}
+
+fn add_contextual_findings(findings: &mut Vec<Finding>, data: &ScanData) {
+    if findings
+        .iter()
+        .any(|finding| finding.rule_id == PRIVACY_NETWORK_SYNC_RULE_ID)
+    {
+        return;
+    }
+
+    if has_privacy_network_sync(data) {
+        findings.push(Finding {
+            rule_id: PRIVACY_NETWORK_SYNC_RULE_ID.to_owned(),
+            category: "privacy".to_owned(),
+            severity: Severity::Medium,
+            message: "Обнаружена связка сеть/WebSocket + идентификаторы игрока/сервера + Authorization/Bearer; похоже на privacy/network sync, но не на RAT без exec/classload/credential цепочки.".to_owned(),
+        });
+    }
+}
+
+fn has_privacy_network_sync(data: &ScanData) -> bool {
+    let has_xor_decode = data
+        .archive_signals
+        .iter()
+        .any(|signal| signal == "xor_loop_string_decode");
+    if !has_xor_decode {
+        return false;
+    }
+
+    let has_auth_header = scoped_text_contains_any(data, &["authorization", "bearer"]);
+    let has_network = refs_contain_any(&data.first_party_bytecode_refs, NETWORK_APIS)
+        || scoped_text_contains_any(data, &["wss://", "ws://", "https://", "http://"]);
+    let identifier_hits = ["uuid", "username", "server_address", "channel", "minecraft"]
+        .iter()
+        .filter(|pattern| scoped_text_contains(data, pattern))
+        .count();
+
+    has_auth_header && has_network && identifier_hits >= 2
+}
+
+fn scoped_text_contains_any(data: &ScanData, patterns: &[&str]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| scoped_text_contains(data, pattern))
+}
+
+fn scoped_text_contains(data: &ScanData, pattern: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    data.first_party_strings
+        .iter()
+        .chain(data.first_party_bytecode_refs.iter())
+        .any(|candidate| candidate.to_ascii_lowercase().contains(&pattern))
+}
+
 /// Scanner aborts that should produce `verdict: unknown` instead of a malicious score.
 #[derive(Debug, thiserror::Error)]
 enum ScanAbort {
@@ -759,9 +833,17 @@ impl ScanAbort {
 fn risk_score(findings: &[Finding]) -> u8 {
     findings
         .iter()
-        .map(|finding| u16::from(finding.severity.score_weight()))
+        .map(|finding| u16::from(finding_score_weight(finding)))
         .sum::<u16>()
         .min(100) as u8
+}
+
+fn finding_score_weight(finding: &Finding) -> u8 {
+    match finding.rule_id.as_str() {
+        "TIMESTAMP_OUTLIER" => Severity::Low.score_weight(),
+        "RAW_GITHUB_URL" | "MODS_SELF_COPY" => 0,
+        _ => finding.severity.score_weight(),
+    }
 }
 
 /// Builds a concise user-facing Russian summary without ever claiming complete safety.
@@ -802,8 +884,9 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 #[cfg(test)]
 mod tests {
     use super::{
-        risk_score, summarize, ArchiveContext, ClassScanData, ScanData, ScanLimits,
-        EXTERNAL_URLCLASSLOADER_SIGNAL, REMOTE_CLASS_LOADING_SIGNAL,
+        add_contextual_findings, has_significant_identifier_overlap, risk_score, summarize,
+        ArchiveContext, ClassScanData, ScanData, ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL,
+        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
     };
 
     use crate::models::scan::{Finding, Severity, Verdict};
@@ -832,6 +915,96 @@ mod tests {
             },
         ];
         assert_eq!(risk_score(&findings), 100);
+    }
+
+    /// Verifies noisy standalone rules stay below the malicious threshold.
+    #[test]
+    fn risk_score_discounts_weak_false_positive_rules() {
+        let findings = vec![
+            Finding {
+                rule_id: "TIMESTAMP_OUTLIER".to_owned(),
+                category: "supply_chain".to_owned(),
+                severity: Severity::High,
+                message: "timestamp".to_owned(),
+            },
+            Finding {
+                rule_id: "RAW_GITHUB_URL".to_owned(),
+                category: "exfiltration".to_owned(),
+                severity: Severity::Low,
+                message: "github".to_owned(),
+            },
+            Finding {
+                rule_id: "MODS_SELF_COPY".to_owned(),
+                category: "persistence".to_owned(),
+                severity: Severity::Low,
+                message: "mods".to_owned(),
+            },
+            Finding {
+                rule_id: "XOR_LOOP_HINT".to_owned(),
+                category: "obfuscation".to_owned(),
+                severity: Severity::Low,
+                message: "xor".to_owned(),
+            },
+        ];
+
+        assert_eq!(risk_score(&findings), 10);
+    }
+
+    /// Verifies privacy/network sync is suspicious but not malicious by itself.
+    #[test]
+    fn privacy_network_sync_scores_as_suspicious() {
+        let mut findings = vec![
+            Finding {
+                rule_id: "TIMESTAMP_OUTLIER".to_owned(),
+                category: "supply_chain".to_owned(),
+                severity: Severity::High,
+                message: "timestamp".to_owned(),
+            },
+            Finding {
+                rule_id: "XOR_LOOP_HINT".to_owned(),
+                category: "obfuscation".to_owned(),
+                severity: Severity::Low,
+                message: "xor".to_owned(),
+            },
+            Finding {
+                rule_id: "URL_API".to_owned(),
+                category: "network".to_owned(),
+                severity: Severity::Low,
+                message: "url".to_owned(),
+            },
+            Finding {
+                rule_id: "HTTPS_URL_CONNECTION".to_owned(),
+                category: "network".to_owned(),
+                severity: Severity::Low,
+                message: "https".to_owned(),
+            },
+        ];
+        let data = ScanData {
+            archive_signals: vec!["xor_loop_string_decode".to_owned()],
+            first_party_strings: vec![
+                "wss://ws.example.invalid".to_owned(),
+                "Authorization".to_owned(),
+                "Bearer".to_owned(),
+                "uuid".to_owned(),
+                "username".to_owned(),
+                "server_address".to_owned(),
+            ],
+            first_party_bytecode_refs: vec!["java/net/Socket".to_owned()],
+            ..Default::default()
+        };
+
+        add_contextual_findings(&mut findings, &data);
+
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == PRIVACY_NETWORK_SYNC_RULE_ID));
+        assert_eq!(risk_score(&findings), 35);
+    }
+
+    /// Verifies related reversed/rotated identifiers do not produce namespace mismatch noise.
+    #[test]
+    fn identifier_overlap_accepts_related_modid_and_package() {
+        assert!(has_significant_identifier_overlap("ogulniega", "gaogulnie"));
     }
 
     /// Verifies clean summaries avoid saying that a jar is guaranteed safe.
