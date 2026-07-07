@@ -55,6 +55,14 @@ impl AppError {
 impl IntoResponse for AppError {
     /// Converts domain errors into the single JSON error envelope required by the API contract.
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            tracing::error!(
+                status = %self.status,
+                code = self.code,
+                message = %self.message,
+                "request failed with internal application error",
+            );
+        }
         let body = PrettyJson(ErrorResponse {
             error: self.code.to_owned(),
             message: Some(self.message),
