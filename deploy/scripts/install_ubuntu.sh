@@ -84,7 +84,7 @@ env_value() {
 }
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl nginx openssl postgresql postgresql-client python3-venv
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl postgresql postgresql-client python3-venv
 
 if [ -z "$DB_PASSWORD" ]; then
     DB_PASSWORD="$(openssl rand -hex 24)"
@@ -102,18 +102,16 @@ fi
 
 install -d -m 0755 /opt/ratscan /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/storage
 install -d -m 0755 /opt/ratscan/telegram_bot
-install -d -m 0755 /var/www/ratscan
 install -d -m 0750 /etc/ratscan
 
 install -m 0755 "$APP_DIR/ratscan" /opt/ratscan/bin/ratscan
 cp -R "$APP_DIR/config/." /opt/ratscan/config/
 cp -R "$APP_DIR/telegram_bot/." /opt/ratscan/telegram_bot/
-cp -R "$DEPLOY_DIR/frontend/." /var/www/ratscan/
 
 python3 -m venv /opt/ratscan/telegram-venv
 /opt/ratscan/telegram-venv/bin/pip install --no-cache-dir -r /opt/ratscan/telegram_bot/requirements.txt
 
-chown -R root:root /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/telegram_bot /opt/ratscan/telegram-venv /var/www/ratscan
+chown -R root:root /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/telegram_bot /opt/ratscan/telegram-venv
 chown -R ratscan:ratscan /opt/ratscan/storage
 
 systemctl enable --now postgresql
@@ -162,9 +160,6 @@ chmod 0640 /etc/ratscan/ratscan.env
 
 install -m 0644 "$DEPLOY_DIR/systemd/ratscan.service" /etc/systemd/system/ratscan.service
 install -m 0644 "$DEPLOY_DIR/systemd/ratscan-telegram-bot.service" /etc/systemd/system/ratscan-telegram-bot.service
-install -m 0644 "$DEPLOY_DIR/nginx/ratscan.conf" /etc/nginx/sites-available/ratscan.conf
-ln -sf /etc/nginx/sites-available/ratscan.conf /etc/nginx/sites-enabled/ratscan.conf
-rm -f /etc/nginx/sites-enabled/default
 
 if ! swapon --show=NAME | grep -qx "/swapfile"; then
     if [ ! -f /swapfile ]; then
@@ -187,9 +182,6 @@ else
     systemctl disable --now ratscan-telegram-bot >/dev/null 2>&1 || true
     echo "Telegram bot is installed but not started: TG_BOT_TOKEN or ALLOWED_TG_ID is empty."
 fi
-nginx -t
-systemctl enable --now nginx
-systemctl reload nginx
 
 echo "RatScan is installed."
-echo "Local URL: http://127.0.0.1/"
+echo "API URL: http://127.0.0.1:8080/"
