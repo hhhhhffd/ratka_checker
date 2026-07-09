@@ -22,6 +22,16 @@ if [ ! -f "$APP_DIR/config/rules.yaml" ]; then
     exit 1
 fi
 
+if [ ! -f "$APP_DIR/telegram_bot/bot.py" ]; then
+    echo "Missing Telegram bot package: $APP_DIR/telegram_bot" >&2
+    exit 1
+fi
+
+if [ ! -f "$APP_DIR/telegram_bot/requirements.txt" ]; then
+    echo "Missing Telegram bot requirements: $APP_DIR/telegram_bot/requirements.txt" >&2
+    exit 1
+fi
+
 if [ ! -f /etc/ratscan/ratscan.env ]; then
     echo "Missing /etc/ratscan/ratscan.env; run scripts/install_ubuntu.sh for first install." >&2
     exit 1
@@ -44,9 +54,20 @@ rollback() {
         rm -rf /var/www/ratscan
         cp -a "$BACKUP_DIR/frontend" /var/www/ratscan
     fi
-    chown -R root:root /opt/ratscan/bin /opt/ratscan/config /var/www/ratscan
+    if [ -d "$BACKUP_DIR/telegram_bot" ]; then
+        rm -rf /opt/ratscan/telegram_bot
+        cp -a "$BACKUP_DIR/telegram_bot" /opt/ratscan/telegram_bot
+    fi
+    if [ -d "$BACKUP_DIR/telegram-venv" ]; then
+        rm -rf /opt/ratscan/telegram-venv
+        cp -a "$BACKUP_DIR/telegram-venv" /opt/ratscan/telegram-venv
+    fi
+    chown -R root:root /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/telegram_bot /opt/ratscan/telegram-venv /var/www/ratscan
     systemctl daemon-reload
     systemctl restart ratscan || true
+    if systemctl is-enabled ratscan-telegram-bot >/dev/null 2>&1; then
+        systemctl restart ratscan-telegram-bot || true
+    fi
 }
 
 trap rollback ERR
@@ -61,28 +82,48 @@ fi
 if [ -d /var/www/ratscan ]; then
     cp -a /var/www/ratscan "$BACKUP_DIR/frontend"
 fi
+if [ -d /opt/ratscan/telegram_bot ]; then
+    cp -a /opt/ratscan/telegram_bot "$BACKUP_DIR/telegram_bot"
+fi
+if [ -d /opt/ratscan/telegram-venv ]; then
+    cp -a /opt/ratscan/telegram-venv "$BACKUP_DIR/telegram-venv"
+fi
 ROLLBACK_NEEDED=1
 
 systemctl stop ratscan
+systemctl stop ratscan-telegram-bot >/dev/null 2>&1 || true
 
 install -d -m 0755 /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/storage
+install -d -m 0755 /opt/ratscan/telegram_bot
 install -d -m 0755 /var/www/ratscan
 install -m 0755 "$APP_DIR/ratscan" /opt/ratscan/bin/ratscan
 rm -rf /opt/ratscan/config
 mkdir -p /opt/ratscan/config
 cp -R "$APP_DIR/config/." /opt/ratscan/config/
+rm -rf /opt/ratscan/telegram_bot
+mkdir -p /opt/ratscan/telegram_bot
+cp -R "$APP_DIR/telegram_bot/." /opt/ratscan/telegram_bot/
 cp -R "$DEPLOY_DIR/frontend/." /var/www/ratscan/
 
-chown -R root:root /opt/ratscan/bin /opt/ratscan/config /var/www/ratscan
+python3 -m venv /opt/ratscan/telegram-venv
+/opt/ratscan/telegram-venv/bin/pip install --no-cache-dir -r /opt/ratscan/telegram_bot/requirements.txt
+
+chown -R root:root /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/telegram_bot /opt/ratscan/telegram-venv /var/www/ratscan
 chown -R ratscan:ratscan /opt/ratscan/storage
 
 install -m 0644 "$DEPLOY_DIR/systemd/ratscan.service" /etc/systemd/system/ratscan.service
+install -m 0644 "$DEPLOY_DIR/systemd/ratscan-telegram-bot.service" /etc/systemd/system/ratscan-telegram-bot.service
 install -m 0644 "$DEPLOY_DIR/nginx/ratscan.conf" /etc/nginx/sites-available/ratscan.conf
 ln -sf /etc/nginx/sites-available/ratscan.conf /etc/nginx/sites-enabled/ratscan.conf
 
 systemctl daemon-reload
 nginx -t
 systemctl restart ratscan
+if grep -q '^TG_BOT_TOKEN=.\+' /etc/ratscan/ratscan.env && grep -q '^ALLOWED_TG_ID=.\+' /etc/ratscan/ratscan.env; then
+    systemctl enable --now ratscan-telegram-bot
+else
+    systemctl disable --now ratscan-telegram-bot >/dev/null 2>&1 || true
+fi
 systemctl reload nginx
 
 for attempt in 1 2 3 4 5; do

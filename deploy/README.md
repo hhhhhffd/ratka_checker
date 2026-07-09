@@ -6,6 +6,7 @@ It runs:
 
 - static frontend through nginx;
 - Rust API through systemd on `127.0.0.1:8080`;
+- optional aiogram Telegram bot through systemd;
 - PostgreSQL on the same host;
 - optional Cloudflare Tunnel in front of nginx.
 
@@ -14,8 +15,12 @@ It runs:
 Run this from the repository root on your dev machine:
 
 ```sh
-sh scripts/package_release.sh deploy/app
+bash deploy/scripts/build_ubuntu_bundle.sh
 ```
+
+The bundle script builds the Rust binary locally, copies `telegram_bot/`, and
+copies local `.env` to `deploy/app/.env` when it exists. `deploy/app/` is ignored
+by git because it can contain secrets.
 
 After that, copy the whole `deploy/` directory to the VPS:
 
@@ -36,17 +41,23 @@ sudo bash scripts/install_ubuntu.sh
 The installer will:
 
 - install `postgresql`, `nginx`, `curl`, `ca-certificates`, and `openssl`;
+- install `python3-venv` and Telegram bot dependencies into
+  `/opt/ratscan/telegram-venv`;
 - create a 4 GB `/swapfile` if it is not active;
 - copy the API to `/opt/ratscan`;
+- copy the Telegram bot to `/opt/ratscan/telegram_bot`;
 - copy the frontend to `/var/www/ratscan`;
-- create `/etc/ratscan/ratscan.env`;
+- create `/etc/ratscan/ratscan.env`, preserving supported values from
+  `deploy/app/.env`;
 - create the PostgreSQL database and user;
-- enable `ratscan.service` and nginx.
+- enable `ratscan.service`, nginx, and `ratscan-telegram-bot.service` when
+  `TG_BOT_TOKEN` and `ALLOWED_TG_ID` are set.
 
 ## 3. Check service state
 
 ```sh
 systemctl status ratscan --no-pager
+systemctl status ratscan-telegram-bot --no-pager
 systemctl status nginx --no-pager
 curl -s http://127.0.0.1/health
 ```
@@ -55,6 +66,7 @@ Logs:
 
 ```sh
 journalctl -u ratscan -f
+journalctl -u ratscan-telegram-bot -f
 ```
 
 ## 4. Cloudflare Tunnel
@@ -90,6 +102,8 @@ systemctl status cloudflared --no-pager
 - API binary: `/opt/ratscan/bin/ratscan`
 - scanner config: `/opt/ratscan/config/rules.yaml`
 - uploaded files: `/opt/ratscan/storage`
+- Telegram bot: `/opt/ratscan/telegram_bot`
+- Telegram bot venv: `/opt/ratscan/telegram-venv`
 - environment: `/etc/ratscan/ratscan.env`
 - frontend: `/var/www/ratscan`
 - nginx config: `/etc/nginx/sites-available/ratscan.conf`
@@ -106,7 +120,7 @@ recreate deployment defaults. Use the update script; it preserves:
 Build the Linux release package locally again:
 
 ```sh
-sh scripts/package_release.sh deploy/app
+bash deploy/scripts/build_ubuntu_bundle.sh
 scp -r deploy ubuntu@YOUR_SERVER_IP:/home/ubuntu/ratka-deploy
 ```
 
@@ -122,8 +136,9 @@ The updater:
 - does not run `apt-get`;
 - does not touch PostgreSQL;
 - backs up the old binary/config/frontend under `/opt/ratscan/update-backup-*`;
-- installs the new binary, `rules.yaml`, frontend, systemd unit, and nginx config;
-- restarts `ratscan`;
+- installs the new binary, `rules.yaml`, Telegram bot, frontend, systemd units,
+  and nginx config;
+- restarts `ratscan` and `ratscan-telegram-bot` when bot env is configured;
 - reloads nginx;
 - checks `http://127.0.0.1/health`;
 - rolls files back if the update fails before the health check.
