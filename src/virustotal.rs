@@ -67,8 +67,6 @@ pub async fn analyze_file(
             source: VirusTotalSource::Lookup,
             stats: None,
             flagged_engines: Vec::new(),
-            first_submission_date: None,
-            permalink: None,
             behavior: behavior_info(None),
             error: Some(
                 "file is unknown to VirusTotal and exceeds the 32MB upload limit".to_owned(),
@@ -87,8 +85,6 @@ pub fn error_report(message: String) -> VirusTotalReport {
         source: VirusTotalSource::Lookup,
         stats: None,
         flagged_engines: Vec::new(),
-        first_submission_date: None,
-        permalink: None,
         behavior: behavior_info(None),
         error: Some(message),
     }
@@ -296,23 +292,18 @@ async fn poll_analysis(
         source: VirusTotalSource::Upload,
         stats: None,
         flagged_engines: Vec::new(),
-        first_submission_date: None,
-        permalink: None,
         behavior: behavior_info(None),
         error: None,
     })
 }
 
 fn file_report(file: FileObject, source: VirusTotalSource) -> VirusTotalReport {
-    let permalink = file.links.and_then(|links| links.self_url);
     let behavior_available = file.attributes.behavior_available();
     VirusTotalReport {
         status: VirusTotalStatus::Completed,
         source,
         stats: file.attributes.last_analysis_stats,
         flagged_engines: flagged_engines(file.attributes.last_analysis_results),
-        first_submission_date: file.attributes.first_submission_date,
-        permalink,
         behavior: behavior_info(behavior_available),
         error: None,
     }
@@ -324,8 +315,6 @@ fn analysis_report(analysis: AnalysisObject) -> VirusTotalReport {
         source: VirusTotalSource::Upload,
         stats: analysis.attributes.stats,
         flagged_engines: flagged_engines(analysis.attributes.results),
-        first_submission_date: None,
-        permalink: None,
         behavior: behavior_info(None),
         error: None,
     }
@@ -406,6 +395,9 @@ fn behavior_report_from_attributes(attributes: serde_json::Value) -> VirusTotalB
 
 fn filter_sandbox_noise(report: &mut VirusTotalBehaviorReport) {
     report
+        .contacted_domains
+        .retain(|value| !is_noisy_domain_or_dns_value(value));
+    report
         .dropped_files
         .retain(|value| !is_noisy_virustotal_behavior_value(value));
     report
@@ -417,6 +409,9 @@ fn filter_sandbox_noise(report: &mut VirusTotalBehaviorReport) {
     report
         .command_executions
         .retain(|value| !is_noisy_virustotal_behavior_value(value));
+    report
+        .dns_lookups
+        .retain(|value| !is_noisy_domain_or_dns_value(value));
 }
 
 fn has_behavior_signal(report: &VirusTotalBehaviorReport) -> bool {
@@ -461,6 +456,16 @@ fn is_noisy_virustotal_behavior_value(value: &str) -> bool {
         || is_noisy_sandbox_java_command(&normalized)
         || is_noisy_rsyslog_artifact(&normalized)
         || is_flattened_sandbox_artifact_marker(&normalized)
+}
+
+fn is_noisy_domain_or_dns_value(value: &str) -> bool {
+    let normalized = normalize_behavior_value(value);
+
+    is_ip_literal(&normalized) || normalized.ends_with(".dscr.akamai.net")
+}
+
+fn is_ip_literal(value: &str) -> bool {
+    value.parse::<std::net::IpAddr>().is_ok()
 }
 
 fn is_noisy_windows_java_artifact(value: &str) -> bool {
@@ -662,7 +667,6 @@ struct VirusTotalData<T> {
 #[derive(Debug, Deserialize)]
 struct FileObject {
     attributes: FileAttributes,
-    links: Option<FileLinks>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,7 +680,6 @@ struct FileAttributes {
     last_analysis_stats: Option<VirusTotalStats>,
     #[serde(default)]
     last_analysis_results: HashMap<String, VirusTotalRawEngineResult>,
-    first_submission_date: Option<i64>,
     #[serde(default)]
     sandbox_verdicts: HashMap<String, serde_json::Value>,
     #[serde(default)]
@@ -712,12 +715,6 @@ struct ThreatSeverity {
 #[derive(Debug, Default, Deserialize)]
 struct ThreatSeverityData {
     can_be_detonated: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileLinks {
-    #[serde(rename = "self")]
-    self_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -765,8 +762,6 @@ mod tests {
                 category: "malicious".to_owned(),
                 result: Some("Trojan-PSW.Win32.Test".to_owned()),
             }],
-            first_submission_date: None,
-            permalink: None,
             behavior: behavior_info(None),
             error: None,
         };
@@ -784,8 +779,6 @@ mod tests {
             source: VirusTotalSource::Lookup,
             stats: None,
             flagged_engines: Vec::new(),
-            first_submission_date: None,
-            permalink: None,
             behavior: behavior_info(None),
             error: None,
         };
@@ -885,8 +878,6 @@ mod tests {
             source: VirusTotalSource::Cache,
             stats: None,
             flagged_engines: Vec::new(),
-            first_submission_date: None,
-            permalink: None,
             behavior: Some(VirusTotalBehaviorInfo {
                 available: Some(true),
                 reports: vec![
@@ -916,8 +907,14 @@ mod tests {
                     VirusTotalBehaviorReport {
                         sandbox_name: Some("Zenbox".to_owned()),
                         analysis_date: Some(2),
-                        contacted_domains: vec!["a1672.dscr.akamai.net".to_owned()],
-                        dns_lookups: vec!["a1672.dscr.akamai.net".to_owned()],
+                        contacted_domains: vec![
+                            "a1672.dscr.akamai.net".to_owned(),
+                            "23.195.81.9".to_owned(),
+                        ],
+                        dns_lookups: vec![
+                            "a1672.dscr.akamai.net".to_owned(),
+                            "23.195.81.25".to_owned(),
+                        ],
                         files_written: vec![
                             "/proc/4965/coredump_filter".to_owned(),
                             "/tmp/hsperfdata_root/4965".to_owned(),
@@ -933,12 +930,18 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-                contacted_domains: vec!["a1672.dscr.akamai.net".to_owned()],
+                contacted_domains: vec![
+                    "a1672.dscr.akamai.net".to_owned(),
+                    "23.195.81.9".to_owned(),
+                ],
                 dropped_files: vec!["3903daac9bc4a3b7.timestamp".to_owned(), "1824".to_owned()],
                 files_written: vec!["/proc/4965/coredump_filter".to_owned()],
                 processes_created: vec!["/usr/bin/java -jar /tmp/sample.jar".to_owned()],
                 command_executions: vec!["/bin/gzip".to_owned()],
-                dns_lookups: vec!["a1672.dscr.akamai.net".to_owned()],
+                dns_lookups: vec![
+                    "a1672.dscr.akamai.net".to_owned(),
+                    "23.195.81.25".to_owned(),
+                ],
                 contacted_ips: Vec::new(),
                 contacted_urls: Vec::new(),
             }),
@@ -948,15 +951,9 @@ mod tests {
         sanitize_report(&mut report);
 
         let behavior = report.behavior.expect("behavior is present");
-        assert_eq!(behavior.reports.len(), 1);
-        assert_eq!(
-            behavior.contacted_domains,
-            vec!["a1672.dscr.akamai.net".to_owned()]
-        );
-        assert_eq!(
-            behavior.dns_lookups,
-            vec!["a1672.dscr.akamai.net".to_owned()]
-        );
+        assert!(behavior.reports.is_empty());
+        assert!(behavior.contacted_domains.is_empty());
+        assert!(behavior.dns_lookups.is_empty());
         assert!(behavior.dropped_files.is_empty());
         assert!(behavior.files_written.is_empty());
         assert!(behavior.processes_created.is_empty());
@@ -967,14 +964,16 @@ mod tests {
     fn behavior_noise_filter_keeps_network_artifacts() {
         let behavior = behavior_info_from_reports(vec![VirusTotalBehaviorObject {
             attributes: serde_json::json!({
+                "contacted_domains": ["pastebin.com", "198.51.100.10"],
                 "contacted_urls": [
                     "https://raw.githubusercontent.com/example/payload.jar",
                     "https://discord.com/api/webhooks/1/token"
                 ],
-                "dns_lookups": ["pastebin.com"]
+                "dns_lookups": ["pastebin.com", "198.51.100.10"]
             }),
         }]);
 
+        assert_eq!(behavior.contacted_domains, vec!["pastebin.com"]);
         assert_eq!(behavior.contacted_urls.len(), 2);
         assert_eq!(behavior.dns_lookups, vec!["pastebin.com"]);
     }

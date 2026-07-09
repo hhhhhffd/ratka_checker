@@ -149,10 +149,6 @@ pub struct VirusTotalReport {
     pub stats: Option<VirusTotalStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flagged_engines: Vec<VirusTotalEngineResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_submission_date: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permalink: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior: Option<VirusTotalBehaviorInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,8 +308,6 @@ mod tests {
             source: VirusTotalSource::Cache,
             stats: None,
             flagged_engines: Vec::new(),
-            first_submission_date: None,
-            permalink: None,
             behavior: None,
             error: None,
         }
