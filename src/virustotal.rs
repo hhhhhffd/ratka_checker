@@ -469,13 +469,13 @@ fn is_noisy_virustotal_behavior_value(value: &str) -> bool {
 }
 
 fn is_noisy_windows_java_artifact(value: &str) -> bool {
-    (value.contains("appdata/local/temp/hsperfdata_")
-        && value.chars().any(|ch| ch.is_ascii_digit()))
+    value.contains("appdata/local/temp/hsperfdata_")
         || (contains_oracle_jre_usage_path(value) && value.ends_with(".timestamp"))
         || value.ends_with("/cmdlinestart.log")
         || value.contains("/device/condrv/connect")
         || (value.contains("/program files/java/") && value.contains("/bin/java.exe"))
         || value.ends_with("/windows/system32/conhost.exe")
+        || (value.contains("/windows/system32/conhost.exe") && value.contains("-forcev1"))
         || value.ends_with("/windows/syswow64/cmd.exe")
         || (value.contains("icacls.exe")
             && contains_oracle_jre_usage_path(value)
@@ -490,7 +490,7 @@ fn contains_oracle_jre_usage_path(value: &str) -> bool {
 fn is_noisy_linux_java_artifact(value: &str) -> bool {
     value.starts_with("/proc/") && value.ends_with("/coredump_filter")
         || value.starts_with("/proc/") && value.ends_with("/coredumpfilter")
-        || (value.starts_with("/tmp/hsperfdata") && value.chars().any(|ch| ch.is_ascii_digit()))
+        || value.starts_with("/tmp/hsperfdata")
         || value == "/usr/bin/java"
         || value == "/bin/gzip"
 }
@@ -518,6 +518,12 @@ fn is_noisy_rsyslog_artifact(value: &str) -> bool {
 fn is_flattened_sandbox_artifact_marker(value: &str) -> bool {
     value == "text"
         || value.chars().all(|character| character.is_ascii_digit())
+        || (value.len() >= 16
+            && value.ends_with(".timestamp")
+            && value
+                .trim_end_matches(".timestamp")
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
         || (value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit()))
 }
 
@@ -525,6 +531,7 @@ fn normalize_behavior_value(value: &str) -> String {
     value
         .trim()
         .replace('\\', "/")
+        .replace("//", "/")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -924,16 +931,20 @@ mod tests {
                         files_written: vec![
                             "/proc/4965/coredump_filter".to_owned(),
                             "/tmp/hsperfdata_root/4965".to_owned(),
+                            "C:\\Users\\user\\AppData\\Local\\Temp\\hsperfdata_user".to_owned(),
+                            "\\Device\\ConDrv\\\\Connect".to_owned(),
                         ],
                         processes_created: vec![
                             "/bin/sh sh -c /usr/lib/rsyslog/rsyslog-rotate logrotate_script /var/log/syslog"
+                                .to_owned(),
+                            "C:\\Windows\\System32\\conhost.exe C:\\Windows\\system32\\conhost.exe 0xffffffff -ForceV1"
                                 .to_owned(),
                         ],
                         ..Default::default()
                     },
                 ],
                 contacted_domains: vec!["a1672.dscr.akamai.net".to_owned()],
-                dropped_files: vec!["1824".to_owned()],
+                dropped_files: vec!["3903daac9bc4a3b7.timestamp".to_owned(), "1824".to_owned()],
                 files_written: vec!["/proc/4965/coredump_filter".to_owned()],
                 processes_created: vec!["/usr/bin/java -jar /tmp/sample.jar".to_owned()],
                 command_executions: vec!["/bin/gzip".to_owned()],
