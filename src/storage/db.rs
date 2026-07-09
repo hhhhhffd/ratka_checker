@@ -17,7 +17,6 @@ pub struct ScanRow {
     pub status: String,
     pub verdict: Option<String>,
     pub risk_score: i32,
-    pub summary: String,
 }
 
 /// Database row for findings before conversion into typed API/domain objects.
@@ -78,7 +77,7 @@ pub async fn find_latest_scan_by_sha256(
 ) -> anyhow::Result<Option<ScanResponse>> {
     let row = sqlx::query_as::<_, ScanRow>(
         r#"
-        SELECT id, sha256, status, verdict, risk_score, summary
+        SELECT id, sha256, status, verdict, risk_score
         FROM scans
         WHERE sha256 = $1
         ORDER BY created_at DESC
@@ -99,7 +98,7 @@ pub async fn find_latest_scan_by_sha256(
 pub async fn find_scan_by_id(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Option<ScanResponse>> {
     let row = sqlx::query_as::<_, ScanRow>(
         r#"
-        SELECT id, sha256, status, verdict, risk_score, summary
+        SELECT id, sha256, status, verdict, risk_score
         FROM scans
         WHERE id = $1
         LIMIT 1
@@ -320,7 +319,6 @@ async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<
         sha256: scan.sha256,
         verdict: scan.verdict.as_deref().map(Verdict::from_db).transpose()?,
         risk_score: scan.risk_score.clamp(0, 100) as u8,
-        summary: scan.summary,
         findings: findings.iter().map(Finding::to_response).collect(),
         virustotal,
     })

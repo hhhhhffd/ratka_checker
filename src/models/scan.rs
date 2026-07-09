@@ -138,14 +138,17 @@ impl Finding {
 /// Summary of the latest VirusTotal report cached for the scanned file hash.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VirusTotalReport {
+    #[serde(
+        default = "default_virustotal_status",
+        skip_serializing_if = "is_completed_virustotal_status"
+    )]
     pub status: VirusTotalStatus,
+    #[serde(default = "default_virustotal_source", skip_serializing)]
     pub source: VirusTotalSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<VirusTotalStats>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flagged_engines: Vec<VirusTotalEngineResult>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_submission_date: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,7 +248,19 @@ pub enum VirusTotalStatus {
     Error,
 }
 
-/// Where the VirusTotal value came from, useful for clients deciding whether to poll again.
+fn is_completed_virustotal_status(status: &VirusTotalStatus) -> bool {
+    *status == VirusTotalStatus::Completed
+}
+
+fn default_virustotal_status() -> VirusTotalStatus {
+    VirusTotalStatus::Completed
+}
+
+fn default_virustotal_source() -> VirusTotalSource {
+    VirusTotalSource::Lookup
+}
+
+/// Where the VirusTotal value came from inside the service.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VirusTotalSource {
@@ -282,8 +297,82 @@ pub struct ScanResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
     pub risk_score: u8,
-    pub summary: String,
     pub findings: Vec<FindingResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virustotal: Option<VirusTotalReport>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn virustotal_report(status: VirusTotalStatus) -> VirusTotalReport {
+        VirusTotalReport {
+            status,
+            source: VirusTotalSource::Cache,
+            stats: None,
+            flagged_engines: Vec::new(),
+            first_submission_date: None,
+            permalink: None,
+            behavior: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn completed_virustotal_response_omits_internal_fields() {
+        let value = serde_json::to_value(virustotal_report(VirusTotalStatus::Completed))
+            .expect("report serializes");
+
+        assert!(value.get("status").is_none());
+        assert!(value.get("source").is_none());
+        assert!(value.get("names").is_none());
+    }
+
+    #[test]
+    fn non_completed_virustotal_response_keeps_status() {
+        let value = serde_json::to_value(virustotal_report(VirusTotalStatus::Error))
+            .expect("report serializes");
+
+        assert_eq!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("error")
+        );
+        assert!(value.get("source").is_none());
+        assert!(value.get("names").is_none());
+    }
+
+    #[test]
+    fn virustotal_report_deserializes_trimmed_completed_cache_shape() {
+        let report = serde_json::from_value::<VirusTotalReport>(serde_json::json!({
+            "stats": {
+                "malicious": 0,
+                "suspicious": 0,
+                "harmless": 0,
+                "undetected": 1,
+                "timeout": 0
+            }
+        }))
+        .expect("trimmed report deserializes");
+
+        assert_eq!(report.status, VirusTotalStatus::Completed);
+        assert_eq!(report.source, VirusTotalSource::Lookup);
+    }
+
+    #[test]
+    fn scan_response_omits_summary() {
+        let response = ScanResponse {
+            scan_id: Uuid::nil(),
+            status: ScanStatus::Done,
+            sha256: "abc".to_owned(),
+            verdict: Some(Verdict::Clean),
+            risk_score: 0,
+            findings: Vec::new(),
+            virustotal: None,
+        };
+
+        let value = serde_json::to_value(response).expect("response serializes");
+
+        assert!(value.get("summary").is_none());
+    }
 }
