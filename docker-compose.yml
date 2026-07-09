@@ -37,6 +37,20 @@ services:
       - ./deploy/frontend:/usr/share/nginx/html:ro
       - ./dev/nginx.conf:/etc/nginx/conf.d/default.conf:ro
 
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: telegram_bot/Dockerfile
+    depends_on:
+      - api
+    env_file:
+      - .env
+    environment:
+      RATSCAN_API_BASE_URL: http://api:8080
+    profiles:
+      - telegram
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   ratscan-storage:

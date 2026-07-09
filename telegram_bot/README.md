@@ -30,6 +30,21 @@ python -m venv .venv-tg
 python -m telegram_bot.bot
 ```
 
+## Run In Docker
+
+The compose service is behind the `telegram` profile, so the API can run without
+the bot.
+
+```sh
+docker compose --profile telegram up -d telegram-bot
+```
+
+Build only the bot image:
+
+```sh
+docker build -f telegram_bot/Dockerfile -t ratscan-telegram-bot .
+```
+
 ## Usage
 
 - Send a `.jar` document to start a scan.
