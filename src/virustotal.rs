@@ -96,6 +96,19 @@ pub fn error_report(message: String) -> VirusTotalReport {
     }
 }
 
+/// Removes known VirusTotal sandbox/runtime artifacts from behavior data before API exposure.
+pub fn sanitize_report(report: &mut VirusTotalReport) {
+    let Some(behavior) = &mut report.behavior else {
+        return;
+    };
+
+    for behavior_report in &mut behavior.reports {
+        filter_sandbox_noise(behavior_report);
+    }
+    behavior.reports.retain(has_behavior_signal);
+    rebuild_behavior_aggregates(behavior);
+}
+
 /// Converts a completed VirusTotal report into weighted findings for the main risk score.
 pub fn findings_for_report(report: &VirusTotalReport) -> Vec<Finding> {
     if report.status != VirusTotalStatus::Completed {
@@ -343,6 +356,7 @@ fn behavior_info_from_reports(
         extend_unique(&mut behavior.dns_lookups, &report.dns_lookups);
         behavior.reports.push(report);
     }
+    behavior.reports.retain(has_behavior_signal);
     behavior
 }
 
@@ -410,6 +424,40 @@ fn filter_sandbox_noise(report: &mut VirusTotalBehaviorReport) {
         .retain(|value| !is_noisy_virustotal_behavior_value(value));
 }
 
+fn has_behavior_signal(report: &VirusTotalBehaviorReport) -> bool {
+    report.verdict.is_some()
+        || !report.contacted_ips.is_empty()
+        || !report.contacted_domains.is_empty()
+        || !report.contacted_urls.is_empty()
+        || !report.dropped_files.is_empty()
+        || !report.files_written.is_empty()
+        || !report.processes_created.is_empty()
+        || !report.command_executions.is_empty()
+        || !report.dns_lookups.is_empty()
+}
+
+fn rebuild_behavior_aggregates(behavior: &mut VirusTotalBehaviorInfo) {
+    behavior.contacted_ips.clear();
+    behavior.contacted_domains.clear();
+    behavior.contacted_urls.clear();
+    behavior.dropped_files.clear();
+    behavior.files_written.clear();
+    behavior.processes_created.clear();
+    behavior.command_executions.clear();
+    behavior.dns_lookups.clear();
+
+    for report in &behavior.reports {
+        extend_unique(&mut behavior.contacted_ips, &report.contacted_ips);
+        extend_unique(&mut behavior.contacted_domains, &report.contacted_domains);
+        extend_unique(&mut behavior.contacted_urls, &report.contacted_urls);
+        extend_unique(&mut behavior.dropped_files, &report.dropped_files);
+        extend_unique(&mut behavior.files_written, &report.files_written);
+        extend_unique(&mut behavior.processes_created, &report.processes_created);
+        extend_unique(&mut behavior.command_executions, &report.command_executions);
+        extend_unique(&mut behavior.dns_lookups, &report.dns_lookups);
+    }
+}
+
 fn is_noisy_virustotal_behavior_value(value: &str) -> bool {
     let normalized = normalize_behavior_value(value);
 
@@ -417,25 +465,31 @@ fn is_noisy_virustotal_behavior_value(value: &str) -> bool {
         || is_noisy_linux_java_artifact(&normalized)
         || is_noisy_sandbox_java_command(&normalized)
         || is_noisy_rsyslog_artifact(&normalized)
+        || is_flattened_sandbox_artifact_marker(&normalized)
 }
 
 fn is_noisy_windows_java_artifact(value: &str) -> bool {
     (value.contains("appdata/local/temp/hsperfdata_")
         && value.chars().any(|ch| ch.is_ascii_digit()))
-        || (value.contains("programdata/oracle/java.oracle_jre_usage")
-            && value.ends_with(".timestamp"))
+        || (contains_oracle_jre_usage_path(value) && value.ends_with(".timestamp"))
         || value.ends_with("/cmdlinestart.log")
         || value.contains("/device/condrv/connect")
         || (value.contains("/program files/java/") && value.contains("/bin/java.exe"))
         || value.ends_with("/windows/system32/conhost.exe")
         || value.ends_with("/windows/syswow64/cmd.exe")
         || (value.contains("icacls.exe")
-            && value.contains("programdata/oracle/java.oracle_jre_usage")
+            && contains_oracle_jre_usage_path(value)
             && value.contains("/grant"))
 }
 
+fn contains_oracle_jre_usage_path(value: &str) -> bool {
+    value.contains("programdata/oracle/java.oracle_jre_usage")
+        || value.contains("programdata/oracle/java/.oracle_jre_usage")
+}
+
 fn is_noisy_linux_java_artifact(value: &str) -> bool {
-    value.starts_with("/proc/") && value.ends_with("/coredumpfilter")
+    value.starts_with("/proc/") && value.ends_with("/coredump_filter")
+        || value.starts_with("/proc/") && value.ends_with("/coredumpfilter")
         || (value.starts_with("/tmp/hsperfdata") && value.chars().any(|ch| ch.is_ascii_digit()))
         || value == "/usr/bin/java"
         || value == "/bin/gzip"
@@ -459,6 +513,12 @@ fn is_noisy_rsyslog_artifact(value: &str) -> bool {
         || value == "/usr/bin/systemctl systemctl kill -s hup rsyslog.service"
         || value == "systemctl kill -s hup rsyslog.service"
         || value.contains("rsyslog-rotate logrotate_script /var/log/")
+}
+
+fn is_flattened_sandbox_artifact_marker(value: &str) -> bool {
+    value == "text"
+        || value.chars().all(|character| character.is_ascii_digit())
+        || (value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit()))
 }
 
 fn normalize_behavior_value(value: &str) -> String {
@@ -818,6 +878,88 @@ mod tests {
             vec!["java.exe -jar C:\\Users\\user\\Downloads\\unknown.jar"]
         );
         assert_eq!(behavior.dropped_files, vec!["/tmp/payload.bin"]);
+    }
+
+    #[test]
+    fn sanitize_report_filters_cached_behavior_aggregates() {
+        let mut report = VirusTotalReport {
+            status: VirusTotalStatus::Completed,
+            source: VirusTotalSource::Cache,
+            stats: None,
+            flagged_engines: Vec::new(),
+            names: Vec::new(),
+            first_submission_date: None,
+            permalink: None,
+            behavior: Some(VirusTotalBehaviorInfo {
+                available: Some(true),
+                reports: vec![
+                    VirusTotalBehaviorReport {
+                        sandbox_name: Some("CAPE Sandbox".to_owned()),
+                        analysis_date: Some(1),
+                        dropped_files: vec![
+                            "1824".to_owned(),
+                            "TEXT".to_owned(),
+                            "f17b4034f5593ee4f170eccc12d34a6de25dd00a00bf19c1015c00a40aff1130"
+                                .to_owned(),
+                        ],
+                        files_written: vec![
+                            "C:\\ProgramData\\Oracle\\Java\\.oracle_jre_usage\\3903daac9bc4a3b7.timestamp"
+                                .to_owned(),
+                        ],
+                        processes_created: vec![
+                            "\"C:\\Program Files\\Java\\jre-1.8\\bin\\java.exe\" -jar \"C:\\Users\\<USER>\\Desktop\\sample.jar\""
+                                .to_owned(),
+                        ],
+                        command_executions: vec![
+                            "C:\\Windows\\system32\\icacls.exe C:\\ProgramData\\Oracle\\Java\\.oracle_jre_usage /grant \"everyone\":(OI)(CI)M"
+                                .to_owned(),
+                        ],
+                        ..Default::default()
+                    },
+                    VirusTotalBehaviorReport {
+                        sandbox_name: Some("Zenbox".to_owned()),
+                        analysis_date: Some(2),
+                        contacted_domains: vec!["a1672.dscr.akamai.net".to_owned()],
+                        dns_lookups: vec!["a1672.dscr.akamai.net".to_owned()],
+                        files_written: vec![
+                            "/proc/4965/coredump_filter".to_owned(),
+                            "/tmp/hsperfdata_root/4965".to_owned(),
+                        ],
+                        processes_created: vec![
+                            "/bin/sh sh -c /usr/lib/rsyslog/rsyslog-rotate logrotate_script /var/log/syslog"
+                                .to_owned(),
+                        ],
+                        ..Default::default()
+                    },
+                ],
+                contacted_domains: vec!["a1672.dscr.akamai.net".to_owned()],
+                dropped_files: vec!["1824".to_owned()],
+                files_written: vec!["/proc/4965/coredump_filter".to_owned()],
+                processes_created: vec!["/usr/bin/java -jar /tmp/sample.jar".to_owned()],
+                command_executions: vec!["/bin/gzip".to_owned()],
+                dns_lookups: vec!["a1672.dscr.akamai.net".to_owned()],
+                contacted_ips: Vec::new(),
+                contacted_urls: Vec::new(),
+            }),
+            error: None,
+        };
+
+        sanitize_report(&mut report);
+
+        let behavior = report.behavior.expect("behavior is present");
+        assert_eq!(behavior.reports.len(), 1);
+        assert_eq!(
+            behavior.contacted_domains,
+            vec!["a1672.dscr.akamai.net".to_owned()]
+        );
+        assert_eq!(
+            behavior.dns_lookups,
+            vec!["a1672.dscr.akamai.net".to_owned()]
+        );
+        assert!(behavior.dropped_files.is_empty());
+        assert!(behavior.files_written.is_empty());
+        assert!(behavior.processes_created.is_empty());
+        assert!(behavior.command_executions.is_empty());
     }
 
     #[test]

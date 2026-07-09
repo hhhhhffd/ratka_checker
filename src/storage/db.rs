@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::models::scan::{
     Finding, ScanResponse, ScanStatus, Severity, Verdict, VirusTotalReport, VirusTotalSource,
 };
+use crate::virustotal;
 
 /// Database row for scans before conversion into the public API response.
 #[derive(Debug, sqlx::FromRow)]
@@ -376,5 +377,6 @@ fn report_from_row(row: VirusTotalReportRow) -> anyhow::Result<VirusTotalReport>
     let mut report = serde_json::from_value::<VirusTotalReport>(row.report_json)?;
     report.source = VirusTotalSource::Cache;
     report.ensure_behavior_shape();
+    virustotal::sanitize_report(&mut report);
     Ok(report)
 }
