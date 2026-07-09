@@ -18,6 +18,12 @@ use crate::{
 const API_BASE_URL: &str = "https://www.virustotal.com/api/v3";
 const BEHAVIOR_VALUE_LIMIT: usize = 50;
 const BEHAVIOR_STRING_LIMIT: usize = 300;
+const VT_SANDBOX_JAVA_PROCESSES: &[&str] = &[
+    "sample.jar",
+    "jartracer.jar",
+    "cmdlinestart.log",
+    "/tmp/sample.jar",
+];
 const FLAGGED_CATEGORIES: &[&str] = &["malicious", "suspicious"];
 const TRUSTED_ENGINES: &[&str] = &[
     "BitDefender",
@@ -341,7 +347,7 @@ fn behavior_info_from_reports(
 }
 
 fn behavior_report_from_attributes(attributes: serde_json::Value) -> VirusTotalBehaviorReport {
-    VirusTotalBehaviorReport {
+    let mut report = VirusTotalBehaviorReport {
         sandbox_name: string_field(&attributes, &["sandbox_name", "sandbox", "environment_id"]),
         analysis_date: integer_field(&attributes, &["analysis_date", "date"]),
         verdict: string_field(
@@ -384,7 +390,85 @@ fn behavior_report_from_attributes(attributes: serde_json::Value) -> VirusTotalB
             ],
         ),
         dns_lookups: field_strings(&attributes, &["dns_lookups", "dns_requests"]),
-    }
+    };
+    filter_sandbox_noise(&mut report);
+    report
+}
+
+fn filter_sandbox_noise(report: &mut VirusTotalBehaviorReport) {
+    report
+        .dropped_files
+        .retain(|value| !is_noisy_virustotal_behavior_value(value));
+    report
+        .files_written
+        .retain(|value| !is_noisy_virustotal_behavior_value(value));
+    report
+        .processes_created
+        .retain(|value| !is_noisy_virustotal_behavior_value(value));
+    report
+        .command_executions
+        .retain(|value| !is_noisy_virustotal_behavior_value(value));
+}
+
+fn is_noisy_virustotal_behavior_value(value: &str) -> bool {
+    let normalized = normalize_behavior_value(value);
+
+    is_noisy_windows_java_artifact(&normalized)
+        || is_noisy_linux_java_artifact(&normalized)
+        || is_noisy_sandbox_java_command(&normalized)
+        || is_noisy_rsyslog_artifact(&normalized)
+}
+
+fn is_noisy_windows_java_artifact(value: &str) -> bool {
+    (value.contains("appdata/local/temp/hsperfdata_")
+        && value.chars().any(|ch| ch.is_ascii_digit()))
+        || (value.contains("programdata/oracle/java.oracle_jre_usage")
+            && value.ends_with(".timestamp"))
+        || value.ends_with("/cmdlinestart.log")
+        || value.contains("/device/condrv/connect")
+        || (value.contains("/program files/java/") && value.contains("/bin/java.exe"))
+        || value.ends_with("/windows/system32/conhost.exe")
+        || value.ends_with("/windows/syswow64/cmd.exe")
+        || (value.contains("icacls.exe")
+            && value.contains("programdata/oracle/java.oracle_jre_usage")
+            && value.contains("/grant"))
+}
+
+fn is_noisy_linux_java_artifact(value: &str) -> bool {
+    value.starts_with("/proc/") && value.ends_with("/coredumpfilter")
+        || (value.starts_with("/tmp/hsperfdata") && value.chars().any(|ch| ch.is_ascii_digit()))
+        || value == "/usr/bin/java"
+        || value == "/bin/gzip"
+}
+
+fn is_noisy_sandbox_java_command(value: &str) -> bool {
+    let runs_known_sandbox_sample = value.contains("java")
+        && VT_SANDBOX_JAVA_PROCESSES
+            .iter()
+            .any(|artifact| value.contains(artifact));
+
+    runs_known_sandbox_sample
+        || (value.contains("cmd.exe")
+            && value.contains("java.exe")
+            && value.contains("sample.jar")
+            && value.contains("cmdlinestart.log"))
+}
+
+fn is_noisy_rsyslog_artifact(value: &str) -> bool {
+    value == "/usr/lib/rsyslog/rsyslog-rotate"
+        || value == "/usr/bin/systemctl systemctl kill -s hup rsyslog.service"
+        || value == "systemctl kill -s hup rsyslog.service"
+        || value.contains("rsyslog-rotate logrotate_script /var/log/")
+}
+
+fn normalize_behavior_value(value: &str) -> String {
+    value
+        .trim()
+        .replace('\\', "/")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -691,5 +775,64 @@ mod tests {
         assert!(behavior
             .command_executions
             .contains(&"cmd.exe /c whoami".to_owned()));
+    }
+
+    #[test]
+    fn behavior_reports_filter_known_virustotal_sandbox_noise() {
+        let behavior = behavior_info_from_reports(vec![VirusTotalBehaviorObject {
+            attributes: serde_json::json!({
+                "files_written": [
+                    "C:\\Users\\user\\AppData\\Local\\Temp\\hsperfdata_user\\1234",
+                    "C:\\ProgramData\\Oracle\\Java.oracle_jre_usage123ABC.timestamp",
+                    "C:\\cmdlinestart.log",
+                    "C:\\Temp\\payload.dll"
+                ],
+                "processes_created": [
+                    "C:\\Program Files\\Java\\jre1.8.0_441\\bin\\java.exe",
+                    "C:\\Windows\\System32\\conhost.exe",
+                    "/usr/bin/java",
+                    "/bin/gzip",
+                    "powershell.exe -enc AAAA"
+                ],
+                "command_executions": [
+                    "java.exe -jar C:\\Temp\\sample.jar",
+                    "java.exe -javaagent:C:\\Temp\\jartracer.jar -jar C:\\Temp\\sample.jar",
+                    "cmd.exe /c java.exe -javaagent:jartracer.jar -jar sample.jar > cmdlinestart.log",
+                    "icacls.exe C:\\ProgramData\\Oracle\\Java.oracle_jre_usage /grant \"everyone\":(OI)(CI)M",
+                    "systemctl kill -s HUP rsyslog.service",
+                    "java.exe -jar C:\\Users\\user\\Downloads\\unknown.jar"
+                ],
+                "dropped_files": [
+                    "/proc/1234/coredumpfilter",
+                    "/tmp/hsperfdata_user/1234",
+                    "/usr/lib/rsyslog/rsyslog-rotate",
+                    "/tmp/payload.bin"
+                ]
+            }),
+        }]);
+
+        assert_eq!(behavior.files_written, vec!["C:\\Temp\\payload.dll"]);
+        assert_eq!(behavior.processes_created, vec!["powershell.exe -enc AAAA"]);
+        assert_eq!(
+            behavior.command_executions,
+            vec!["java.exe -jar C:\\Users\\user\\Downloads\\unknown.jar"]
+        );
+        assert_eq!(behavior.dropped_files, vec!["/tmp/payload.bin"]);
+    }
+
+    #[test]
+    fn behavior_noise_filter_keeps_network_artifacts() {
+        let behavior = behavior_info_from_reports(vec![VirusTotalBehaviorObject {
+            attributes: serde_json::json!({
+                "contacted_urls": [
+                    "https://raw.githubusercontent.com/example/payload.jar",
+                    "https://discord.com/api/webhooks/1/token"
+                ],
+                "dns_lookups": ["pastebin.com"]
+            }),
+        }]);
+
+        assert_eq!(behavior.contacted_urls.len(), 2);
+        assert_eq!(behavior.dns_lookups, vec!["pastebin.com"]);
     }
 }

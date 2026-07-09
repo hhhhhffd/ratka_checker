@@ -106,6 +106,30 @@
   match_type: bytecode_ref
   pattern: "java/lang/ClassLoader.defineClass"
   message: "Найден defineClass без подтвержденной подкачки кода"
+- rule_id: REFLECTION_METHOD_INVOKE
+  category: dangerous_api
+  severity: low
+  match_type: bytecode_ref
+  pattern: "java/lang/reflect/Method.invoke"
+  message: "Найден reflection Method.invoke"
+- rule_id: DESKTOP_GET_DESKTOP
+  category: dangerous_api
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/awt/Desktop.getDesktop"
+  message: "Найден Desktop.getDesktop"
+- rule_id: SYSTEM_LOAD
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/lang/System.load"
+  message: "Найден System.load для загрузки native-библиотеки"
+- rule_id: SYSTEM_LOAD_LIBRARY
+  category: dangerous_api
+  severity: high
+  match_type: bytecode_ref
+  pattern: "java/lang/System.loadLibrary"
+  message: "Найден System.loadLibrary для загрузки native-библиотеки"
 - rule_id: FILES_WRITE
   category: dangerous_api
   severity: low
@@ -148,6 +172,18 @@
   match_type: bytecode_ref
   pattern: "java/net/http/HttpRequest"
   message: "Найдено использование Java 11 HttpRequest"
+- rule_id: URL_OPEN_CONNECTION
+  category: network
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "java/net/URL.openConnection"
+  message: "Найден URL.openConnection"
+- rule_id: OKHTTP_CLIENT
+  category: network
+  severity: low
+  match_type: bytecode_ref
+  pattern: "okhttp3/OkHttpClient"
+  message: "Найдено использование OkHttpClient"
 - rule_id: DISCORD_TOKEN_PATH
   category: credential_theft
   severity: critical
@@ -218,7 +254,7 @@
   category: exfiltration
   severity: high
   match_type: regex
-  pattern: "(hastebin\\.com|paste\\.ee)"
+  pattern: "(hastebin\\.com|hastebin\\.com/raw|paste\\.ee)"
   message: "Обнаружен paste-сервис для конфигов или exfiltration"
 - rule_id: RAW_GITHUB_URL
   category: exfiltration
@@ -250,6 +286,24 @@
   match_type: bytecode_ref
   pattern: "java/util/Base64"
   message: "Найдено использование Base64 API без подтвержденной dynamic-loading цепочки"
+- rule_id: CIPHER_API
+  category: obfuscation
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "javax/crypto/Cipher"
+  message: "Найдено использование Cipher API"
+- rule_id: SECRET_KEY_SPEC
+  category: obfuscation
+  severity: medium
+  match_type: bytecode_ref
+  pattern: "javax/crypto/spec/SecretKeySpec"
+  message: "Найдено использование SecretKeySpec"
+- rule_id: DECRYPT_HINT
+  category: obfuscation
+  severity: low
+  match_type: regex
+  pattern: "\\bdecrypt\\b"
+  message: "Найдена строка decrypt"
 - rule_id: BASE64_BLOB
   category: obfuscation
   severity: low
