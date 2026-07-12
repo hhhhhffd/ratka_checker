@@ -8,9 +8,16 @@ use std::{
 use zip::ZipArchive;
 
 use crate::{
-    models::scan::{Confidence, Finding, Obfuscation, ScanReport, Severity, Verdict},
+    models::scan::{CodeScope, Confidence, Finding, Obfuscation, ScanReport, Severity, Verdict},
     rules::engine::RulesEngine,
-    scanner::{class_file, metadata, strings},
+    scanner::{
+        class_file, metadata,
+        scope::{
+            classify_classes, ArchiveScopeInput, ClassScopeInput, DependencyMetadata,
+            ScopeClassificationInput,
+        },
+        strings,
+    },
 };
 
 const NESTED_JAR_SIGNAL: &str = "nested_jar";
@@ -86,17 +93,59 @@ pub struct ScanData {
     pub mod_ids: Vec<String>,
     pub mod_aliases: Vec<String>,
     pub entrypoint_classes: Vec<String>,
-    pub entry_timestamps: Vec<(String, String)>,
+    /// Archive-specific contexts. Nested archives must never share timestamps or paths with
+    /// their parent archive.
+    pub archive_layers: Vec<ArchiveLayer>,
+    pub resource_files: Vec<ResourceScanData>,
+}
+
+/// A single JAR or ZIP encountered while recursively parsing the submitted archive.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ArchiveLayer {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub path: String,
+    pub depth: usize,
+    pub declared_dependency: bool,
+    pub mod_metadata: Vec<String>,
+    pub entrypoint_classes: Vec<String>,
+    pub entries: Vec<ArchiveEntryData>,
+    pub timestamp_baseline: Option<String>,
+}
+
+/// Metadata retained for an entry without retaining or executing its contents.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ArchiveEntryData {
+    pub path: String,
+    pub timestamp: Option<String>,
+    pub normalized_timestamp: bool,
+    pub uncompressed_size: u64,
+}
+
+/// A non-class resource and the archive layer it came from.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResourceScanData {
+    pub archive_id: String,
+    pub archive_path: String,
+    pub path: String,
+    pub uncompressed_size: u64,
 }
 
 /// Per-class data used for lower-noise correlation signals.
 #[derive(Clone, Debug, Default)]
 pub struct ClassScanData {
+    pub archive_id: String,
+    pub archive_path: String,
     pub path: String,
     pub class_name: Option<String>,
     pub major_version: u16,
     pub strings: Vec<String>,
     pub bytecode_refs: Vec<String>,
+    pub scope: CodeScope,
+    pub dependency_name: Option<String>,
+    pub dependency_version: Option<String>,
+    pub reachable_from_entrypoint: bool,
+    pub classification_confidence: Confidence,
 }
 
 /// Complete scanner result ready to persist after risk scoring.
@@ -132,9 +181,11 @@ fn scan_bytes(
         total_uncompressed_bytes: 0,
         file_count: 0,
         data: ScanData::default(),
+        next_archive_id: 0,
     };
+    let root_archive_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
 
-    if let Err(error) = parse_zip_bytes(bytes, 0, &mut context) {
+    if let Err(error) = parse_zip_bytes(bytes, &root_archive_id, &mut context) {
         return Ok(unknown_outcome(
             error.rule_id(),
             "archive_structure",
@@ -186,9 +237,10 @@ fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 /// Parses a zip archive recursively while enforcing global limits before reading file contents.
 fn parse_zip_bytes(
     bytes: &[u8],
-    depth: usize,
+    archive_id: &str,
     context: &mut ArchiveContext,
 ) -> Result<(), ScanAbort> {
+    let depth = context.archive_depth(archive_id)?;
     if depth > context.limits.max_nesting_depth {
         return Err(ScanAbort::NestingDepth {
             limit: context.limits.max_nesting_depth,
@@ -212,13 +264,17 @@ fn parse_zip_bytes(
 
         let name = entry.name().replace('\\', "/");
         let uncompressed_size = entry.size();
-        if let Some(last_modified) = entry.last_modified() {
-            context
-                .data
-                .entry_timestamps
-                .push((name.clone(), format!("{last_modified:?}")));
-        }
-        context.observe_file(&name, uncompressed_size)?;
+        let timestamp = entry.last_modified().map(format_zip_timestamp);
+        let normalized_timestamp = entry
+            .last_modified()
+            .is_some_and(is_normalized_zip_timestamp);
+        context.observe_file(
+            archive_id,
+            &name,
+            uncompressed_size,
+            timestamp,
+            normalized_timestamp,
+        )?;
 
         let mut entry_bytes = Vec::new();
         entry
@@ -226,8 +282,10 @@ fn parse_zip_bytes(
             .map_err(|error| ScanAbort::InvalidZip {
                 message: error.to_string(),
             })?;
-        context.extract_entry(&name, &entry_bytes, depth)?;
+        context.extract_entry(archive_id, &name, &entry_bytes)?;
     }
+
+    context.calculate_timestamp_baseline(archive_id)?;
 
     Ok(())
 }
@@ -238,11 +296,70 @@ struct ArchiveContext {
     total_uncompressed_bytes: u64,
     file_count: usize,
     data: ScanData,
+    next_archive_id: usize,
 }
 
 impl ArchiveContext {
+    fn create_archive_layer(
+        &mut self,
+        parent_id: Option<String>,
+        path: String,
+        depth: usize,
+        declared_dependency: bool,
+    ) -> String {
+        let id = format!("archive-{}", self.next_archive_id);
+        self.next_archive_id += 1;
+        self.data.archive_layers.push(ArchiveLayer {
+            id: id.clone(),
+            parent_id,
+            path,
+            depth,
+            declared_dependency,
+            mod_metadata: Vec::new(),
+            entrypoint_classes: Vec::new(),
+            entries: Vec::new(),
+            timestamp_baseline: None,
+        });
+        id
+    }
+
+    fn archive_layer(&self, archive_id: &str) -> Result<&ArchiveLayer, ScanAbort> {
+        self.data
+            .archive_layers
+            .iter()
+            .find(|layer| layer.id == archive_id)
+            .ok_or_else(|| ScanAbort::InvalidZip {
+                message: format!("missing archive layer {archive_id}"),
+            })
+    }
+
+    fn archive_layer_mut(&mut self, archive_id: &str) -> Result<&mut ArchiveLayer, ScanAbort> {
+        self.data
+            .archive_layers
+            .iter_mut()
+            .find(|layer| layer.id == archive_id)
+            .ok_or_else(|| ScanAbort::InvalidZip {
+                message: format!("missing archive layer {archive_id}"),
+            })
+    }
+
+    fn archive_depth(&self, archive_id: &str) -> Result<usize, ScanAbort> {
+        Ok(self.archive_layer(archive_id)?.depth)
+    }
+
+    fn archive_path(&self, archive_id: &str) -> Result<String, ScanAbort> {
+        Ok(self.archive_layer(archive_id)?.path.clone())
+    }
+
     /// Records file metadata and enforces zip-bomb limits before any content processing.
-    fn observe_file(&mut self, name: &str, uncompressed_size: u64) -> Result<(), ScanAbort> {
+    fn observe_file(
+        &mut self,
+        archive_id: &str,
+        name: &str,
+        uncompressed_size: u64,
+        timestamp: Option<String>,
+        normalized_timestamp: bool,
+    ) -> Result<(), ScanAbort> {
         self.file_count += 1;
         if self.file_count > self.limits.max_files_in_archive {
             return Err(ScanAbort::FileCount {
@@ -270,6 +387,14 @@ impl ArchiveContext {
             });
         }
 
+        self.archive_layer_mut(archive_id)?
+            .entries
+            .push(ArchiveEntryData {
+                path: name.to_owned(),
+                timestamp,
+                normalized_timestamp,
+                uncompressed_size,
+            });
         self.observe_archive_structure(name, uncompressed_size);
         Ok(())
     }
@@ -302,16 +427,35 @@ impl ArchiveContext {
     }
 
     /// Extracts content signals from metadata, class files, generic resources, and nested jars.
-    fn extract_entry(&mut self, name: &str, bytes: &[u8], depth: usize) -> Result<(), ScanAbort> {
+    fn extract_entry(
+        &mut self,
+        archive_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), ScanAbort> {
         let lower = name.to_ascii_lowercase();
         self.observe_magic_bytes(&lower, bytes);
 
         if lower.ends_with(".jar") || lower.ends_with(".zip") {
-            return parse_zip_bytes(bytes, depth + 1, self);
+            let parent = self.archive_layer(archive_id)?;
+            let child_path = archive_entry_path(&parent.path, name);
+            let child_archive_id = self.create_archive_layer(
+                Some(archive_id.to_owned()),
+                child_path,
+                parent.depth + 1,
+                is_fabric_declared_nested_jar(&lower),
+            );
+            return parse_zip_bytes(bytes, &child_archive_id, self);
         }
 
         if metadata::is_metadata_file(name) {
+            self.archive_layer_mut(archive_id)?
+                .mod_metadata
+                .push(name.to_owned());
             let metadata = metadata::extract_metadata(name, bytes);
+            self.archive_layer_mut(archive_id)?
+                .entrypoint_classes
+                .extend(metadata.entrypoint_classes.clone());
             self.data.manifest_fields.extend(metadata.manifest_fields);
             self.data.metadata_strings.extend(metadata.strings.clone());
             self.data.strings.extend(metadata.strings);
@@ -327,11 +471,18 @@ impl ArchiveContext {
             match class_file::parse_class_file(bytes) {
                 Ok(class_data) => {
                     self.data.class_files.push(ClassScanData {
+                        archive_id: archive_id.to_owned(),
+                        archive_path: self.archive_path(archive_id)?,
                         path: name.to_owned(),
                         class_name: class_data.class_name.clone(),
                         major_version: class_data.major_version,
                         strings: class_data.strings.clone(),
                         bytecode_refs: class_data.bytecode_refs.clone(),
+                        scope: CodeScope::Unknown,
+                        dependency_name: None,
+                        dependency_version: None,
+                        reachable_from_entrypoint: false,
+                        classification_confidence: Confidence::Low,
                     });
                     self.data.strings.extend(class_data.strings);
                     self.data.bytecode_refs.extend(class_data.bytecode_refs);
@@ -351,6 +502,12 @@ impl ArchiveContext {
                 }
             }
         } else {
+            self.data.resource_files.push(ResourceScanData {
+                archive_id: archive_id.to_owned(),
+                archive_path: self.archive_path(archive_id)?,
+                path: name.to_owned(),
+                uncompressed_size: bytes.len() as u64,
+            });
             self.data
                 .strings
                 .extend(strings::extract_printable_strings(bytes));
@@ -372,6 +529,7 @@ impl ArchiveContext {
 
     /// Adds aggregate signals that require seeing multiple files before deciding.
     fn add_derived_signals(&mut self) {
+        self.classify_code_scope();
         self.add_first_party_scope();
         let scoped_versions = self.first_party_class_versions();
         let version_source = if scoped_versions.is_empty() {
@@ -396,9 +554,8 @@ impl ArchiveContext {
     }
 
     fn add_first_party_scope(&mut self) {
-        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
         for class_file in &self.data.class_files {
-            if is_first_party_class(class_file, &first_party_prefixes) {
+            if class_file.scope == CodeScope::FirstParty {
                 self.data
                     .first_party_strings
                     .extend(class_file.strings.clone());
@@ -410,50 +567,123 @@ impl ArchiveContext {
     }
 
     fn first_party_class_versions(&self) -> Vec<u16> {
-        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
         self.data
             .class_files
             .iter()
-            .filter(|class_file| is_first_party_class(class_file, &first_party_prefixes))
+            .filter(|class_file| class_file.scope == CodeScope::FirstParty)
             .map(|class_file| class_file.major_version)
             .collect()
     }
 
+    /// Attributes every class to the archive it came from before first-party rules run.
+    fn classify_code_scope(&mut self) {
+        let archives = self
+            .data
+            .archive_layers
+            .iter()
+            .map(|layer| ArchiveScopeInput {
+                archive_id: layer.id.clone(),
+                archive_path: layer.path.clone(),
+                depth: layer.depth,
+                declared_dependency: layer
+                    .declared_dependency
+                    .then(|| dependency_metadata_from_archive_path(&layer.path)),
+                has_mod_metadata: !layer.mod_metadata.is_empty(),
+                entrypoint_classes: layer.entrypoint_classes.clone(),
+                mixin_package_roots: Vec::new(),
+                maven_package_roots: Vec::new(),
+            })
+            .collect();
+        let classes = self
+            .data
+            .class_files
+            .iter()
+            .filter_map(|class| {
+                class.class_name.as_ref().map(|class_name| ClassScopeInput {
+                    archive_id: class.archive_id.clone(),
+                    class_name: class_name.clone(),
+                })
+            })
+            .collect();
+        let classifications = classify_classes(&ScopeClassificationInput {
+            archives,
+            classes,
+            dominant_package_roots: dominant_package_roots(&self.data.class_files),
+        });
+        let classifications = classifications
+            .into_iter()
+            .map(|classification| {
+                (
+                    (
+                        classification.archive_id.clone(),
+                        classification.class_name.clone(),
+                    ),
+                    classification,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        for class in &mut self.data.class_files {
+            let Some(class_name) = &class.class_name else {
+                continue;
+            };
+            let key = (class.archive_id.clone(), class_name.clone());
+            let Some(classification) = classifications.get(&key) else {
+                continue;
+            };
+            class.scope = classification.scope.clone();
+            class.dependency_name = classification
+                .dependency
+                .as_ref()
+                .map(|dependency| dependency.name.clone());
+            class.dependency_version = classification
+                .dependency
+                .as_ref()
+                .and_then(|dependency| dependency.version.clone());
+            class.reachable_from_entrypoint = classification.reachable_from_entrypoint;
+            class.classification_confidence = classification.classification_confidence.clone();
+        }
+    }
+
     fn add_timestamp_outlier_signal(&mut self) {
-        if self.data.entry_timestamps.len() < TIMESTAMP_OUTLIER_MIN_FILES {
-            return;
-        }
-        let mut counts = HashMap::<&str, usize>::new();
-        for (_, timestamp) in self.timestamp_candidates() {
-            *counts.entry(timestamp.as_str()).or_default() += 1;
-        }
-        let dominant = counts.values().copied().max().unwrap_or_default();
-        let total = self.timestamp_candidates().len();
-        if dominant * 100 / total >= TIMESTAMP_DOMINANT_PERCENT && total > dominant {
+        if self
+            .data
+            .archive_layers
+            .iter()
+            .any(archive_layer_has_timestamp_outlier)
+        {
             self.data
                 .archive_signals
                 .push(TIMESTAMP_OUTLIER_SIGNAL.to_owned());
         }
     }
 
-    fn timestamp_candidates(&self) -> Vec<&(String, String)> {
-        self.data
-            .entry_timestamps
-            .iter()
-            .filter(|(path, _)| !is_signature_or_manifest_path(path))
-            .collect()
+    fn calculate_timestamp_baseline(&mut self, archive_id: &str) -> Result<(), ScanAbort> {
+        let layer = self.archive_layer_mut(archive_id)?;
+        let mut counts = HashMap::<&str, usize>::new();
+        for entry in layer.entries.iter().filter(|entry| {
+            !entry.normalized_timestamp && is_timestamp_outlier_candidate(&entry.path)
+        }) {
+            if let Some(timestamp) = entry.timestamp.as_deref() {
+                *counts.entry(timestamp).or_default() += 1;
+            }
+        }
+        layer.timestamp_baseline = counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(timestamp, _)| timestamp.to_owned());
+        Ok(())
     }
 
     fn add_modid_package_signal(&mut self) {
         if self.data.mod_ids.is_empty() || self.data.class_names.is_empty() {
             return;
         }
-        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
         let packages = self
             .data
             .class_files
             .iter()
-            .filter(|class_file| is_first_party_class(class_file, &first_party_prefixes))
+            .filter(|class_file| class_file.scope == CodeScope::FirstParty)
             .filter_map(|class_file| class_file.class_name.as_deref())
             .filter_map(|class_name| class_name.rsplit_once('/').map(|(package, _)| package))
             .map(normalize_identifier)
@@ -579,9 +809,8 @@ impl ArchiveContext {
     }
 
     fn add_class_correlation_signals(&mut self) {
-        let first_party_prefixes = first_party_prefixes(&self.data.entrypoint_classes);
         for class_file in &self.data.class_files {
-            if !is_first_party_class(class_file, &first_party_prefixes) {
+            if class_file.scope != CodeScope::FirstParty {
                 continue;
             }
             let has_network = refs_contain_any(&class_file.bytecode_refs, NETWORK_APIS);
@@ -668,59 +897,43 @@ fn is_known_dependency_native_path(lower_name: &str) -> bool {
         || lower_name.starts_with("mediaplayerinfo/natives/")
 }
 
-fn first_party_prefixes(entrypoint_classes: &[String]) -> Vec<String> {
-    let mut prefixes = HashSet::new();
-    for entrypoint in entrypoint_classes {
-        let class_name = entrypoint
-            .split_once(':')
-            .map_or(entrypoint.as_str(), |(_, class_name)| class_name)
-            .replace('.', "/");
-        let Some((package, _)) = class_name.rsplit_once('/') else {
+fn dependency_metadata_from_archive_path(path: &str) -> DependencyMetadata {
+    let name = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".jar")
+        .to_owned();
+    DependencyMetadata {
+        name,
+        version: None,
+        package_roots: Vec::new(),
+    }
+}
+
+fn dominant_package_roots(class_files: &[ClassScanData]) -> Vec<String> {
+    let mut roots = HashMap::<String, usize>::new();
+    for class_file in class_files {
+        let Some(class_name) = class_file.class_name.as_deref() else {
             continue;
         };
-        let segments = package.split('/').collect::<Vec<_>>();
-        if segments.len() >= 3 {
-            prefixes.insert(segments[..3].join("/"));
+        let package = class_name
+            .rsplit_once('/')
+            .map_or(class_name, |(package, _)| package);
+        let segments = package
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            continue;
         }
-        if segments.len() >= 4 {
-            prefixes.insert(segments[..4].join("/"));
-        }
+        let root = segments[..segments.len().min(3)].join("/");
+        *roots.entry(root).or_default() += 1;
     }
-    prefixes.into_iter().collect()
-}
-
-fn is_first_party_class(class_file: &ClassScanData, first_party_prefixes: &[String]) -> bool {
-    let class_name = class_file
-        .class_name
-        .as_deref()
-        .unwrap_or(class_file.path.as_str())
-        .trim_end_matches(".class");
-    if is_known_dependency_class_path(class_name)
-        || is_known_dependency_class_path(&class_file.path)
-    {
-        return false;
-    }
-    first_party_prefixes.is_empty()
-        || first_party_prefixes
-            .iter()
-            .any(|prefix| class_name == prefix || class_name.starts_with(&format!("{prefix}/")))
-}
-
-fn is_known_dependency_class_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [
-        "com/kenai/",
-        "dev/redstones/mediaplayerinfo/",
-        "jnr/",
-        "kotlin/",
-        "kotlinx/",
-        "org/freedesktop/dbus/",
-        "org/intellij/",
-        "org/jetbrains/",
-        "org/slf4j/",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
+    roots
+        .into_iter()
+        .filter_map(|(root, count)| (count >= 2).then_some(root))
+        .collect()
 }
 
 fn is_signature_or_manifest_path(path: &str) -> bool {
@@ -730,6 +943,63 @@ fn is_signature_or_manifest_path(path: &str) -> bool {
         || lower.ends_with(".rsa")
         || lower.ends_with(".dsa")
         || lower.ends_with(".ec")
+}
+
+fn is_timestamp_outlier_candidate(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    !is_signature_or_manifest_path(path)
+        && !metadata::is_metadata_file(path)
+        && !lower.ends_with(".jar")
+        && !lower.ends_with(".zip")
+        && !lower.starts_with("assets/")
+        && !lower.contains("/lang/")
+        && !lower.ends_with("readme")
+        && !lower.ends_with("readme.txt")
+        && !lower.ends_with("readme.md")
+}
+
+fn archive_layer_has_timestamp_outlier(layer: &ArchiveLayer) -> bool {
+    let candidates = layer
+        .entries
+        .iter()
+        .filter(|entry| !entry.normalized_timestamp && is_timestamp_outlier_candidate(&entry.path))
+        .collect::<Vec<_>>();
+    if candidates.len() < TIMESTAMP_OUTLIER_MIN_FILES {
+        return false;
+    }
+
+    let mut counts = HashMap::<&str, usize>::new();
+    for entry in &candidates {
+        if let Some(timestamp) = entry.timestamp.as_deref() {
+            *counts.entry(timestamp).or_default() += 1;
+        }
+    }
+    let dominant = counts.values().copied().max().unwrap_or_default();
+    dominant * 100 / candidates.len() >= TIMESTAMP_DOMINANT_PERCENT && candidates.len() > dominant
+}
+
+fn archive_entry_path(archive_path: &str, entry_path: &str) -> String {
+    if archive_path == "<root>" {
+        entry_path.to_owned()
+    } else {
+        format!("{archive_path}!/{entry_path}")
+    }
+}
+
+fn format_zip_timestamp(timestamp: zip::DateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        timestamp.year(),
+        timestamp.month(),
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute(),
+        timestamp.second()
+    )
+}
+
+fn is_normalized_zip_timestamp(timestamp: zip::DateTime) -> bool {
+    timestamp.year() == 1980 && timestamp.month() == 1 && timestamp.day() == 1
 }
 
 fn normalize_identifier(value: &str) -> String {
@@ -904,12 +1174,15 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 #[cfg(test)]
 mod tests {
     use super::{
-        add_contextual_findings, has_significant_identifier_overlap, risk_score, summarize,
-        ArchiveContext, ClassScanData, ScanData, ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL,
-        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
+        add_contextual_findings, has_significant_identifier_overlap, parse_zip_bytes, risk_score,
+        summarize, ArchiveContext, ClassScanData, ScanData, ScanLimits,
+        EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
+        TIMESTAMP_OUTLIER_SIGNAL,
     };
 
-    use crate::models::scan::{Finding, Severity, Verdict};
+    use crate::models::scan::{CodeScope, Confidence, Finding, Severity, Verdict};
+    use std::io::{Cursor, Write};
+    use zip::{write::SimpleFileOptions, DateTime, ZipWriter};
 
     /// Verifies the fixed severity weights are capped at 100.
     #[test]
@@ -993,6 +1266,8 @@ mod tests {
     #[test]
     fn class_correlation_detects_remote_class_loading_in_one_class() {
         let mut context = test_context(vec![ClassScanData {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
             path: "com/example/mod/Loader.class".to_owned(),
             class_name: Some("com/example/mod/Loader".to_owned()),
             major_version: 65,
@@ -1001,6 +1276,11 @@ mod tests {
                 "java/net/http/HttpClient".to_owned(),
                 "java/lang/ClassLoader.defineClass".to_owned(),
             ],
+            scope: CodeScope::FirstParty,
+            dependency_name: None,
+            dependency_version: None,
+            reachable_from_entrypoint: false,
+            classification_confidence: Confidence::High,
         }]);
 
         context.add_correlation_signals();
@@ -1016,18 +1296,32 @@ mod tests {
     fn class_correlation_ignores_refs_split_across_classes() {
         let mut context = test_context(vec![
             ClassScanData {
+                archive_id: "archive-0".to_owned(),
+                archive_path: "<root>".to_owned(),
                 path: "com/example/mod/Net.class".to_owned(),
                 class_name: Some("com/example/mod/Net".to_owned()),
                 major_version: 65,
                 strings: Vec::new(),
                 bytecode_refs: vec!["java/net/http/HttpClient".to_owned()],
+                scope: CodeScope::FirstParty,
+                dependency_name: None,
+                dependency_version: None,
+                reachable_from_entrypoint: false,
+                classification_confidence: Confidence::High,
             },
             ClassScanData {
+                archive_id: "archive-0".to_owned(),
+                archive_path: "<root>".to_owned(),
                 path: "com/example/mod/Loader.class".to_owned(),
                 class_name: Some("com/example/mod/Loader".to_owned()),
                 major_version: 65,
                 strings: Vec::new(),
                 bytecode_refs: vec!["java/lang/ClassLoader.defineClass".to_owned()],
+                scope: CodeScope::FirstParty,
+                dependency_name: None,
+                dependency_version: None,
+                reachable_from_entrypoint: false,
+                classification_confidence: Confidence::High,
             },
         ]);
 
@@ -1043,6 +1337,8 @@ mod tests {
     #[test]
     fn class_correlation_detects_external_urlclassloader_target() {
         let mut context = test_context(vec![ClassScanData {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
             path: "com/example/mod/Loader.class".to_owned(),
             class_name: Some("com/example/mod/Loader".to_owned()),
             major_version: 65,
@@ -1051,6 +1347,11 @@ mod tests {
                 "java/net/URL".to_owned(),
                 "java/net/URLClassLoader".to_owned(),
             ],
+            scope: CodeScope::FirstParty,
+            dependency_name: None,
+            dependency_version: None,
+            reachable_from_entrypoint: false,
+            classification_confidence: Confidence::High,
         }]);
 
         context.add_class_correlation_signals();
@@ -1065,6 +1366,8 @@ mod tests {
     #[test]
     fn class_correlation_ignores_known_dependency_classes() {
         let mut context = test_context(vec![ClassScanData {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
             path: "jnr/ffi/provider/jffi/AsmLibraryLoader.class".to_owned(),
             class_name: Some("jnr/ffi/provider/jffi/AsmLibraryLoader".to_owned()),
             major_version: 52,
@@ -1074,6 +1377,11 @@ mod tests {
                 "java/net/URLClassLoader".to_owned(),
                 "java/lang/ClassLoader.defineClass".to_owned(),
             ],
+            scope: CodeScope::BundledDependency,
+            dependency_name: Some("JNR".to_owned()),
+            dependency_version: None,
+            reachable_from_entrypoint: false,
+            classification_confidence: Confidence::High,
         }]);
 
         context.add_class_correlation_signals();
@@ -1082,6 +1390,87 @@ mod tests {
             .data
             .archive_signals
             .contains(&REMOTE_CLASS_LOADING_SIGNAL.to_owned()));
+    }
+
+    #[test]
+    fn timestamp_baseline_is_calculated_per_nested_archive() {
+        let root_timestamp = zip_timestamp(2024, 1, 1);
+        let nested_timestamp = zip_timestamp(2023, 1, 1);
+        let nested = zip_bytes(
+            (0..20)
+                .map(|index| {
+                    (
+                        format!("dependency-{index}.txt"),
+                        nested_timestamp,
+                        b"nested".to_vec(),
+                    )
+                })
+                .collect(),
+        );
+        let mut root_entries = (0..19)
+            .map(|index| {
+                (
+                    format!("root-{index}.txt"),
+                    root_timestamp,
+                    b"root".to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        root_entries.push((
+            "META-INF/jars/dependency.jar".to_owned(),
+            nested_timestamp,
+            nested,
+        ));
+
+        let mut context = archive_test_context();
+        let root_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
+        parse_zip_bytes(&zip_bytes(root_entries), &root_id, &mut context).expect("archive parses");
+        context.add_timestamp_outlier_signal();
+
+        let root = context
+            .data
+            .archive_layers
+            .iter()
+            .find(|layer| layer.id == root_id)
+            .expect("root layer exists");
+        let nested = context
+            .data
+            .archive_layers
+            .iter()
+            .find(|layer| layer.parent_id.as_deref() == Some(root_id.as_str()))
+            .expect("nested layer exists");
+        assert_eq!(
+            root.timestamp_baseline.as_deref(),
+            Some("2024-01-01T00:00:00")
+        );
+        assert_eq!(
+            nested.timestamp_baseline.as_deref(),
+            Some("2023-01-01T00:00:00")
+        );
+        assert!(!context
+            .data
+            .archive_signals
+            .contains(&TIMESTAMP_OUTLIER_SIGNAL.to_owned()));
+    }
+
+    #[test]
+    fn normalized_1980_zip_timestamp_does_not_trigger_outlier() {
+        let normalized = zip_timestamp(1980, 1, 1);
+        let regular = zip_timestamp(2024, 1, 1);
+        let mut entries = (0..20)
+            .map(|index| (format!("file-{index}.txt"), normalized, b"content".to_vec()))
+            .collect::<Vec<_>>();
+        entries.push(("different.txt".to_owned(), regular, b"different".to_vec()));
+
+        let mut context = archive_test_context();
+        let root_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
+        parse_zip_bytes(&zip_bytes(entries), &root_id, &mut context).expect("archive parses");
+        context.add_timestamp_outlier_signal();
+
+        assert!(!context
+            .data
+            .archive_signals
+            .contains(&TIMESTAMP_OUTLIER_SIGNAL.to_owned()));
     }
 
     fn test_context(class_files: Vec<ClassScanData>) -> ArchiveContext {
@@ -1099,6 +1488,37 @@ mod tests {
                 entrypoint_classes: vec!["com.example.mod.Loader".to_owned()],
                 ..Default::default()
             },
+            next_archive_id: 1,
         }
+    }
+
+    fn archive_test_context() -> ArchiveContext {
+        ArchiveContext {
+            limits: ScanLimits {
+                max_total_uncompressed_bytes: 1024 * 1024,
+                max_files_in_archive: 100,
+                max_nesting_depth: 4,
+                max_single_file_bytes: 1024 * 1024,
+            },
+            total_uncompressed_bytes: 0,
+            file_count: 0,
+            data: ScanData::default(),
+            next_archive_id: 0,
+        }
+    }
+
+    fn zip_timestamp(year: u16, month: u8, day: u8) -> DateTime {
+        DateTime::from_date_and_time(year, month, day, 0, 0, 0).expect("valid test timestamp")
+    }
+
+    fn zip_bytes(entries: Vec<(String, DateTime, Vec<u8>)>) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut archive = ZipWriter::new(cursor);
+        for (path, timestamp, contents) in entries {
+            let options = SimpleFileOptions::default().last_modified_time(timestamp);
+            archive.start_file(path, options).expect("entry starts");
+            archive.write_all(&contents).expect("entry writes");
+        }
+        archive.finish().expect("archive finishes").into_inner()
     }
 }

@@ -150,7 +150,8 @@ mod tests {
             mod_ids: Vec::new(),
             mod_aliases: Vec::new(),
             entrypoint_classes: Vec::new(),
-            entry_timestamps: Vec::new(),
+            archive_layers: Vec::new(),
+            resource_files: Vec::new(),
         };
         assert_eq!(engine.evaluate(&data).len(), 1);
     }
