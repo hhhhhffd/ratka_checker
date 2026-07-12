@@ -9,12 +9,19 @@ use zip::ZipArchive;
 
 use crate::{
     models::scan::{
-        Capability, CodeScope, Confidence, Evidence, Finding, Obfuscation, ScanReport, Severity,
-        Verdict,
+        Capability, CodeScope, Confidence, ConfirmedChain, Evidence, Finding, Limitation,
+        Obfuscation, ScanReport, Severity, Verdict,
     },
     rules::engine::RulesEngine,
     scanner::{
-        asset, class_file, context_recognizers, metadata, native,
+        asset,
+        class_file::{self, ConstantValue, MethodScanData, ValueOrigin},
+        context_recognizers,
+        dataflow::{
+            analyze_method_flows, ConfirmedChainCandidate, ConfirmedChainKind, DataFlowConfig,
+            FileTarget, FlowEvidence, MethodFlow, MethodId, Operation, SourceKind, TransformKind,
+        },
+        metadata, native,
         scope::{
             classify_classes, ArchiveScopeInput, ClassScopeInput, DependencyMetadata,
             ScopeClassificationInput,
@@ -145,6 +152,7 @@ pub struct ClassScanData {
     pub major_version: u16,
     pub strings: Vec<String>,
     pub bytecode_refs: Vec<String>,
+    pub methods: Vec<MethodScanData>,
     pub scope: CodeScope,
     pub dependency_name: Option<String>,
     pub dependency_version: Option<String>,
@@ -198,11 +206,26 @@ fn scan_bytes(
     }
 
     context.add_derived_signals();
+    let data_flow = analyze_scan_data_flow(&context.data);
     let contextual_results = context_recognizers::recognize(&context.data);
     let mut findings = rules_engine.evaluate(&context.data);
     findings.retain(|finding| !contextual_results.suppresses(&finding.rule_id));
     findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
+    let confirmed_chains = data_flow
+        .confirmed_chains
+        .iter()
+        .map(confirmed_chain_from_candidate)
+        .collect::<Vec<_>>();
+    let limitations = data_flow
+        .limitations
+        .iter()
+        .map(|limitation| Limitation {
+            code: "DATA_FLOW_LIMITATION".to_owned(),
+            message: format!("{limitation:?}"),
+            evidence: Vec::new(),
+        })
+        .collect::<Vec<_>>();
     let (verdict, risk_score, summary) = finalize_findings(&findings);
 
     let report = ScanReport {
@@ -216,9 +239,9 @@ fn scan_bytes(
             .chain(contextual_results.capabilities)
             .collect(),
         findings: findings.clone(),
-        confirmed_chains: Vec::new(),
+        confirmed_chains,
         obfuscation: Obfuscation::default(),
-        limitations: Vec::new(),
+        limitations,
     };
 
     Ok(ScanOutcome {
@@ -487,6 +510,7 @@ impl ArchiveContext {
                         major_version: class_data.major_version,
                         strings: class_data.strings.clone(),
                         bytecode_refs: class_data.bytecode_refs.clone(),
+                        methods: class_data.methods,
                         scope: CodeScope::Unknown,
                         dependency_name: None,
                         dependency_version: None,
@@ -605,7 +629,6 @@ impl ArchiveContext {
         self.add_timestamp_outlier_signal();
         self.add_modid_package_signal();
         self.add_short_name_signal();
-        self.add_correlation_signals();
     }
 
     fn add_first_party_scope(&mut self) {
@@ -1135,6 +1158,250 @@ fn scoped_text_contains(data: &ScanData, pattern: &str) -> bool {
         .any(|candidate| candidate.to_ascii_lowercase().contains(&pattern))
 }
 
+/// Translates first-party method summaries into the bounded, parser-independent data-flow model.
+fn analyze_scan_data_flow(data: &ScanData) -> crate::scanner::dataflow::DataFlowResult {
+    let flows = data
+        .class_files
+        .iter()
+        .filter(|class_file| class_file.scope == CodeScope::FirstParty)
+        .flat_map(|class_file| {
+            class_file
+                .methods
+                .iter()
+                .map(|method| method_flow_from_scan_data(class_file, method))
+        })
+        .collect::<Vec<_>>();
+    analyze_method_flows(&flows, &DataFlowConfig::default())
+}
+
+fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanData) -> MethodFlow {
+    let id = MethodId {
+        archive_id: class_file.archive_id.clone(),
+        class_name: method.class_name.clone(),
+        method_name: method.method_name.clone(),
+        descriptor: method.descriptor.clone(),
+    };
+    let mut operations = Vec::new();
+    for call in &method.calls {
+        let Some(owner) = call.owner.as_deref() else {
+            continue;
+        };
+        let evidence = flow_evidence(class_file, &id, call.offset, owner, &call.name);
+        let output = call
+            .result_origin
+            .as_ref()
+            .and_then(|origin| local_for_origin(method, origin));
+        let arguments = call
+            .argument_origins
+            .iter()
+            .filter_map(|origin| local_for_origin(method, origin))
+            .collect::<Vec<_>>();
+
+        if is_http_response(owner, &call.name) {
+            if let Some(output) = output {
+                operations.push(Operation::Source {
+                    output,
+                    kind: SourceKind::HttpResponse,
+                    evidence,
+                });
+            }
+            continue;
+        }
+        if is_credential_read(owner, &call.name) {
+            if let Some(output) = output {
+                operations.push(Operation::Source {
+                    output,
+                    kind: SourceKind::CredentialFile,
+                    evidence,
+                });
+            }
+            continue;
+        }
+        if is_base64_decode(owner, &call.name) {
+            if let (Some(input), Some(output)) = (arguments.last().copied(), output) {
+                operations.push(Operation::Transform {
+                    input,
+                    output,
+                    kind: TransformKind::Base64Decode,
+                    evidence,
+                });
+            }
+            continue;
+        }
+        if is_file_write(owner, &call.name) {
+            if let Some(input) = arguments.last().copied() {
+                operations.push(Operation::WriteFile {
+                    input,
+                    destination: call
+                        .argument_origins
+                        .first()
+                        .and_then(file_target_from_origin)
+                        .unwrap_or(FileTarget::Unknown),
+                    evidence,
+                });
+            }
+            continue;
+        }
+        if is_process_execution(owner, &call.name) {
+            operations.push(Operation::ExecuteFile {
+                target: call
+                    .argument_origins
+                    .first()
+                    .and_then(file_target_from_origin)
+                    .unwrap_or(FileTarget::Unknown),
+                evidence,
+            });
+            continue;
+        }
+        if is_http_send(owner, &call.name) {
+            if let Some(body) = arguments.last().copied() {
+                operations.push(Operation::NetworkSend { body, evidence });
+            }
+            continue;
+        }
+        if is_dynamic_load(owner, &call.name) {
+            if let Some(input) = arguments.first().copied() {
+                operations.push(Operation::DynamicLoad {
+                    input,
+                    kind: crate::scanner::dataflow::DynamicLoadKind::ClassDefinition,
+                    evidence,
+                });
+            }
+        }
+    }
+    MethodFlow {
+        id,
+        parameter_count: 0,
+        operations,
+    }
+}
+
+fn local_for_origin(method: &MethodScanData, origin: &ValueOrigin) -> Option<u16> {
+    if let ValueOrigin::Local(local) = origin {
+        return Some(*local);
+    }
+    method
+        .local_origins
+        .iter()
+        .rev()
+        .find(|record| &record.origin == origin)
+        .map(|record| record.local_index)
+}
+
+fn file_target_from_origin(origin: &ValueOrigin) -> Option<FileTarget> {
+    match origin {
+        ValueOrigin::Constant(ConstantValue::String(value)) => {
+            Some(FileTarget::Known(value.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn flow_evidence(
+    class_file: &ClassScanData,
+    method: &MethodId,
+    offset: u32,
+    owner: &str,
+    name: &str,
+) -> FlowEvidence {
+    FlowEvidence {
+        archive_id: class_file.archive_id.clone(),
+        archive_path: class_file.archive_path.clone(),
+        class_name: method.class_name.clone(),
+        method_name: method.method_name.clone(),
+        method_descriptor: method.descriptor.clone(),
+        bytecode_offset: offset,
+        operation: format!("{owner}.{name}"),
+        value_preview: None,
+    }
+}
+
+fn is_http_response(owner: &str, name: &str) -> bool {
+    owner.contains("HttpClient") && matches!(name, "send" | "execute" | "get")
+}
+
+fn is_credential_read(owner: &str, name: &str) -> bool {
+    (owner == "java/nio/file/Files" && matches!(name, "readAllBytes" | "readString"))
+        || owner.contains("InputStream") && name == "read"
+}
+
+fn is_base64_decode(owner: &str, name: &str) -> bool {
+    (owner.contains("Base64") || owner.contains("Decoder")) && name == "decode"
+}
+
+fn is_file_write(owner: &str, name: &str) -> bool {
+    (owner == "java/nio/file/Files" && matches!(name, "write" | "writeString"))
+        || owner == "java/io/FileOutputStream" && name == "write"
+}
+
+fn is_process_execution(owner: &str, name: &str) -> bool {
+    (owner == "java/lang/Runtime" && name == "exec")
+        || (owner == "java/lang/ProcessBuilder" && name == "start")
+}
+
+fn is_http_send(owner: &str, name: &str) -> bool {
+    owner.contains("HttpClient") && matches!(name, "post" | "send" | "execute")
+}
+
+fn is_dynamic_load(owner: &str, name: &str) -> bool {
+    (owner.contains("ClassLoader") && name == "defineClass")
+        || (owner == "java/lang/System" && matches!(name, "load" | "loadLibrary"))
+}
+
+fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> ConfirmedChain {
+    let (rule_id, severity, score_contribution) = match candidate.kind {
+        ConfirmedChainKind::DownloadWriteExecute => (
+            "CONFIRMED_DOWNLOAD_WRITE_EXEC".to_owned(),
+            Severity::High,
+            50,
+        ),
+        ConfirmedChainKind::CredentialExfiltration => (
+            "CONFIRMED_CREDENTIAL_EXFILTRATION".to_owned(),
+            Severity::Critical,
+            90,
+        ),
+        ConfirmedChainKind::DecodedDynamicLoad => (
+            "CONFIRMED_DECODED_DYNAMIC_LOAD".to_owned(),
+            Severity::High,
+            60,
+        ),
+        ConfirmedChainKind::RemoteDynamicLoad => (
+            "CONFIRMED_REMOTE_DYNAMIC_LOAD".to_owned(),
+            Severity::Critical,
+            80,
+        ),
+    };
+    let evidence = std::iter::once(&candidate.source)
+        .chain(candidate.transformations.iter())
+        .chain(candidate.operations.iter())
+        .map(|flow| Evidence {
+            archive_id: flow.archive_id.clone(),
+            archive_path: flow.archive_path.clone(),
+            class_name: Some(flow.class_name.clone()),
+            method_name: Some(flow.method_name.clone()),
+            method_descriptor: Some(flow.method_descriptor.clone()),
+            bytecode_offset: Some(flow.bytecode_offset),
+            resource_path: None,
+            operation: flow.operation.clone(),
+            value_preview: flow.value_preview.clone(),
+            scope: CodeScope::FirstParty,
+        })
+        .collect();
+    ConfirmedChain {
+        chain_id: candidate.chain_id.clone(),
+        rule_id,
+        severity,
+        confidence: Confidence::High,
+        score_contribution,
+        operations: candidate
+            .operations
+            .iter()
+            .map(|operation| operation.operation.clone())
+            .collect(),
+        evidence,
+    }
+}
+
 /// Scanner aborts that should produce `verdict: unknown` instead of a malicious score.
 #[derive(Debug, thiserror::Error)]
 enum ScanAbort {
@@ -1331,6 +1598,7 @@ mod tests {
                 "java/net/http/HttpClient".to_owned(),
                 "java/lang/ClassLoader.defineClass".to_owned(),
             ],
+            methods: Vec::new(),
             scope: CodeScope::FirstParty,
             dependency_name: None,
             dependency_version: None,
@@ -1358,6 +1626,7 @@ mod tests {
                 major_version: 65,
                 strings: Vec::new(),
                 bytecode_refs: vec!["java/net/http/HttpClient".to_owned()],
+                methods: Vec::new(),
                 scope: CodeScope::FirstParty,
                 dependency_name: None,
                 dependency_version: None,
@@ -1372,6 +1641,7 @@ mod tests {
                 major_version: 65,
                 strings: Vec::new(),
                 bytecode_refs: vec!["java/lang/ClassLoader.defineClass".to_owned()],
+                methods: Vec::new(),
                 scope: CodeScope::FirstParty,
                 dependency_name: None,
                 dependency_version: None,
@@ -1402,6 +1672,7 @@ mod tests {
                 "java/net/URL".to_owned(),
                 "java/net/URLClassLoader".to_owned(),
             ],
+            methods: Vec::new(),
             scope: CodeScope::FirstParty,
             dependency_name: None,
             dependency_version: None,
@@ -1432,6 +1703,7 @@ mod tests {
                 "java/net/URLClassLoader".to_owned(),
                 "java/lang/ClassLoader.defineClass".to_owned(),
             ],
+            methods: Vec::new(),
             scope: CodeScope::BundledDependency,
             dependency_name: Some("JNR".to_owned()),
             dependency_version: None,

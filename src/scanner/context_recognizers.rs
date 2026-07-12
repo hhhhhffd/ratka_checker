@@ -407,6 +407,7 @@ mod tests {
             major_version: 52,
             strings: strings.iter().map(|value| (*value).to_owned()).collect(),
             bytecode_refs: refs.iter().map(|value| (*value).to_owned()).collect(),
+            methods: Vec::new(),
             scope: CodeScope::FirstParty,
             dependency_name: None,
             dependency_version: None,
