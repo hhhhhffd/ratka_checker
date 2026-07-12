@@ -1,0 +1,10 @@
+{
+  "name": "desktop API links",
+  "scenario": "desktop_browse",
+  "expected_verdict": "clean",
+  "risk_score": { "min": 0, "max": 3 },
+  "required_findings": [],
+  "forbidden_findings": ["DESKTOP_GET_DESKTOP"],
+  "expected_capabilities": ["DESKTOP_BROWSE_STATIC_HTTPS"],
+  "expected_obfuscation_level": "none"
+}

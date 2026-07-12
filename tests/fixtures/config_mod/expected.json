@@ -1,0 +1,10 @@
+{
+  "name": "ordinary config mod",
+  "scenario": "config_write",
+  "expected_verdict": "clean",
+  "risk_score": { "min": 0, "max": 3 },
+  "required_findings": [],
+  "forbidden_findings": ["FILES_WRITE"],
+  "expected_capabilities": ["CONFIG_FILE_WRITE"],
+  "expected_obfuscation_level": "none"
+}

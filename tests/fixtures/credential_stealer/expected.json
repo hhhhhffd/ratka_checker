@@ -1,0 +1,10 @@
+{
+  "name": "credential theft and exfiltration",
+  "scenario": "credential_stealer",
+  "expected_verdict": "malicious",
+  "risk_score": { "min": 80, "max": 100 },
+  "required_findings": ["CONFIRMED_CREDENTIAL_EXFILTRATION"],
+  "forbidden_findings": [],
+  "expected_capabilities": [],
+  "expected_obfuscation_level": "low"
+}

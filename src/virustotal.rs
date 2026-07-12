@@ -121,40 +121,40 @@ pub fn findings_for_report(report: &VirusTotalReport) -> Vec<Finding> {
         .collect::<Vec<_>>();
 
     if !trusted_malicious.is_empty() {
-        return vec![Finding {
-            rule_id: "VT_TRUSTED_MALICIOUS_ENGINE".to_owned(),
-            category: "virustotal".to_owned(),
-            severity: Severity::Critical,
-            message: format!(
+        return vec![Finding::legacy(
+            "VT_TRUSTED_MALICIOUS_ENGINE",
+            "virustotal",
+            Severity::Critical,
+            format!(
                 "VirusTotal: trusted engine detected malware: {}",
                 engine_summary(&trusted_malicious)
             ),
-        }];
+        )];
     }
 
     if malicious_engines.len() >= 3 {
-        return vec![Finding {
-            rule_id: "VT_MULTIPLE_MALICIOUS_ENGINES".to_owned(),
-            category: "virustotal".to_owned(),
-            severity: Severity::High,
-            message: format!(
+        return vec![Finding::legacy(
+            "VT_MULTIPLE_MALICIOUS_ENGINES",
+            "virustotal",
+            Severity::High,
+            format!(
                 "VirusTotal: {} engines detected malware: {}",
                 malicious_engines.len(),
                 engine_summary(&malicious_engines)
             ),
-        }];
+        )];
     }
 
     if !malicious_engines.is_empty() {
-        return vec![Finding {
-            rule_id: "VT_SINGLE_MALICIOUS_ENGINE".to_owned(),
-            category: "virustotal".to_owned(),
-            severity: Severity::Medium,
-            message: format!(
+        return vec![Finding::legacy(
+            "VT_SINGLE_MALICIOUS_ENGINE",
+            "virustotal",
+            Severity::Medium,
+            format!(
                 "VirusTotal: single engine detected malware: {}",
                 engine_summary(&malicious_engines)
             ),
-        }];
+        )];
     }
 
     let suspicious_count = report
@@ -163,12 +163,12 @@ pub fn findings_for_report(report: &VirusTotalReport) -> Vec<Finding> {
         .filter(|engine| engine.category == "suspicious")
         .count();
     if suspicious_count > 0 {
-        return vec![Finding {
-            rule_id: "VT_SUSPICIOUS_ENGINES".to_owned(),
-            category: "virustotal".to_owned(),
-            severity: Severity::Low,
-            message: format!("VirusTotal: {suspicious_count} engines marked file suspicious"),
-        }];
+        return vec![Finding::legacy(
+            "VT_SUSPICIOUS_ENGINES",
+            "virustotal",
+            Severity::Low,
+            format!("VirusTotal: {suspicious_count} engines marked file suspicious"),
+        )];
     }
 
     Vec::new()

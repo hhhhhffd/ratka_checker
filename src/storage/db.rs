@@ -5,7 +5,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::scan::{
-    Finding, ScanResponse, ScanStatus, Severity, Verdict, VirusTotalReport, VirusTotalSource,
+    Capability, CodeScope, Confidence, ConfirmedChain, Finding, FindingKind, Limitation,
+    Obfuscation, ScanReport, ScanResponse, ScanStatus, Severity, Verdict, VirusTotalReport,
+    VirusTotalSource,
 };
 use crate::virustotal;
 
@@ -17,6 +19,8 @@ pub struct ScanRow {
     pub status: String,
     pub verdict: Option<String>,
     pub risk_score: i32,
+    pub confidence: String,
+    pub obfuscation: serde_json::Value,
 }
 
 /// Database row for findings before conversion into typed API/domain objects.
@@ -25,7 +29,38 @@ struct FindingRow {
     rule_id: String,
     category: String,
     severity: String,
+    finding_kind: String,
+    confidence: String,
+    score_contribution: i32,
+    scope: String,
+    evidence: serde_json::Value,
+    chain_id: Option<String>,
     message: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CapabilityRow {
+    rule_id: String,
+    message: String,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ConfirmedChainRow {
+    chain_id: String,
+    rule_id: String,
+    severity: String,
+    confidence: String,
+    score_contribution: i32,
+    operations: serde_json::Value,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LimitationRow {
+    code: String,
+    message: String,
+    evidence: serde_json::Value,
 }
 
 /// Database row for cached VirusTotal reports.
@@ -77,7 +112,7 @@ pub async fn find_latest_scan_by_sha256(
 ) -> anyhow::Result<Option<ScanResponse>> {
     let row = sqlx::query_as::<_, ScanRow>(
         r#"
-        SELECT id, sha256, status, verdict, risk_score
+        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation
         FROM scans
         WHERE sha256 = $1
         ORDER BY created_at DESC
@@ -98,7 +133,7 @@ pub async fn find_latest_scan_by_sha256(
 pub async fn find_scan_by_id(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Option<ScanResponse>> {
     let row = sqlx::query_as::<_, ScanRow>(
         r#"
-        SELECT id, sha256, status, verdict, risk_score
+        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation
         FROM scans
         WHERE id = $1
         LIMIT 1
@@ -145,6 +180,39 @@ pub async fn complete_scan(
     .execute(&mut *tx)
     .await?;
     replace_findings(&mut tx, scan_id, findings).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Persists the full structured scan report atomically for the new API response model.
+pub async fn complete_scan_report(
+    pool: &PgPool,
+    scan_id: Uuid,
+    report: &ScanReport,
+    summary: &str,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let obfuscation = serde_json::to_value(&report.obfuscation)?;
+    sqlx::query(
+        r#"
+        UPDATE scans SET status = 'done', verdict = $2, risk_score = $3, summary = $4,
+            confidence = $5, obfuscation = $6, error_code = NULL, error_message = NULL,
+            updated_at = now(), completed_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(scan_id)
+    .bind(report.verdict.as_str())
+    .bind(i32::from(report.risk_score))
+    .bind(summary)
+    .bind(report.confidence.as_str())
+    .bind(obfuscation)
+    .execute(&mut *tx)
+    .await?;
+    replace_findings(&mut tx, scan_id, &report.findings).await?;
+    replace_capabilities(&mut tx, scan_id, &report.capabilities).await?;
+    replace_confirmed_chains(&mut tx, scan_id, &report.confirmed_chains).await?;
+    replace_limitations(&mut tx, scan_id, &report.limitations).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -292,16 +360,26 @@ async fn replace_findings(
         .await?;
 
     for finding in findings {
+        let evidence = serde_json::to_value(&finding.evidence)
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         sqlx::query(
             r#"
-            INSERT INTO findings (scan_id, rule_id, category, severity, message)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO findings
+                (scan_id, rule_id, category, severity, finding_kind, confidence,
+                 score_contribution, scope, evidence, chain_id, message)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(scan_id)
         .bind(&finding.rule_id)
         .bind(&finding.category)
         .bind(finding.severity.as_str())
+        .bind(finding.kind.as_str())
+        .bind(finding.confidence.as_str())
+        .bind(i32::from(finding.score_contribution))
+        .bind(finding.scope.as_str())
+        .bind(evidence)
+        .bind(&finding.related_chain_id)
         .bind(&finding.message)
         .execute(&mut **tx)
         .await?;
@@ -309,9 +387,67 @@ async fn replace_findings(
     Ok(())
 }
 
+async fn replace_capabilities(
+    tx: &mut Transaction<'_, Postgres>,
+    scan_id: Uuid,
+    capabilities: &[Capability],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM scan_capabilities WHERE scan_id = $1")
+        .bind(scan_id)
+        .execute(&mut **tx)
+        .await?;
+    for capability in capabilities {
+        sqlx::query("INSERT INTO scan_capabilities (scan_id, rule_id, message, evidence) VALUES ($1, $2, $3, $4)")
+            .bind(scan_id).bind(&capability.rule_id).bind(&capability.message)
+            .bind(serde_json::to_value(&capability.evidence)?).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+async fn replace_confirmed_chains(
+    tx: &mut Transaction<'_, Postgres>,
+    scan_id: Uuid,
+    chains: &[ConfirmedChain],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM confirmed_chains WHERE scan_id = $1")
+        .bind(scan_id)
+        .execute(&mut **tx)
+        .await?;
+    for chain in chains {
+        sqlx::query(r#"INSERT INTO confirmed_chains
+            (scan_id, chain_id, rule_id, severity, confidence, score_contribution, operations, evidence)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#)
+            .bind(scan_id).bind(&chain.chain_id).bind(&chain.rule_id).bind(chain.severity.as_str())
+            .bind(chain.confidence.as_str()).bind(i32::from(chain.score_contribution))
+            .bind(serde_json::to_value(&chain.operations)?).bind(serde_json::to_value(&chain.evidence)?)
+            .execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+async fn replace_limitations(
+    tx: &mut Transaction<'_, Postgres>,
+    scan_id: Uuid,
+    limitations: &[Limitation],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM scan_limitations WHERE scan_id = $1")
+        .bind(scan_id)
+        .execute(&mut **tx)
+        .await?;
+    for limitation in limitations {
+        sqlx::query("INSERT INTO scan_limitations (scan_id, code, message, evidence) VALUES ($1, $2, $3, $4)")
+            .bind(scan_id).bind(&limitation.code).bind(&limitation.message)
+            .bind(serde_json::to_value(&limitation.evidence)?).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 /// Converts database rows to the public response and validates enum strings at the boundary.
 async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<ScanResponse> {
     let findings = scan_findings(pool, scan.id).await?;
+    let capabilities = scan_capabilities(pool, scan.id).await?;
+    let confirmed_chains = scan_confirmed_chains(pool, scan.id).await?;
+    let limitations = scan_limitations(pool, scan.id).await?;
     let virustotal = find_virustotal_report_for_response(pool, &scan.sha256).await?;
     Ok(ScanResponse {
         scan_id: scan.id,
@@ -319,7 +455,12 @@ async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<
         sha256: scan.sha256,
         verdict: scan.verdict.as_deref().map(Verdict::from_db).transpose()?,
         risk_score: scan.risk_score.clamp(0, 100) as u8,
-        findings: findings.iter().map(Finding::to_response).collect(),
+        confidence: Confidence::from_db(&scan.confidence)?,
+        capabilities,
+        findings,
+        confirmed_chains,
+        obfuscation: serde_json::from_value::<Obfuscation>(scan.obfuscation)?,
+        limitations,
         virustotal,
     })
 }
@@ -328,7 +469,8 @@ async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<
 async fn scan_findings(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<Finding>> {
     let rows = sqlx::query_as::<_, FindingRow>(
         r#"
-        SELECT rule_id, category, severity, message
+        SELECT rule_id, category, severity, finding_kind, confidence, score_contribution,
+               scope, evidence, chain_id, message
         FROM findings
         WHERE scan_id = $1
         ORDER BY id ASC
@@ -343,8 +485,69 @@ async fn scan_findings(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<Findi
             Ok(Finding {
                 rule_id: row.rule_id,
                 category: row.category,
+                kind: FindingKind::from_db(&row.finding_kind)?,
                 severity: Severity::from_db(&row.severity)?,
+                confidence: Confidence::from_db(&row.confidence)?,
+                score_contribution: row.score_contribution.clamp(0, 100) as u8,
+                scope: CodeScope::from_db(&row.scope)?,
                 message: row.message,
+                evidence: serde_json::from_value(row.evidence)?,
+                related_chain_id: row.chain_id,
+            })
+        })
+        .collect()
+}
+
+async fn scan_capabilities(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<Capability>> {
+    let rows = sqlx::query_as::<_, CapabilityRow>(
+        "SELECT rule_id, message, evidence FROM scan_capabilities WHERE scan_id = $1 ORDER BY id ASC",
+    ).bind(scan_id).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(Capability {
+                rule_id: row.rule_id,
+                message: row.message,
+                evidence: serde_json::from_value(row.evidence)?,
+            })
+        })
+        .collect()
+}
+
+async fn scan_confirmed_chains(
+    pool: &PgPool,
+    scan_id: Uuid,
+) -> anyhow::Result<Vec<ConfirmedChain>> {
+    let rows = sqlx::query_as::<_, ConfirmedChainRow>(r#"SELECT chain_id, rule_id, severity, confidence,
+        score_contribution, operations, evidence FROM confirmed_chains WHERE scan_id = $1 ORDER BY id ASC"#)
+        .bind(scan_id).fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ConfirmedChain {
+                chain_id: row.chain_id,
+                rule_id: row.rule_id,
+                severity: Severity::from_db(&row.severity)?,
+                confidence: Confidence::from_db(&row.confidence)?,
+                score_contribution: row.score_contribution.clamp(0, 100) as u8,
+                operations: serde_json::from_value(row.operations)?,
+                evidence: serde_json::from_value(row.evidence)?,
+            })
+        })
+        .collect()
+}
+
+async fn scan_limitations(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<Limitation>> {
+    let rows = sqlx::query_as::<_, LimitationRow>(
+        "SELECT code, message, evidence FROM scan_limitations WHERE scan_id = $1 ORDER BY id ASC",
+    )
+    .bind(scan_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(Limitation {
+                code: row.code,
+                message: row.message,
+                evidence: serde_json::from_value(row.evidence)?,
             })
         })
         .collect()

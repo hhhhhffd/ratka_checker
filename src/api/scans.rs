@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     api::AppState,
     error::AppError,
+    models::scan::{Finding, ScanReport},
     response::PrettyJson,
     scanner::archive,
     storage::{db, files},
@@ -98,25 +99,25 @@ async fn run_scan_worker(
         tokio::task::spawn_blocking(move || archive::scan_file(&scan_path, limits, &rules_engine))
             .await?;
     if let Some(report) = run_virustotal(scan_id, &storage_path, &filename, &state).await? {
-        outcome
-            .findings
-            .extend(virustotal::findings_for_report(&report));
-        let (verdict, risk_score, summary) = archive::finalize_findings(&outcome.findings);
-        outcome.verdict = verdict;
-        outcome.risk_score = risk_score;
-        outcome.summary = summary;
+        outcome.summary = merge_virustotal_findings(
+            &mut outcome.report,
+            virustotal::findings_for_report(&report),
+        );
     }
 
-    db::complete_scan(
-        &state.db,
-        scan_id,
-        outcome.verdict,
-        outcome.risk_score,
-        &outcome.summary,
-        &outcome.findings,
-    )
-    .await
-    .map_err(Into::into)
+    db::complete_scan_report(&state.db, scan_id, &outcome.report, &outcome.summary).await
+}
+
+/// Adds VirusTotal evidence to the structured report without discarding static-analysis context.
+fn merge_virustotal_findings(
+    report: &mut ScanReport,
+    findings: impl IntoIterator<Item = Finding>,
+) -> String {
+    report.findings.extend(findings);
+    let (verdict, risk_score, summary) = archive::finalize_findings(&report.findings);
+    report.verdict = verdict;
+    report.risk_score = risk_score;
+    summary
 }
 
 /// Runs the optional VirusTotal phase and persists its own report without failing static analysis.
@@ -201,5 +202,50 @@ fn validate_filename(filename: &str) -> Result<(), AppError> {
         Err(AppError::invalid_file(
             "uploaded file must have a .jar filename",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::scan::{
+        Capability, Confidence, Finding, Obfuscation, ScanReport, Severity, Verdict,
+    };
+
+    use super::merge_virustotal_findings;
+
+    #[test]
+    fn virustotal_merge_preserves_non_finding_report_sections() {
+        let capability = Capability {
+            rule_id: "CONFIG_FILE_WRITE".to_owned(),
+            message: "Writes a JSON configuration file".to_owned(),
+            evidence: Vec::new(),
+        };
+        let mut report = ScanReport {
+            verdict: Verdict::Clean,
+            risk_score: 0,
+            confidence: Confidence::High,
+            capabilities: vec![capability.clone()],
+            findings: Vec::new(),
+            confirmed_chains: Vec::new(),
+            obfuscation: Obfuscation::default(),
+            limitations: Vec::new(),
+        };
+
+        let summary = merge_virustotal_findings(
+            &mut report,
+            vec![Finding::legacy(
+                "VT_TRUSTED_MALICIOUS_ENGINE",
+                "virustotal",
+                Severity::Critical,
+                "Trusted engine detected malware",
+            )],
+        );
+
+        assert_eq!(report.capabilities, vec![capability]);
+        assert_eq!(report.confidence, Confidence::High);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.risk_score, Severity::Critical.score_weight());
+        assert_eq!(report.verdict, Verdict::Suspicious);
+        assert!(!summary.is_empty());
     }
 }

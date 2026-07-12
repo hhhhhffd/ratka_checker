@@ -50,12 +50,12 @@ impl RulesEngine {
                 && self.rule_matches(compiled, data)
             {
                 emitted_rule_ids.insert(compiled.rule.rule_id.clone());
-                findings.push(Finding {
-                    rule_id: compiled.rule.rule_id.clone(),
-                    category: compiled.rule.category.clone(),
-                    severity: compiled.rule.severity.clone(),
-                    message: compiled.rule.message.clone(),
-                });
+                findings.push(Finding::legacy(
+                    compiled.rule.rule_id.clone(),
+                    compiled.rule.category.clone(),
+                    compiled.rule.severity.clone(),
+                    compiled.rule.message.clone(),
+                ));
             }
         }
 

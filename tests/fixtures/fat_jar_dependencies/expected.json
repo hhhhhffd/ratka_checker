@@ -1,0 +1,10 @@
+{
+  "name": "fat JAR with JNA and ZIP4J",
+  "scenario": "fat_jar_dependencies",
+  "expected_verdict": "clean",
+  "risk_score": { "min": 0, "max": 5 },
+  "required_findings": [],
+  "forbidden_findings": ["NATIVE_BINARY_MAGIC", "NATIVE_LIB_REMOTE_LOAD"],
+  "expected_capabilities": ["NESTED_DEPENDENCY", "EMBEDDED_NATIVE_LIBRARY", "REFLECTION", "BASE64"],
+  "expected_obfuscation_level": "none"
+}

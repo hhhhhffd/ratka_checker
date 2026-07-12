@@ -8,7 +8,7 @@ use std::{
 use zip::ZipArchive;
 
 use crate::{
-    models::scan::{Finding, Severity, Verdict},
+    models::scan::{Confidence, Finding, Obfuscation, ScanReport, Severity, Verdict},
     rules::engine::RulesEngine,
     scanner::{class_file, metadata, strings},
 };
@@ -102,6 +102,7 @@ pub struct ClassScanData {
 /// Complete scanner result ready to persist after risk scoring.
 #[derive(Clone, Debug)]
 pub struct ScanOutcome {
+    pub report: ScanReport,
     pub verdict: Verdict,
     pub risk_score: u8,
     pub summary: String,
@@ -146,7 +147,19 @@ fn scan_bytes(
     add_contextual_findings(&mut findings, &context.data);
     let (verdict, risk_score, summary) = finalize_findings(&findings);
 
+    let report = ScanReport {
+        verdict: verdict.clone(),
+        risk_score,
+        confidence: Confidence::Medium,
+        capabilities: Vec::new(),
+        findings: findings.clone(),
+        confirmed_chains: Vec::new(),
+        obfuscation: Obfuscation::default(),
+        limitations: Vec::new(),
+    };
+
     Ok(ScanOutcome {
+        report,
         verdict,
         risk_score,
         summary,
@@ -754,12 +767,12 @@ fn add_contextual_findings(findings: &mut Vec<Finding>, data: &ScanData) {
     }
 
     if has_privacy_network_sync(data) {
-        findings.push(Finding {
-            rule_id: PRIVACY_NETWORK_SYNC_RULE_ID.to_owned(),
-            category: "privacy".to_owned(),
-            severity: Severity::Medium,
-            message: "Обнаружена связка сеть/WebSocket + идентификаторы игрока/сервера + Authorization/Bearer; похоже на privacy/network sync, но не на RAT без exec/classload/credential цепочки.".to_owned(),
-        });
+        findings.push(Finding::legacy(
+            PRIVACY_NETWORK_SYNC_RULE_ID,
+            "privacy",
+            Severity::Medium,
+            "Обнаружена связка сеть/WebSocket + идентификаторы игрока/сервера + Authorization/Bearer; похоже на privacy/network sync, но не на RAT без exec/classload/credential цепочки.",
+        ));
     }
 }
 
@@ -868,16 +881,23 @@ fn summarize(findings: &[Finding], verdict: Verdict) -> String {
 
 /// Creates a technical `unknown` outcome with one explanatory finding.
 fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcome {
+    let finding = Finding::legacy(rule_id, category, Severity::High, message.clone());
+    let report = ScanReport {
+        verdict: Verdict::Unknown,
+        risk_score: 0,
+        confidence: Confidence::Low,
+        capabilities: Vec::new(),
+        findings: vec![finding.clone()],
+        confirmed_chains: Vec::new(),
+        obfuscation: Obfuscation::default(),
+        limitations: Vec::new(),
+    };
     ScanOutcome {
+        report,
         verdict: Verdict::Unknown,
         risk_score: 0,
         summary: message.clone(),
-        findings: vec![Finding {
-            rule_id: rule_id.to_owned(),
-            category: category.to_owned(),
-            severity: Severity::High,
-            message,
-        }],
+        findings: vec![finding],
     }
 }
 
@@ -895,24 +915,9 @@ mod tests {
     #[test]
     fn risk_score_caps_at_100() {
         let findings = vec![
-            Finding {
-                rule_id: "A".to_owned(),
-                category: "x".to_owned(),
-                severity: Severity::Critical,
-                message: "a".to_owned(),
-            },
-            Finding {
-                rule_id: "B".to_owned(),
-                category: "x".to_owned(),
-                severity: Severity::Critical,
-                message: "b".to_owned(),
-            },
-            Finding {
-                rule_id: "C".to_owned(),
-                category: "x".to_owned(),
-                severity: Severity::High,
-                message: "c".to_owned(),
-            },
+            Finding::legacy("A", "x", Severity::Critical, "a"),
+            Finding::legacy("B", "x", Severity::Critical, "b"),
+            Finding::legacy("C", "x", Severity::High, "c"),
         ];
         assert_eq!(risk_score(&findings), 100);
     }
@@ -921,30 +926,15 @@ mod tests {
     #[test]
     fn risk_score_discounts_weak_false_positive_rules() {
         let findings = vec![
-            Finding {
-                rule_id: "TIMESTAMP_OUTLIER".to_owned(),
-                category: "supply_chain".to_owned(),
-                severity: Severity::High,
-                message: "timestamp".to_owned(),
-            },
-            Finding {
-                rule_id: "RAW_GITHUB_URL".to_owned(),
-                category: "exfiltration".to_owned(),
-                severity: Severity::Low,
-                message: "github".to_owned(),
-            },
-            Finding {
-                rule_id: "MODS_SELF_COPY".to_owned(),
-                category: "persistence".to_owned(),
-                severity: Severity::Low,
-                message: "mods".to_owned(),
-            },
-            Finding {
-                rule_id: "XOR_LOOP_HINT".to_owned(),
-                category: "obfuscation".to_owned(),
-                severity: Severity::Low,
-                message: "xor".to_owned(),
-            },
+            Finding::legacy(
+                "TIMESTAMP_OUTLIER",
+                "supply_chain",
+                Severity::High,
+                "timestamp",
+            ),
+            Finding::legacy("RAW_GITHUB_URL", "exfiltration", Severity::Low, "github"),
+            Finding::legacy("MODS_SELF_COPY", "persistence", Severity::Low, "mods"),
+            Finding::legacy("XOR_LOOP_HINT", "obfuscation", Severity::Low, "xor"),
         ];
 
         assert_eq!(risk_score(&findings), 10);
@@ -954,30 +944,15 @@ mod tests {
     #[test]
     fn privacy_network_sync_scores_as_suspicious() {
         let mut findings = vec![
-            Finding {
-                rule_id: "TIMESTAMP_OUTLIER".to_owned(),
-                category: "supply_chain".to_owned(),
-                severity: Severity::High,
-                message: "timestamp".to_owned(),
-            },
-            Finding {
-                rule_id: "XOR_LOOP_HINT".to_owned(),
-                category: "obfuscation".to_owned(),
-                severity: Severity::Low,
-                message: "xor".to_owned(),
-            },
-            Finding {
-                rule_id: "URL_API".to_owned(),
-                category: "network".to_owned(),
-                severity: Severity::Low,
-                message: "url".to_owned(),
-            },
-            Finding {
-                rule_id: "HTTPS_URL_CONNECTION".to_owned(),
-                category: "network".to_owned(),
-                severity: Severity::Low,
-                message: "https".to_owned(),
-            },
+            Finding::legacy(
+                "TIMESTAMP_OUTLIER",
+                "supply_chain",
+                Severity::High,
+                "timestamp",
+            ),
+            Finding::legacy("XOR_LOOP_HINT", "obfuscation", Severity::Low, "xor"),
+            Finding::legacy("URL_API", "network", Severity::Low, "url"),
+            Finding::legacy("HTTPS_URL_CONNECTION", "network", Severity::Low, "https"),
         ];
         let data = ScanData {
             archive_signals: vec!["xor_loop_string_decode".to_owned()],

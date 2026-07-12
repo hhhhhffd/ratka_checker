@@ -107,30 +107,242 @@ impl Severity {
     }
 }
 
-/// Public finding object returned in scan responses.
-#[derive(Clone, Debug, Serialize)]
-pub struct FindingResponse {
-    pub rule_id: String,
-    pub severity: Severity,
-    pub message: String,
+/// How confidently the scanner classified a behaviour or archive component.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
-/// Internal finding object carries category for DB storage and summary generation.
-#[derive(Clone, Debug)]
+impl Confidence {
+    pub fn from_db(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(anyhow::anyhow!("unknown confidence: {other}")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Origin of code or data that produced a scan result.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeScope {
+    FirstParty,
+    BundledDependency,
+    NestedMod,
+    GeneratedCode,
+    Metadata,
+    Resource,
+    #[default]
+    Unknown,
+}
+
+impl CodeScope {
+    pub fn from_db(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "first_party" => Ok(Self::FirstParty),
+            "bundled_dependency" => Ok(Self::BundledDependency),
+            "nested_mod" => Ok(Self::NestedMod),
+            "generated_code" => Ok(Self::GeneratedCode),
+            "metadata" => Ok(Self::Metadata),
+            "resource" => Ok(Self::Resource),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(anyhow::anyhow!("unknown code scope: {other}")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FirstParty => "first_party",
+            Self::BundledDependency => "bundled_dependency",
+            Self::NestedMod => "nested_mod",
+            Self::GeneratedCode => "generated_code",
+            Self::Metadata => "metadata",
+            Self::Resource => "resource",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classification of a result. Capabilities are intentionally not risk-bearing findings.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    #[default]
+    Finding,
+    Heuristic,
+    Native,
+    Virustotal,
+}
+
+impl FindingKind {
+    pub fn from_db(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "finding" => Ok(Self::Finding),
+            "heuristic" => Ok(Self::Heuristic),
+            "native" => Ok(Self::Native),
+            "virustotal" => Ok(Self::Virustotal),
+            other => Err(anyhow::anyhow!("unknown finding kind: {other}")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Finding => "finding",
+            Self::Heuristic => "heuristic",
+            Self::Native => "native",
+            Self::Virustotal => "virustotal",
+        }
+    }
+}
+
+/// Exact source location and value origin used to support a result.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Evidence {
+    pub archive_id: String,
+    pub archive_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method_descriptor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytecode_offset: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_path: Option<String>,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_preview: Option<String>,
+    #[serde(default)]
+    pub scope: CodeScope,
+}
+
+/// A neutral observable behaviour that does not contribute to risk by itself.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Capability {
+    pub rule_id: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
+}
+
+/// A sequence of operations connected by data-flow evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConfirmedChain {
+    pub chain_id: String,
+    pub rule_id: String,
+    pub severity: Severity,
+    #[serde(default)]
+    pub confidence: Confidence,
+    pub score_contribution: u8,
+    pub operations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
+}
+
+/// Degree to which obfuscation limits static-analysis confidence.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Obfuscation {
+    #[serde(default)]
+    pub level: ObfuscationLevel,
+    pub score: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObfuscationLevel {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+}
+
+/// A reason why the scan may not be complete.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Limitation {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
+}
+
+/// Structured result emitted by the scanner before persistence or API enrichment.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScanReport {
+    pub verdict: Verdict,
+    pub risk_score: u8,
+    #[serde(default)]
+    pub confidence: Confidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed_chains: Vec<ConfirmedChain>,
+    #[serde(default)]
+    pub obfuscation: Obfuscation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<Limitation>,
+}
+
+/// Suspicious signal with its contribution and the evidence supporting it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Finding {
     pub rule_id: String,
     pub category: String,
+    #[serde(default)]
+    pub kind: FindingKind,
     pub severity: Severity,
+    #[serde(default)]
+    pub confidence: Confidence,
+    #[serde(default)]
+    pub score_contribution: u8,
+    #[serde(default)]
+    pub scope: CodeScope,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_chain_id: Option<String>,
 }
 
 impl Finding {
-    /// Drops internal category data for the public API response shape.
-    pub fn to_response(&self) -> FindingResponse {
-        FindingResponse {
-            rule_id: self.rule_id.clone(),
-            severity: self.severity.clone(),
-            message: self.message.clone(),
+    /// Creates a legacy rule result while callers are migrated to supply structured evidence.
+    pub fn legacy(
+        rule_id: impl Into<String>,
+        category: impl Into<String>,
+        severity: Severity,
+        message: impl Into<String>,
+    ) -> Self {
+        let score_contribution = severity.score_weight();
+        Self {
+            rule_id: rule_id.into(),
+            category: category.into(),
+            kind: FindingKind::Finding,
+            severity,
+            confidence: Confidence::Medium,
+            score_contribution,
+            scope: CodeScope::Unknown,
+            message: message.into(),
+            evidence: Vec::new(),
+            related_chain_id: None,
         }
     }
 }
@@ -285,7 +497,7 @@ pub struct VirusTotalEngineResult {
 }
 
 /// Response shared by POST /v1/scans, GET /v1/scans/{id}, and hash lookups.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ScanResponse {
     pub scan_id: Uuid,
     pub status: ScanStatus,
@@ -293,7 +505,18 @@ pub struct ScanResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
     pub risk_score: u8,
-    pub findings: Vec<FindingResponse>,
+    #[serde(default)]
+    pub confidence: Confidence,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub findings: Vec<Finding>,
+    #[serde(default)]
+    pub confirmed_chains: Vec<ConfirmedChain>,
+    #[serde(default)]
+    pub obfuscation: Obfuscation,
+    #[serde(default)]
+    pub limitations: Vec<Limitation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub virustotal: Option<VirusTotalReport>,
 }
@@ -361,12 +584,51 @@ mod tests {
             sha256: "abc".to_owned(),
             verdict: Some(Verdict::Clean),
             risk_score: 0,
+            confidence: Confidence::High,
+            capabilities: Vec::new(),
             findings: Vec::new(),
+            confirmed_chains: Vec::new(),
+            obfuscation: Obfuscation::default(),
+            limitations: Vec::new(),
             virustotal: None,
         };
 
         let value = serde_json::to_value(response).expect("response serializes");
 
         assert!(value.get("summary").is_none());
+    }
+
+    #[test]
+    fn legacy_finding_uses_safe_structured_defaults() {
+        let finding = Finding::legacy("RULE", "archive", Severity::Low, "legacy result");
+
+        assert_eq!(finding.kind, FindingKind::Finding);
+        assert_eq!(finding.confidence, Confidence::Medium);
+        assert_eq!(finding.scope, CodeScope::Unknown);
+        assert_eq!(finding.score_contribution, 5);
+        assert!(finding.evidence.is_empty());
+    }
+
+    #[test]
+    fn legacy_scan_response_deserializes_with_structured_defaults() {
+        let response = serde_json::from_value::<ScanResponse>(serde_json::json!({
+            "scan_id": Uuid::nil(),
+            "status": "done",
+            "sha256": "abc",
+            "verdict": "clean",
+            "risk_score": 0,
+            "findings": [{
+                "rule_id": "OLD_RULE",
+                "category": "archive",
+                "severity": "low",
+                "message": "old response"
+            }]
+        }))
+        .expect("legacy response deserializes");
+
+        assert_eq!(response.confidence, Confidence::Medium);
+        assert!(response.capabilities.is_empty());
+        assert_eq!(response.findings[0].scope, CodeScope::Unknown);
+        assert_eq!(response.obfuscation, Obfuscation::default());
     }
 }
