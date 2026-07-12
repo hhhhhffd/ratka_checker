@@ -8,10 +8,13 @@ use std::{
 use zip::ZipArchive;
 
 use crate::{
-    models::scan::{CodeScope, Confidence, Finding, Obfuscation, ScanReport, Severity, Verdict},
+    models::scan::{
+        Capability, CodeScope, Confidence, Evidence, Finding, Obfuscation, ScanReport, Severity,
+        Verdict,
+    },
     rules::engine::RulesEngine,
     scanner::{
-        class_file, metadata,
+        asset, class_file, context_recognizers, metadata, native,
         scope::{
             classify_classes, ArchiveScopeInput, ClassScopeInput, DependencyMetadata,
             ScopeClassificationInput,
@@ -97,6 +100,7 @@ pub struct ScanData {
     /// their parent archive.
     pub archive_layers: Vec<ArchiveLayer>,
     pub resource_files: Vec<ResourceScanData>,
+    pub embedded_native_capabilities: Vec<Capability>,
 }
 
 /// A single JAR or ZIP encountered while recursively parsing the submitted archive.
@@ -194,7 +198,10 @@ fn scan_bytes(
     }
 
     context.add_derived_signals();
+    let contextual_results = context_recognizers::recognize(&context.data);
     let mut findings = rules_engine.evaluate(&context.data);
+    findings.retain(|finding| !contextual_results.suppresses(&finding.rule_id));
+    findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
     let (verdict, risk_score, summary) = finalize_findings(&findings);
 
@@ -202,7 +209,12 @@ fn scan_bytes(
         verdict: verdict.clone(),
         risk_score,
         confidence: Confidence::Medium,
-        capabilities: Vec::new(),
+        capabilities: context
+            .data
+            .embedded_native_capabilities
+            .into_iter()
+            .chain(contextual_results.capabilities)
+            .collect(),
         findings: findings.clone(),
         confirmed_chains: Vec::new(),
         obfuscation: Obfuscation::default(),
@@ -400,7 +412,7 @@ impl ArchiveContext {
     }
 
     /// Adds archive-structure signals based on path and size metadata.
-    fn observe_archive_structure(&mut self, name: &str, uncompressed_size: u64) {
+    fn observe_archive_structure(&mut self, name: &str, _uncompressed_size: u64) {
         let lower = name.to_ascii_lowercase();
         if lower.ends_with(".jar") {
             if !is_fabric_declared_nested_jar(&lower) {
@@ -418,11 +430,6 @@ impl ArchiveContext {
                 .archive_signals
                 .push(SCRIPT_FILE_SIGNAL.to_owned());
         }
-        if lower.starts_with("assets/") && uncompressed_size >= LARGE_ASSET_THRESHOLD_BYTES {
-            self.data
-                .archive_signals
-                .push(LARGE_ASSET_SIGNAL.to_owned());
-        }
         self.data.strings.push(name.to_owned());
     }
 
@@ -434,7 +441,9 @@ impl ArchiveContext {
         bytes: &[u8],
     ) -> Result<(), ScanAbort> {
         let lower = name.to_ascii_lowercase();
-        self.observe_magic_bytes(&lower, bytes);
+        self.observe_magic_bytes(archive_id, name, &lower, bytes)?;
+
+        self.observe_asset(name, bytes);
 
         if lower.ends_with(".jar") || lower.ends_with(".zip") {
             let parent = self.archive_layer(archive_id)?;
@@ -516,7 +525,35 @@ impl ArchiveContext {
         Ok(())
     }
 
-    fn observe_magic_bytes(&mut self, lower_name: &str, bytes: &[u8]) {
+    fn observe_magic_bytes(
+        &mut self,
+        archive_id: &str,
+        name: &str,
+        lower_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), ScanAbort> {
+        if let Some(analysis) = native::inspect_native_file(name, bytes) {
+            if let Some(known_library) = analysis.known_library {
+                let archive_path = self.archive_path(archive_id)?;
+                self.data.embedded_native_capabilities.push(Capability {
+                    rule_id: "EMBEDDED_NATIVE_LIBRARY".to_owned(),
+                    message: format!("Встроенная native-библиотека {known_library:?} распознана по штатному пути загрузчика."),
+                    evidence: vec![Evidence {
+                        archive_id: archive_id.to_owned(),
+                        archive_path,
+                        class_name: None,
+                        method_name: None,
+                        method_descriptor: None,
+                        bytecode_offset: None,
+                        resource_path: Some(name.to_owned()),
+                        operation: "embedded_native_library".to_owned(),
+                        value_preview: Some(format!("{known_library:?}")),
+                        scope: CodeScope::Resource,
+                    }],
+                });
+                return Ok(());
+            }
+        }
         if is_native_binary(bytes) && !is_known_dependency_native_path(lower_name) {
             self.data
                 .archive_signals
@@ -524,6 +561,24 @@ impl ArchiveContext {
         }
         if bytes.starts_with(b"PK\x03\x04") && !is_fabric_declared_nested_jar(lower_name) {
             self.data.archive_signals.push(NESTED_ZIP_SIGNAL.to_owned());
+        }
+        Ok(())
+    }
+
+    fn observe_asset(&mut self, name: &str, bytes: &[u8]) {
+        if !name.to_ascii_lowercase().starts_with("assets/")
+            || (bytes.len() as u64) < LARGE_ASSET_THRESHOLD_BYTES
+        {
+            return;
+        }
+        let analysis = asset::inspect_asset(name, bytes);
+        let valid_image = analysis.detected_format.is_some()
+            && analysis.extension_matches_magic
+            && analysis.trailing_payload.is_none();
+        if !valid_image {
+            self.data
+                .archive_signals
+                .push(LARGE_ASSET_SIGNAL.to_owned());
         }
     }
 

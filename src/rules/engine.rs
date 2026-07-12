@@ -152,6 +152,7 @@ mod tests {
             entrypoint_classes: Vec::new(),
             archive_layers: Vec::new(),
             resource_files: Vec::new(),
+            embedded_native_capabilities: Vec::new(),
         };
         assert_eq!(engine.evaluate(&data).len(), 1);
     }
