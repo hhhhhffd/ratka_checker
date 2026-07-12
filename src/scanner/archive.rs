@@ -21,7 +21,7 @@ use crate::{
             analyze_method_flows, ConfirmedChainCandidate, ConfirmedChainKind, DataFlowConfig,
             FileTarget, FlowEvidence, MethodFlow, MethodId, Operation, SourceKind, TransformKind,
         },
-        metadata, native,
+        metadata, native, obfuscation,
         scope::{
             classify_classes, ArchiveScopeInput, ClassScopeInput, DependencyMetadata,
             ScopeClassificationInput,
@@ -140,6 +140,9 @@ pub struct ResourceScanData {
     pub archive_path: String,
     pub path: String,
     pub uncompressed_size: u64,
+    /// Shannon entropy in thousandths of a bit per byte. Keeping an integer
+    /// makes resource metadata comparable without retaining resource bytes.
+    pub entropy_milli_bits: u16,
 }
 
 /// Per-class data used for lower-noise correlation signals.
@@ -206,10 +209,12 @@ fn scan_bytes(
     }
 
     context.add_derived_signals();
+    let obfuscation = obfuscation::enrich_and_analyze(&mut context.data);
     let data_flow = analyze_scan_data_flow(&context.data);
     let contextual_results = context_recognizers::recognize(&context.data);
     let mut findings = rules_engine.evaluate(&context.data);
     findings.retain(|finding| !contextual_results.suppresses(&finding.rule_id));
+    findings.retain(|finding| finding.rule_id != "SHORT_NAMES_WITHOUT_MIXIN");
     findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
     let confirmed_chains = data_flow
@@ -217,6 +222,28 @@ fn scan_bytes(
         .iter()
         .map(confirmed_chain_from_candidate)
         .collect::<Vec<_>>();
+    let chain_capabilities = updater_capabilities(&confirmed_chains);
+    if confirmed_chains
+        .iter()
+        .any(|chain| chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC")
+    {
+        findings.push(Finding {
+            rule_id: "AUTO_UPDATER_WITHOUT_HASH_CHECK".to_owned(),
+            category: "updater".to_owned(),
+            kind: crate::models::scan::FindingKind::Heuristic,
+            severity: Severity::Medium,
+            confidence: Confidence::Medium,
+            score_contribution: 0,
+            scope: CodeScope::FirstParty,
+            message: "Автообновлятор скачивает и запускает JAR без подтверждённой проверки хеша."
+                .to_owned(),
+            evidence: confirmed_chains
+                .iter()
+                .flat_map(|chain| chain.evidence.clone())
+                .collect(),
+            related_chain_id: confirmed_chains.first().map(|chain| chain.chain_id.clone()),
+        });
+    }
     let limitations = data_flow
         .limitations
         .iter()
@@ -226,21 +253,23 @@ fn scan_bytes(
             evidence: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let (verdict, risk_score, summary) = finalize_findings(&findings);
+    let (verdict, risk_score, summary) =
+        finalize_report(&findings, &confirmed_chains, &obfuscation.obfuscation);
 
     let report = ScanReport {
         verdict: verdict.clone(),
         risk_score,
-        confidence: Confidence::Medium,
+        confidence: obfuscation.confidence,
         capabilities: context
             .data
             .embedded_native_capabilities
             .into_iter()
             .chain(contextual_results.capabilities)
+            .chain(chain_capabilities)
             .collect(),
         findings: findings.clone(),
         confirmed_chains,
-        obfuscation: Obfuscation::default(),
+        obfuscation: obfuscation.obfuscation,
         limitations,
     };
 
@@ -255,8 +284,20 @@ fn scan_bytes(
 
 /// Recomputes verdict fields after callers add non-static findings such as VirusTotal signals.
 pub fn finalize_findings(findings: &[Finding]) -> (Verdict, u8, String) {
-    let risk_score = risk_score(findings);
-    let verdict = Verdict::from_score(risk_score);
+    finalize_report(findings, &[], &Obfuscation::default())
+}
+
+/// Applies score caps and evidence gates. Weak findings alone can never produce `malicious`.
+pub fn finalize_report(
+    findings: &[Finding],
+    confirmed_chains: &[ConfirmedChain],
+    obfuscation: &Obfuscation,
+) -> (Verdict, u8, String) {
+    let mut risk_score = risk_score(findings, confirmed_chains, obfuscation);
+    let verdict = verdict_from_evidence(findings, confirmed_chains, obfuscation, risk_score);
+    if verdict == Verdict::Malicious {
+        risk_score = risk_score.max(70);
+    }
     let summary = summarize(findings, verdict.clone());
     (verdict, risk_score, summary)
 }
@@ -540,6 +581,7 @@ impl ArchiveContext {
                 archive_path: self.archive_path(archive_id)?,
                 path: name.to_owned(),
                 uncompressed_size: bytes.len() as u64,
+                entropy_milli_bits: shannon_entropy_milli_bits(bytes),
             });
             self.data
                 .strings
@@ -966,6 +1008,28 @@ fn is_native_binary(bytes: &[u8]) -> bool {
         || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
 }
 
+/// Returns Shannon entropy in thousandths of a bit per byte without retaining
+/// resource content after archive parsing.
+fn shannon_entropy_milli_bits(bytes: &[u8]) -> u16 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut counts = [0_usize; 256];
+    for byte in bytes {
+        counts[*byte as usize] += 1;
+    }
+    let length = bytes.len() as f64;
+    let entropy = counts
+        .iter()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let probability = *count as f64 / length;
+            -probability * probability.log2()
+        })
+        .sum::<f64>();
+    (entropy * 1_000.0).round().clamp(0.0, f64::from(u16::MAX)) as u16
+}
+
 fn is_fabric_declared_nested_jar(lower_name: &str) -> bool {
     lower_name.starts_with("meta-inf/jars/") && lower_name.ends_with(".jar")
 }
@@ -1352,8 +1416,8 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
     let (rule_id, severity, score_contribution) = match candidate.kind {
         ConfirmedChainKind::DownloadWriteExecute => (
             "CONFIRMED_DOWNLOAD_WRITE_EXEC".to_owned(),
-            Severity::High,
-            50,
+            Severity::Medium,
+            20,
         ),
         ConfirmedChainKind::CredentialExfiltration => (
             "CONFIRMED_CREDENTIAL_EXFILTRATION".to_owned(),
@@ -1402,6 +1466,36 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
     }
 }
 
+fn updater_capabilities(chains: &[ConfirmedChain]) -> Vec<Capability> {
+    let Some(chain) = chains
+        .iter()
+        .find(|chain| chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC")
+    else {
+        return Vec::new();
+    };
+    [
+        (
+            "AUTO_UPDATER_DOWNLOAD",
+            "Автообновлятор получает обновление по сети.",
+        ),
+        (
+            "AUTO_UPDATER_WRITE_JAR",
+            "Автообновлятор записывает JAR обновления.",
+        ),
+        (
+            "AUTO_UPDATER_LAUNCH",
+            "Автообновлятор запускает обновление.",
+        ),
+    ]
+    .into_iter()
+    .map(|(rule_id, message)| Capability {
+        rule_id: rule_id.to_owned(),
+        message: message.to_owned(),
+        evidence: chain.evidence.clone(),
+    })
+    .collect()
+}
+
 /// Scanner aborts that should produce `verdict: unknown` instead of a malicious score.
 #[derive(Debug, thiserror::Error)]
 enum ScanAbort {
@@ -1435,19 +1529,74 @@ impl ScanAbort {
 }
 
 /// Scores findings with the fixed severity weights and caps the total at 100.
-fn risk_score(findings: &[Finding]) -> u8 {
-    findings
+fn risk_score(
+    findings: &[Finding],
+    confirmed_chains: &[ConfirmedChain],
+    _obfuscation: &Obfuscation,
+) -> u8 {
+    let mut category_scores = HashMap::<&str, u16>::new();
+    for finding in findings {
+        let cap = category_score_cap(&finding.category);
+        let score = u16::from(finding_score_weight(finding)).min(cap);
+        let total = category_scores.entry(&finding.category).or_default();
+        *total = (*total + score).min(cap);
+    }
+    let chain_score = confirmed_chains
         .iter()
-        .map(|finding| u16::from(finding_score_weight(finding)))
+        .map(|chain| u16::from(chain.score_contribution))
+        .sum::<u16>();
+    category_scores
+        .values()
+        .copied()
         .sum::<u16>()
+        .saturating_add(chain_score)
         .min(100) as u8
+}
+
+fn category_score_cap(category: &str) -> u16 {
+    match category {
+        "network" | "dangerous_api" | "obfuscation" => 5,
+        "archive_structure" | "supply_chain" => 15,
+        _ => 100,
+    }
+}
+
+fn verdict_from_evidence(
+    findings: &[Finding],
+    confirmed_chains: &[ConfirmedChain],
+    obfuscation: &Obfuscation,
+    risk_score: u8,
+) -> Verdict {
+    let has_malicious_chain = confirmed_chains.iter().any(|chain| {
+        matches!(
+            chain.rule_id.as_str(),
+            "CONFIRMED_CREDENTIAL_EXFILTRATION"
+                | "CONFIRMED_DECODED_DYNAMIC_LOAD"
+                | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
+        ) || (chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC"
+            && matches!(
+                obfuscation.level,
+                crate::models::scan::ObfuscationLevel::High
+            ))
+    });
+    let trusted_vt_detection = findings
+        .iter()
+        .any(|finding| finding.rule_id == "VT_TRUSTED_MALICIOUS_ENGINE");
+    if has_malicious_chain || trusted_vt_detection {
+        return Verdict::Malicious;
+    }
+    if !confirmed_chains.is_empty() || risk_score > 5 {
+        Verdict::Suspicious
+    } else {
+        Verdict::Clean
+    }
 }
 
 fn finding_score_weight(finding: &Finding) -> u8 {
     match finding.rule_id.as_str() {
         "TIMESTAMP_OUTLIER" => Severity::Low.score_weight(),
         "RAW_GITHUB_URL" | "MODS_SELF_COPY" => 0,
-        _ => finding.severity.score_weight(),
+        _ => finding.score_contribution,
     }
 }
 
@@ -1502,7 +1651,7 @@ mod tests {
         TIMESTAMP_OUTLIER_SIGNAL,
     };
 
-    use crate::models::scan::{CodeScope, Confidence, Finding, Severity, Verdict};
+    use crate::models::scan::{CodeScope, Confidence, Finding, Obfuscation, Severity, Verdict};
     use std::io::{Cursor, Write};
     use zip::{write::SimpleFileOptions, DateTime, ZipWriter};
 
@@ -1514,7 +1663,7 @@ mod tests {
             Finding::legacy("B", "x", Severity::Critical, "b"),
             Finding::legacy("C", "x", Severity::High, "c"),
         ];
-        assert_eq!(risk_score(&findings), 100);
+        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 100);
     }
 
     /// Verifies noisy standalone rules stay below the malicious threshold.
@@ -1532,7 +1681,7 @@ mod tests {
             Finding::legacy("XOR_LOOP_HINT", "obfuscation", Severity::Low, "xor"),
         ];
 
-        assert_eq!(risk_score(&findings), 10);
+        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 10);
     }
 
     /// Verifies privacy/network sync is suspicious but not malicious by itself.
@@ -1568,7 +1717,7 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.rule_id == PRIVACY_NETWORK_SYNC_RULE_ID));
-        assert_eq!(risk_score(&findings), 35);
+        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 30);
     }
 
     /// Verifies related reversed/rotated identifiers do not produce namespace mismatch noise.

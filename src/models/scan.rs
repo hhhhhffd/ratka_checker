@@ -381,8 +381,27 @@ impl VirusTotalReport {
 pub struct VirusTotalBehaviorInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available: Option<bool>,
+    /// Reliability of the process attribution supplied by the sandbox.
+    #[serde(default = "default_behavior_confidence")]
+    pub behavior_confidence: Confidence,
+    /// Sandbox processes identified as the launcher for the submitted sample.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_execution: Vec<VirusTotalProcess>,
+    /// Processes whose parent process is a verified sample process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_child_processes: Vec<VirusTotalProcess>,
+    /// File artifacts tied to a verified sample process by a process identifier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_files: Vec<VirusTotalFileArtifact>,
+    /// Network artifacts tied to a verified sample process by a process identifier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_network: Vec<VirusTotalNetworkArtifact>,
+    /// Sandbox/runtime activity that cannot be attributed to the submitted sample.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_noise: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reports: Vec<VirusTotalBehaviorReport>,
+    /// Legacy aggregate fields retained for cached reports and existing API consumers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contacted_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -410,6 +429,18 @@ pub struct VirusTotalBehaviorReport {
     pub analysis_date: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
+    #[serde(default = "default_behavior_confidence")]
+    pub behavior_confidence: Confidence,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_execution: Vec<VirusTotalProcess>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_child_processes: Vec<VirusTotalProcess>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_files: Vec<VirusTotalFileArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_network: Vec<VirusTotalNetworkArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_noise: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contacted_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -428,10 +459,55 @@ pub struct VirusTotalBehaviorReport {
     pub dns_lookups: Vec<String>,
 }
 
+/// A process record emitted by a VirusTotal sandbox report.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VirusTotalProcess {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+}
+
+/// A filesystem operation attributed to the submitted sample by the sandbox.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VirusTotalFileArtifact {
+    pub path: String,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u64>,
+}
+
+/// A network operation attributed to the submitted sample by the sandbox.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VirusTotalNetworkArtifact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u64>,
+}
+
 impl VirusTotalBehaviorInfo {
     pub fn empty(available: Option<bool>) -> Self {
         Self {
             available,
+            behavior_confidence: default_behavior_confidence(),
+            sample_execution: Vec::new(),
+            attributed_child_processes: Vec::new(),
+            attributed_files: Vec::new(),
+            attributed_network: Vec::new(),
+            environment_noise: Vec::new(),
             reports: Vec::new(),
             contacted_ips: Vec::new(),
             contacted_domains: Vec::new(),
@@ -443,6 +519,10 @@ impl VirusTotalBehaviorInfo {
             dns_lookups: Vec::new(),
         }
     }
+}
+
+fn default_behavior_confidence() -> Confidence {
+    Confidence::Low
 }
 
 /// Coarse VirusTotal lifecycle state exposed without leaking raw API response shape.
@@ -574,6 +654,21 @@ mod tests {
 
         assert_eq!(report.status, VirusTotalStatus::Completed);
         assert_eq!(report.source, VirusTotalSource::Lookup);
+    }
+
+    #[test]
+    fn legacy_virustotal_behavior_deserializes_with_low_attribution_confidence() {
+        let behavior = serde_json::from_value::<VirusTotalBehaviorInfo>(serde_json::json!({
+            "available": true,
+            "processes_created": ["java -jar sample.jar"]
+        }))
+        .expect("legacy behavior deserializes");
+
+        assert_eq!(behavior.behavior_confidence, Confidence::Low);
+        assert!(behavior.sample_execution.is_empty());
+        assert!(behavior.attributed_child_processes.is_empty());
+        assert!(behavior.attributed_files.is_empty());
+        assert!(behavior.attributed_network.is_empty());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    net::IpAddr,
     path::Path,
 };
 
@@ -9,9 +10,9 @@ use serde::Deserialize;
 use crate::{
     config::VirusTotalConfig,
     models::scan::{
-        Finding, Severity, VirusTotalBehaviorInfo, VirusTotalBehaviorReport,
-        VirusTotalEngineResult, VirusTotalReport, VirusTotalSource, VirusTotalStats,
-        VirusTotalStatus,
+        Confidence, Finding, Severity, VirusTotalBehaviorInfo, VirusTotalBehaviorReport,
+        VirusTotalEngineResult, VirusTotalFileArtifact, VirusTotalNetworkArtifact,
+        VirusTotalProcess, VirusTotalReport, VirusTotalSource, VirusTotalStats, VirusTotalStatus,
     },
 };
 
@@ -99,7 +100,10 @@ pub fn sanitize_report(report: &mut VirusTotalReport) {
     for behavior_report in &mut behavior.reports {
         filter_sandbox_noise(behavior_report);
     }
-    behavior.reports.retain(has_behavior_signal);
+    behavior.reports.retain(|behavior_report| {
+        has_attributed_behavior_signal(behavior_report)
+            || !behavior_report.environment_noise.is_empty()
+    });
     rebuild_behavior_aggregates(behavior);
 }
 
@@ -330,21 +334,51 @@ fn behavior_info_from_reports(
     let mut behavior = VirusTotalBehaviorInfo::empty(Some(true));
     for raw_report in behavior_reports {
         let report = behavior_report_from_attributes(raw_report.attributes);
-        extend_unique(&mut behavior.contacted_ips, &report.contacted_ips);
-        extend_unique(&mut behavior.contacted_domains, &report.contacted_domains);
-        extend_unique(&mut behavior.contacted_urls, &report.contacted_urls);
-        extend_unique(&mut behavior.dropped_files, &report.dropped_files);
-        extend_unique(&mut behavior.files_written, &report.files_written);
-        extend_unique(&mut behavior.processes_created, &report.processes_created);
-        extend_unique(&mut behavior.command_executions, &report.command_executions);
-        extend_unique(&mut behavior.dns_lookups, &report.dns_lookups);
+        merge_behavior_report(&mut behavior, &report);
         behavior.reports.push(report);
     }
-    behavior.reports.retain(has_behavior_signal);
+    behavior.reports.retain(has_attributed_behavior_signal);
+    if !behavior.sample_execution.is_empty() {
+        behavior.behavior_confidence = Confidence::High;
+    }
     behavior
 }
 
 fn behavior_report_from_attributes(attributes: serde_json::Value) -> VirusTotalBehaviorReport {
+    let processes = process_records(&attributes);
+    let sample_execution = processes
+        .iter()
+        .filter(|process| is_sample_process(process))
+        .cloned()
+        .collect::<Vec<_>>();
+    let attributed_process_ids = attributed_process_ids(&sample_execution, &processes);
+    let attributed_child_processes = processes
+        .iter()
+        .filter(|process| {
+            process
+                .pid
+                .is_some_and(|pid| attributed_process_ids.contains(&pid))
+                && !sample_execution.contains(process)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut environment_noise = Vec::new();
+    for process in &processes {
+        if !process
+            .pid
+            .is_some_and(|pid| attributed_process_ids.contains(&pid))
+        {
+            add_environment_noise(&mut environment_noise, "process", process_summary(process));
+        }
+    }
+    let (attributed_files, file_noise) =
+        classify_file_artifacts(&attributes, &attributed_process_ids);
+    environment_noise.extend(file_noise);
+    let (attributed_network, network_noise) =
+        classify_network_artifacts(&attributes, &attributed_process_ids);
+    environment_noise.extend(network_noise);
+
     let mut report = VirusTotalBehaviorReport {
         sandbox_name: string_field(&attributes, &["sandbox_name", "sandbox", "environment_id"]),
         analysis_date: integer_field(&attributes, &["analysis_date", "date"]),
@@ -352,81 +386,55 @@ fn behavior_report_from_attributes(attributes: serde_json::Value) -> VirusTotalB
             &attributes,
             &["verdict", "sandbox_verdict", "classification", "category"],
         ),
-        contacted_ips: field_strings(
-            &attributes,
-            &["contacted_ips", "ip_traffic", "network", "hosts"],
-        ),
-        contacted_domains: field_strings(
-            &attributes,
-            &["contacted_domains", "domains", "dns_lookups", "hosts"],
-        ),
-        contacted_urls: field_strings(
-            &attributes,
-            &["contacted_urls", "http_conversations", "urls"],
-        ),
-        dropped_files: field_strings(&attributes, &["dropped_files", "files_dropped"]),
-        files_written: field_strings(
-            &attributes,
-            &["files_written", "files_created", "files_deleted"],
-        ),
-        processes_created: field_strings(
-            &attributes,
-            &[
-                "processes_created",
-                "processes_terminated",
-                "process_tree",
-                "processes",
-            ],
-        ),
-        command_executions: field_strings(
-            &attributes,
-            &[
-                "command_executions",
-                "commands_executed",
-                "cmd",
-                "command_line",
-            ],
-        ),
-        dns_lookups: field_strings(&attributes, &["dns_lookups", "dns_requests"]),
+        behavior_confidence: if sample_execution.is_empty() {
+            Confidence::Low
+        } else {
+            Confidence::High
+        },
+        sample_execution,
+        attributed_child_processes,
+        attributed_files,
+        attributed_network,
+        environment_noise: unique_limited(environment_noise),
+        ..Default::default()
     };
-    filter_sandbox_noise(&mut report);
+    populate_legacy_behavior_fields(&mut report);
     report
 }
 
 fn filter_sandbox_noise(report: &mut VirusTotalBehaviorReport) {
-    report
-        .contacted_domains
-        .retain(|value| !is_noisy_domain_or_dns_value(value));
-    report
-        .dropped_files
-        .retain(|value| !is_noisy_virustotal_behavior_value(value));
-    report
-        .files_written
-        .retain(|value| !is_noisy_virustotal_behavior_value(value));
-    report
-        .processes_created
-        .retain(|value| !is_noisy_virustotal_behavior_value(value));
-    report
-        .command_executions
-        .retain(|value| !is_noisy_virustotal_behavior_value(value));
-    report
-        .dns_lookups
-        .retain(|value| !is_noisy_domain_or_dns_value(value));
+    let legacy_values = [
+        ("contacted_ip", &mut report.contacted_ips),
+        ("contacted_domain", &mut report.contacted_domains),
+        ("contacted_url", &mut report.contacted_urls),
+        ("dropped_file", &mut report.dropped_files),
+        ("file_write", &mut report.files_written),
+        ("process", &mut report.processes_created),
+        ("command", &mut report.command_executions),
+        ("dns", &mut report.dns_lookups),
+    ];
+    for (kind, values) in legacy_values {
+        for value in values.drain(..) {
+            add_environment_noise(&mut report.environment_noise, kind, value);
+        }
+    }
+    report.environment_noise = unique_limited(report.environment_noise.clone());
 }
 
-fn has_behavior_signal(report: &VirusTotalBehaviorReport) -> bool {
+fn has_attributed_behavior_signal(report: &VirusTotalBehaviorReport) -> bool {
     report.verdict.is_some()
-        || !report.contacted_ips.is_empty()
-        || !report.contacted_domains.is_empty()
-        || !report.contacted_urls.is_empty()
-        || !report.dropped_files.is_empty()
-        || !report.files_written.is_empty()
-        || !report.processes_created.is_empty()
-        || !report.command_executions.is_empty()
-        || !report.dns_lookups.is_empty()
+        || !report.sample_execution.is_empty()
+        || !report.attributed_child_processes.is_empty()
+        || !report.attributed_files.is_empty()
+        || !report.attributed_network.is_empty()
 }
 
 fn rebuild_behavior_aggregates(behavior: &mut VirusTotalBehaviorInfo) {
+    behavior.sample_execution.clear();
+    behavior.attributed_child_processes.clear();
+    behavior.attributed_files.clear();
+    behavior.attributed_network.clear();
+    behavior.environment_noise.clear();
     behavior.contacted_ips.clear();
     behavior.contacted_domains.clear();
     behavior.contacted_urls.clear();
@@ -436,16 +444,370 @@ fn rebuild_behavior_aggregates(behavior: &mut VirusTotalBehaviorInfo) {
     behavior.command_executions.clear();
     behavior.dns_lookups.clear();
 
-    for report in &behavior.reports {
-        extend_unique(&mut behavior.contacted_ips, &report.contacted_ips);
-        extend_unique(&mut behavior.contacted_domains, &report.contacted_domains);
-        extend_unique(&mut behavior.contacted_urls, &report.contacted_urls);
-        extend_unique(&mut behavior.dropped_files, &report.dropped_files);
-        extend_unique(&mut behavior.files_written, &report.files_written);
-        extend_unique(&mut behavior.processes_created, &report.processes_created);
-        extend_unique(&mut behavior.command_executions, &report.command_executions);
-        extend_unique(&mut behavior.dns_lookups, &report.dns_lookups);
+    for report in &mut behavior.reports {
+        filter_sandbox_noise(report);
     }
+    for report in behavior.reports.clone() {
+        merge_behavior_report(behavior, &report);
+    }
+
+    behavior.behavior_confidence = if behavior.sample_execution.is_empty() {
+        Confidence::Low
+    } else {
+        Confidence::High
+    };
+}
+
+fn merge_behavior_report(behavior: &mut VirusTotalBehaviorInfo, report: &VirusTotalBehaviorReport) {
+    extend_unique_processes(&mut behavior.sample_execution, &report.sample_execution);
+    extend_unique_processes(
+        &mut behavior.attributed_child_processes,
+        &report.attributed_child_processes,
+    );
+    extend_unique_file_artifacts(&mut behavior.attributed_files, &report.attributed_files);
+    extend_unique_network_artifacts(&mut behavior.attributed_network, &report.attributed_network);
+    extend_unique(&mut behavior.environment_noise, &report.environment_noise);
+    extend_unique(&mut behavior.contacted_ips, &report.contacted_ips);
+    extend_unique(&mut behavior.contacted_domains, &report.contacted_domains);
+    extend_unique(&mut behavior.contacted_urls, &report.contacted_urls);
+    extend_unique(&mut behavior.dropped_files, &report.dropped_files);
+    extend_unique(&mut behavior.files_written, &report.files_written);
+    extend_unique(&mut behavior.processes_created, &report.processes_created);
+    extend_unique(&mut behavior.command_executions, &report.command_executions);
+    extend_unique(&mut behavior.dns_lookups, &report.dns_lookups);
+}
+
+fn populate_legacy_behavior_fields(report: &mut VirusTotalBehaviorReport) {
+    report.contacted_ips = unique_limited(
+        report
+            .attributed_network
+            .iter()
+            .filter_map(|artifact| artifact.ip.clone())
+            .collect(),
+    );
+    report.contacted_domains = unique_limited(
+        report
+            .attributed_network
+            .iter()
+            .filter_map(|artifact| artifact.domain.clone())
+            .collect(),
+    );
+    report.contacted_urls = unique_limited(
+        report
+            .attributed_network
+            .iter()
+            .filter_map(|artifact| artifact.url.clone())
+            .collect(),
+    );
+    report.dropped_files = unique_limited(
+        report
+            .attributed_files
+            .iter()
+            .filter(|artifact| artifact.operation == "dropped")
+            .map(|artifact| artifact.path.clone())
+            .collect(),
+    );
+    report.files_written = unique_limited(
+        report
+            .attributed_files
+            .iter()
+            .filter(|artifact| artifact.operation != "dropped")
+            .map(|artifact| artifact.path.clone())
+            .collect(),
+    );
+    report.processes_created = unique_limited(
+        report
+            .attributed_child_processes
+            .iter()
+            .map(process_summary)
+            .collect(),
+    );
+}
+
+fn process_records(attributes: &serde_json::Value) -> Vec<VirusTotalProcess> {
+    let mut records = Vec::new();
+    for key in ["process_tree", "processes_created", "processes"] {
+        let Some(value) = attributes.get(key) else {
+            continue;
+        };
+        collect_process_records(value, &mut records);
+    }
+    records.truncate(BEHAVIOR_VALUE_LIMIT);
+    records
+}
+
+fn collect_process_records(value: &serde_json::Value, records: &mut Vec<VirusTotalProcess>) {
+    if records.len() >= BEHAVIOR_VALUE_LIMIT {
+        return;
+    }
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_process_records(value, records);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let process = VirusTotalProcess {
+                pid: object_u64(object, &["pid", "process_id"]),
+                parent_pid: object_u64(object, &["ppid", "parent_pid", "parent_process_id"]),
+                image: object_string(object, &["image", "path", "name", "process_name"]),
+                command_line: object_string(object, &["command_line", "command", "cmd"]),
+            };
+            if process.pid.is_some() || process.image.is_some() || process.command_line.is_some() {
+                records.push(process);
+            }
+            for key in ["children", "child_processes", "processes"] {
+                if let Some(children) = object.get(key) {
+                    collect_process_records(children, records);
+                }
+            }
+        }
+        serde_json::Value::String(command_line) => records.push(VirusTotalProcess {
+            command_line: Some(truncate_behavior_string(command_line)),
+            ..Default::default()
+        }),
+        _ => {}
+    }
+}
+
+fn attributed_process_ids(
+    sample_execution: &[VirusTotalProcess],
+    processes: &[VirusTotalProcess],
+) -> HashSet<u64> {
+    let mut attributed = sample_execution
+        .iter()
+        .filter_map(|process| process.pid)
+        .collect::<HashSet<_>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for process in processes {
+            if let (Some(pid), Some(parent_pid)) = (process.pid, process.parent_pid) {
+                if attributed.contains(&parent_pid) && attributed.insert(pid) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    attributed
+}
+
+fn is_sample_process(process: &VirusTotalProcess) -> bool {
+    [process.image.as_deref(), process.command_line.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| normalize_behavior_value(value).contains("sample.jar"))
+}
+
+fn process_summary(process: &VirusTotalProcess) -> String {
+    process
+        .command_line
+        .clone()
+        .or_else(|| process.image.clone())
+        .unwrap_or_else(|| format!("pid={}", process.pid.unwrap_or_default()))
+}
+
+fn classify_file_artifacts(
+    attributes: &serde_json::Value,
+    attributed_process_ids: &HashSet<u64>,
+) -> (Vec<VirusTotalFileArtifact>, Vec<String>) {
+    let mut attributed = Vec::new();
+    let mut noise = Vec::new();
+    for (key, operation) in [
+        ("dropped_files", "dropped"),
+        ("files_dropped", "dropped"),
+        ("files_written", "written"),
+        ("files_created", "written"),
+        ("files_deleted", "deleted"),
+    ] {
+        let Some(value) = attributes.get(key) else {
+            continue;
+        };
+        for artifact in file_artifacts(value, operation) {
+            if artifact
+                .process_id
+                .is_some_and(|pid| attributed_process_ids.contains(&pid))
+            {
+                attributed.push(artifact);
+            } else {
+                add_environment_noise(&mut noise, key, artifact.path);
+            }
+        }
+    }
+    (limited_artifacts(attributed), unique_limited(noise))
+}
+
+fn file_artifacts(value: &serde_json::Value, operation: &str) -> Vec<VirusTotalFileArtifact> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .flat_map(|value| file_artifacts(value, operation))
+            .collect(),
+        serde_json::Value::Object(object) => object_string(object, &["path", "file_path", "name"])
+            .map(|path| {
+                vec![VirusTotalFileArtifact {
+                    path,
+                    operation: operation.to_owned(),
+                    process_id: object_u64(object, &["pid", "process_id"]),
+                }]
+            })
+            .unwrap_or_default(),
+        serde_json::Value::String(path) => vec![VirusTotalFileArtifact {
+            path: truncate_behavior_string(path),
+            operation: operation.to_owned(),
+            process_id: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn classify_network_artifacts(
+    attributes: &serde_json::Value,
+    attributed_process_ids: &HashSet<u64>,
+) -> (Vec<VirusTotalNetworkArtifact>, Vec<String>) {
+    let mut attributed = Vec::new();
+    let mut noise = Vec::new();
+    for key in [
+        "ip_traffic",
+        "network",
+        "contacted_ips",
+        "contacted_domains",
+        "domains",
+        "dns_lookups",
+        "contacted_urls",
+        "http_conversations",
+        "urls",
+    ] {
+        let Some(value) = attributes.get(key) else {
+            continue;
+        };
+        for artifact in network_artifacts(value, key) {
+            if artifact
+                .process_id
+                .is_some_and(|pid| attributed_process_ids.contains(&pid))
+            {
+                attributed.push(artifact);
+            } else {
+                add_environment_noise(&mut noise, key, network_summary(&artifact));
+            }
+        }
+    }
+    (limited_artifacts(attributed), unique_limited(noise))
+}
+
+fn network_artifacts(value: &serde_json::Value, source: &str) -> Vec<VirusTotalNetworkArtifact> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .flat_map(|value| network_artifacts(value, source))
+            .collect(),
+        serde_json::Value::Object(object) => {
+            let ip = object_string(object, &["ip", "destination_ip", "host"])
+                .and_then(|value| value.parse::<IpAddr>().ok().map(|ip| ip.to_string()));
+            let artifact = VirusTotalNetworkArtifact {
+                ip,
+                domain: object_string(object, &["domain", "hostname"]),
+                url: object_string(object, &["url", "request_url"]),
+                port: object_u16(object, &["port", "destination_port"]),
+                protocol: object_string(object, &["protocol", "transport_protocol"]),
+                process_id: object_u64(object, &["pid", "process_id"]),
+            };
+            if artifact.ip.is_some() || artifact.domain.is_some() || artifact.url.is_some() {
+                vec![artifact]
+            } else {
+                Vec::new()
+            }
+        }
+        serde_json::Value::String(value) => {
+            let mut artifact = VirusTotalNetworkArtifact::default();
+            if let Ok(ip) = value.parse::<IpAddr>() {
+                artifact.ip = Some(ip.to_string());
+            } else if matches!(source, "contacted_urls" | "http_conversations" | "urls") {
+                artifact.url = Some(truncate_behavior_string(value));
+            } else {
+                artifact.domain = Some(truncate_behavior_string(value));
+            }
+            vec![artifact]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn network_summary(artifact: &VirusTotalNetworkArtifact) -> String {
+    artifact
+        .url
+        .clone()
+        .or_else(|| artifact.domain.clone())
+        .or_else(|| artifact.ip.clone())
+        .unwrap_or_else(|| "unparsed network artifact".to_owned())
+}
+
+fn add_environment_noise(target: &mut Vec<String>, kind: &str, value: String) {
+    if !is_noisy_virustotal_behavior_value(&value) && !is_noisy_domain_or_dns_value(&value) {
+        target.push(format!("{kind}: {}", truncate_behavior_string(&value)));
+    }
+}
+
+fn object_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| object.get(*key))
+        .find_map(json_string)
+        .map(truncate_behavior_string)
+}
+
+fn object_u64(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .filter_map(|key| object.get(*key))
+        .find_map(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+}
+
+fn object_u16(object: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<u16> {
+    object_u64(object, keys).and_then(|port| u16::try_from(port).ok())
+}
+
+fn extend_unique_processes(target: &mut Vec<VirusTotalProcess>, values: &[VirusTotalProcess]) {
+    for value in values {
+        if target.len() >= BEHAVIOR_VALUE_LIMIT || target.contains(value) {
+            continue;
+        }
+        target.push(value.clone());
+    }
+}
+
+fn extend_unique_file_artifacts(
+    target: &mut Vec<VirusTotalFileArtifact>,
+    values: &[VirusTotalFileArtifact],
+) {
+    for value in values {
+        if target.len() >= BEHAVIOR_VALUE_LIMIT || target.contains(value) {
+            continue;
+        }
+        target.push(value.clone());
+    }
+}
+
+fn extend_unique_network_artifacts(
+    target: &mut Vec<VirusTotalNetworkArtifact>,
+    values: &[VirusTotalNetworkArtifact],
+) {
+    for value in values {
+        if target.len() >= BEHAVIOR_VALUE_LIMIT || target.contains(value) {
+            continue;
+        }
+        target.push(value.clone());
+    }
+}
+
+fn limited_artifacts<T>(mut artifacts: Vec<T>) -> Vec<T> {
+    artifacts.truncate(BEHAVIOR_VALUE_LIMIT);
+    artifacts
 }
 
 fn is_noisy_virustotal_behavior_value(value: &str) -> bool {
@@ -549,43 +911,6 @@ fn integer_field(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
     keys.iter()
         .filter_map(|key| value.get(*key))
         .find_map(serde_json::Value::as_i64)
-}
-
-fn field_strings(value: &serde_json::Value, keys: &[&str]) -> Vec<String> {
-    let mut output = Vec::new();
-    for key in keys {
-        if let Some(field_value) = value.get(*key) {
-            collect_json_strings(field_value, &mut output);
-        }
-    }
-    unique_limited(output)
-}
-
-fn collect_json_strings(value: &serde_json::Value, output: &mut Vec<String>) {
-    if output.len() >= BEHAVIOR_VALUE_LIMIT {
-        return;
-    }
-    match value {
-        serde_json::Value::String(text) => output.push(truncate_behavior_string(text)),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_json_strings(value, output);
-                if output.len() >= BEHAVIOR_VALUE_LIMIT {
-                    break;
-                }
-            }
-        }
-        serde_json::Value::Object(object) => {
-            for value in object.values() {
-                collect_json_strings(value, output);
-                if output.len() >= BEHAVIOR_VALUE_LIMIT {
-                    break;
-                }
-            }
-        }
-        serde_json::Value::Number(number) => output.push(number.to_string()),
-        _ => {}
-    }
 }
 
 fn json_string(value: &serde_json::Value) -> Option<&str> {
@@ -806,26 +1131,40 @@ mod tests {
             attributes: serde_json::json!({
                 "sandbox_name": "Zenbox",
                 "verdict": "malicious",
-                "contacted_ips": ["203.0.113.10"],
-                "contacted_domains": ["example.invalid"],
-                "contacted_urls": ["https://example.invalid/payload"],
-                "dropped_files": [{"sha256": "abc123", "path": "C:\\\\Temp\\\\x.dll"}],
-                "files_written": ["C:\\\\Temp\\\\x.dll"],
-                "processes_created": [{"command_line": "java -jar sample.jar"}],
-                "command_executions": ["cmd.exe /c whoami"],
-                "dns_lookups": ["example.invalid"]
+                "process_tree": [
+                    {"pid": 10, "command_line": "java -jar sample.jar"},
+                    {"pid": 11, "ppid": 10, "command_line": "powershell.exe -enc AAAA"}
+                ],
+                "dropped_files": [{"path": "C:\\\\Temp\\\\x.dll", "process_id": 11}],
+                "ip_traffic": [{
+                    "destination_ip": "203.0.113.10",
+                    "domain": "example.invalid",
+                    "url": "https://example.invalid/payload",
+                    "destination_port": 443,
+                    "protocol": "tcp",
+                    "process_id": 11
+                }]
             }),
         }]);
 
         assert_eq!(behavior.available, Some(true));
+        assert_eq!(behavior.behavior_confidence, Confidence::High);
         assert_eq!(behavior.reports.len(), 1);
+        assert_eq!(behavior.sample_execution.len(), 1);
+        assert_eq!(behavior.attributed_child_processes.len(), 1);
+        assert_eq!(behavior.attributed_files.len(), 1);
+        assert_eq!(behavior.attributed_network[0].port, Some(443));
+        assert_eq!(
+            behavior.attributed_network[0].protocol.as_deref(),
+            Some("tcp")
+        );
         assert!(behavior.contacted_ips.contains(&"203.0.113.10".to_owned()));
         assert!(behavior
             .contacted_domains
             .contains(&"example.invalid".to_owned()));
         assert!(behavior
-            .command_executions
-            .contains(&"cmd.exe /c whoami".to_owned()));
+            .processes_created
+            .contains(&"powershell.exe -enc AAAA".to_owned()));
     }
 
     #[test]
@@ -862,13 +1201,16 @@ mod tests {
             }),
         }]);
 
-        assert_eq!(behavior.files_written, vec!["C:\\Temp\\payload.dll"]);
-        assert_eq!(behavior.processes_created, vec!["powershell.exe -enc AAAA"]);
-        assert_eq!(
-            behavior.command_executions,
-            vec!["java.exe -jar C:\\Users\\user\\Downloads\\unknown.jar"]
-        );
-        assert_eq!(behavior.dropped_files, vec!["/tmp/payload.bin"]);
+        assert_eq!(behavior.behavior_confidence, Confidence::Low);
+        assert!(behavior.sample_execution.is_empty());
+        assert!(behavior.attributed_child_processes.is_empty());
+        assert!(behavior.attributed_files.is_empty());
+        assert!(behavior.processes_created.is_empty());
+        assert!(behavior.files_written.is_empty());
+        assert!(behavior
+            .environment_noise
+            .iter()
+            .any(|value| value.contains("payload.dll")));
     }
 
     #[test]
@@ -880,6 +1222,12 @@ mod tests {
             flagged_engines: Vec::new(),
             behavior: Some(VirusTotalBehaviorInfo {
                 available: Some(true),
+                behavior_confidence: Confidence::Low,
+                sample_execution: Vec::new(),
+                attributed_child_processes: Vec::new(),
+                attributed_files: Vec::new(),
+                attributed_network: Vec::new(),
+                environment_noise: Vec::new(),
                 reports: vec![
                     VirusTotalBehaviorReport {
                         sandbox_name: Some("CAPE Sandbox".to_owned()),
@@ -973,8 +1321,13 @@ mod tests {
             }),
         }]);
 
-        assert_eq!(behavior.contacted_domains, vec!["pastebin.com"]);
-        assert_eq!(behavior.contacted_urls.len(), 2);
-        assert_eq!(behavior.dns_lookups, vec!["pastebin.com"]);
+        assert_eq!(behavior.behavior_confidence, Confidence::Low);
+        assert!(behavior.attributed_network.is_empty());
+        assert!(behavior.contacted_domains.is_empty());
+        assert!(behavior.contacted_urls.is_empty());
+        assert!(behavior
+            .environment_noise
+            .iter()
+            .any(|value| value.contains("pastebin.com")));
     }
 }

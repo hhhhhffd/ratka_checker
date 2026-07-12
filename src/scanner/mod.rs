@@ -5,5 +5,6 @@ pub mod context_recognizers;
 pub mod dataflow;
 pub mod metadata;
 pub mod native;
+pub mod obfuscation;
 pub mod scope;
 pub mod strings;

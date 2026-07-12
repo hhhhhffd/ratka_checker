@@ -6,5 +6,5 @@
   "required_findings": ["CONFIRMED_CREDENTIAL_EXFILTRATION"],
   "forbidden_findings": [],
   "expected_capabilities": [],
-  "expected_obfuscation_level": "low"
+  "expected_obfuscation_level": "none"
 }

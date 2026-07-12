@@ -46,6 +46,19 @@ curl -F "file=@mod.jar" \
   http://127.0.0.1:8080/v1/scans
 ```
 
+## Scan result model
+
+Completed responses separate neutral `capabilities` from risk-bearing
+`findings` and evidence-backed `confirmed_chains`. Each finding carries its
+scope, confidence, score contribution, and archive/class/method/offset
+evidence when available. `obfuscation` is reported independently and lowers
+analysis confidence; it is not a malicious verdict by itself. `limitations`
+describe bounded parsing or attribution gaps.
+
+`malicious` requires a confirmed dangerous chain (for example credential
+exfiltration or decoded dynamic loading) or a trusted VirusTotal detection;
+weak API matches cannot produce it by accumulation alone.
+
 ## VirusTotal
 
 VirusTotal is optional and disabled by default. Set `VIRUSTOTAL_ENABLED=true`

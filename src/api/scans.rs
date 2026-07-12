@@ -114,7 +114,11 @@ fn merge_virustotal_findings(
     findings: impl IntoIterator<Item = Finding>,
 ) -> String {
     report.findings.extend(findings);
-    let (verdict, risk_score, summary) = archive::finalize_findings(&report.findings);
+    let (verdict, risk_score, summary) = archive::finalize_report(
+        &report.findings,
+        &report.confirmed_chains,
+        &report.obfuscation,
+    );
     report.verdict = verdict;
     report.risk_score = risk_score;
     summary
@@ -244,8 +248,8 @@ mod tests {
         assert_eq!(report.capabilities, vec![capability]);
         assert_eq!(report.confidence, Confidence::High);
         assert_eq!(report.findings.len(), 1);
-        assert_eq!(report.risk_score, Severity::Critical.score_weight());
-        assert_eq!(report.verdict, Verdict::Suspicious);
+        assert_eq!(report.risk_score, 70);
+        assert_eq!(report.verdict, Verdict::Malicious);
         assert!(!summary.is_empty());
     }
 }
