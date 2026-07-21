@@ -1,4 +1,4 @@
-use ratscan_models::scan::{ConfirmedChain, Finding, ScanResponse, Severity};
+use ratscan_models::scan::{ConfirmedChain, Finding, ScanResponse, Severity, Verdict};
 
 pub const MAX_EMBED_FIELDS: usize = 25;
 pub const MAX_FIELD_CHARS: usize = 1024;
@@ -162,7 +162,10 @@ fn limitations(result: &ScanResponse, threshold: u8) -> String {
     let warning =
         result.analysis_coverage.overall_score < threshold || !result.limitations.is_empty();
     let mut lines = if warning {
-        vec!["⚠️ Файл не признан вредоносным, но анализ выполнен не полностью.".to_owned()]
+        vec![format!(
+            "⚠️ {}",
+            limitation_warning(result.verdict.as_ref())
+        )]
     } else {
         Vec::new()
     };
@@ -176,6 +179,20 @@ fn limitations(result: &ScanResponse, threshold: u8) -> String {
             .map(|value| format!("`{}` — {}", value.code, escape(&value.message))),
     );
     lines.join("\n")
+}
+
+fn limitation_warning(verdict: Option<&Verdict>) -> &'static str {
+    match verdict {
+        Some(Verdict::Suspicious) => {
+            "Обнаружены подозрительные признаки; часть анализа выполнена не полностью."
+        }
+        Some(Verdict::Malicious) => {
+            "Вредоносная цепочка подтверждена. Ограничения относятся к оставшейся части анализа и не отменяют verdict."
+        }
+        Some(Verdict::Clean) | Some(Verdict::Unknown) | None => {
+            "Файл не признан вредоносным, но анализ выполнен не полностью."
+        }
+    }
 }
 
 fn virustotal(result: &ScanResponse) -> String {
@@ -355,6 +372,52 @@ mod tests {
             .iter()
             .flat_map(|embed| &embed.fields)
             .any(|field| field.value.contains("анализ выполнен не полностью")));
+    }
+
+    #[test]
+    fn limitation_warning_is_specific_to_backend_verdict() {
+        let mut suspicious = response();
+        suspicious.verdict = Some(Verdict::Suspicious);
+        let suspicious_text = limitations(&suspicious, 80);
+        assert!(suspicious_text.contains("подозрительные признаки"));
+
+        let mut malicious = response();
+        malicious.verdict = Some(Verdict::Malicious);
+        let malicious_text = limitations(&malicious, 80);
+        assert!(malicious_text.contains("Вредоносная цепочка подтверждена"));
+        assert!(malicious_text.contains("не отменяют verdict"));
+    }
+
+    #[test]
+    fn critical_chains_are_rendered_before_high_and_capabilities() {
+        let mut value = response();
+        value.confirmed_chains = vec![
+            ConfirmedChain {
+                chain_id: "high".into(),
+                rule_id: "HIGH".into(),
+                severity: Severity::High,
+                confidence: Confidence::High,
+                score_contribution: 30,
+                operations: vec!["high".into()],
+                evidence: vec![],
+            },
+            ConfirmedChain {
+                chain_id: "critical".into(),
+                rule_id: "CRITICAL".into(),
+                severity: Severity::Critical,
+                confidence: Confidence::High,
+                score_contribution: 50,
+                operations: vec!["critical".into()],
+                evidence: vec![],
+            },
+        ];
+        let rendered = format_report(&value, &context());
+        let chains = rendered
+            .iter()
+            .flat_map(|embed| &embed.fields)
+            .find(|field| field.name == "Confirmed chains")
+            .unwrap();
+        assert!(chains.value.find("CRITICAL").unwrap() < chains.value.find("HIGH").unwrap());
     }
     #[test]
     fn report_fields_never_exceed_discord_limits() {

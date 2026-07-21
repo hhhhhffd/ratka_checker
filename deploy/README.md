@@ -5,6 +5,7 @@ This directory is the Ubuntu deployment kit for a small test VPS.
 It runs:
 
 - Rust API through systemd on `127.0.0.1:8080`;
+- optional Rust Discord gateway bot through systemd;
 - optional aiogram Telegram bot through systemd;
 - PostgreSQL on the same host.
 
@@ -47,13 +48,14 @@ The installer will:
 - create `/etc/ratscan/ratscan.env`, preserving supported values from
   `deploy/app/.env`;
 - create the PostgreSQL database and user;
-- enable `ratscan.service` and `ratscan-telegram-bot.service` when
-  `TG_BOT_TOKEN` and `ALLOWED_TG_ID` are set.
+- enable `ratscan.service`, and optional Discord/Telegram services when their
+  corresponding credentials are set.
 
 ## 3. Check service state
 
 ```sh
 systemctl status ratscan --no-pager
+systemctl status ratscan-discord --no-pager
 systemctl status ratscan-telegram-bot --no-pager
 curl -s http://127.0.0.1:8080/health
 ```
@@ -62,17 +64,23 @@ Logs:
 
 ```sh
 journalctl -u ratscan -f
+journalctl -u ratscan-discord -f
 journalctl -u ratscan-telegram-bot -f
 ```
 
 ## 4. Runtime paths
 
 - API binary: `/opt/ratscan/bin/ratscan`
+- Discord binary: `/opt/ratscan/bin/ratscan-discord`
 - scanner config: `/opt/ratscan/config/rules.yaml`
 - uploaded files: `/opt/ratscan/storage`
 - Telegram bot: `/opt/ratscan/telegram_bot`
 - Telegram bot venv: `/opt/ratscan/telegram-venv`
 - environment: `/etc/ratscan/ratscan.env`
+
+For a one-time import of legacy `ds-bot` settings, run the bundled script after
+installation with the database URL from `/etc/ratscan/ratscan.env`. It is
+idempotent and does not import legacy scan history.
 
 ## 5. Update an existing VPS
 
@@ -103,7 +111,7 @@ The updater:
 - does not touch PostgreSQL;
 - backs up the old binary/config/Telegram bot under `/opt/ratscan/update-backup-*`;
 - installs the new binary, `rules.yaml`, Telegram bot, and systemd units;
-- restarts `ratscan` and `ratscan-telegram-bot` when bot env is configured;
+- restarts `ratscan` and optional Discord/Telegram bots when their env is configured;
 - checks `http://127.0.0.1:8080/health`;
 - rolls files back if the update fails before the health check.
 
@@ -112,6 +120,7 @@ Useful checks after update:
 ```sh
 systemctl status ratscan --no-pager
 journalctl -u ratscan -n 100 --no-pager
+journalctl -u ratscan-discord -n 100 --no-pager
 curl -s http://127.0.0.1:8080/health
 ```
 

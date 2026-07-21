@@ -129,6 +129,10 @@ DISCORD_PER_GUILD_SCANS_PER_MINUTE=30
 Start all local services with `docker compose up --build`. The Discord service
 uses `/health` and requires `{"status":"ok"}` before reporting API health.
 
-The legacy `ds-bot` remains temporarily as a parity reference. It must not run
-against the shared database and is removed only after its checklist and
-Discord-facing integration tests are complete.
+To import settings from a previous `ds-bot` installation after the SQL
+migrations have run, use `DATABASE_URL=... scripts/migrate_discord_settings.sh`.
+The script imports only guild settings and never imports legacy scan history,
+because those rows cannot be safely mapped to UUID scans.
+
+See [the Discord parity checklist](docs/discord-parity-checklist.md) for the
+automated and staging verification matrix.

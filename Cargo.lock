@@ -1629,6 +1629,7 @@ name = "ratscan-discord"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "futures",
  "ratscan-models",
  "ratscan-storage",

@@ -1,7 +1,10 @@
 //! Discord-specific orchestration for RatScan. Scanner verdicts remain backend-owned.
 
 pub mod api_client;
+pub mod pipeline;
 pub mod report;
+pub mod routing;
+pub mod settings;
 pub mod throttling;
 
 use std::str::FromStr;
@@ -21,6 +24,33 @@ pub enum ThreadName {
     Suspicious,
     Danger,
     Error,
+}
+
+/// Selects a name for the single thread created for all JARs on one message.
+/// Failed attachments never hide a successful result, but an all-failure batch
+/// must remain visibly actionable.
+pub fn aggregate_thread_name<I>(verdicts: I) -> ThreadName
+where
+    I: IntoIterator<Item = Option<ratscan_models::scan::Verdict>>,
+{
+    let mut best = None;
+    for verdict in verdicts.into_iter().flatten() {
+        let rank = match verdict {
+            ratscan_models::scan::Verdict::Malicious => 3,
+            ratscan_models::scan::Verdict::Suspicious => 2,
+            ratscan_models::scan::Verdict::Clean => 1,
+            ratscan_models::scan::Verdict::Unknown => 0,
+        };
+        if best.is_none_or(|current| rank > current) {
+            best = Some(rank);
+        }
+    }
+    match best {
+        Some(3) => ThreadName::Danger,
+        Some(2) => ThreadName::Suspicious,
+        Some(1) => ThreadName::Clean,
+        _ => ThreadName::Error,
+    }
 }
 
 impl ThreadName {
@@ -150,5 +180,18 @@ mod tests {
         assert!(channel_is_allowed(&[10], &[], 10, None));
         assert!(channel_is_allowed(&[], &[20], 10, Some(20)));
         assert!(!channel_is_allowed(&[], &[20], 10, None));
+    }
+
+    #[test]
+    fn aggregate_verdict_prefers_the_most_dangerous_successful_result() {
+        assert_eq!(
+            aggregate_thread_name([Some(Verdict::Clean), Some(Verdict::Malicious), None]),
+            ThreadName::Danger
+        );
+        assert_eq!(
+            aggregate_thread_name([None, Some(Verdict::Suspicious), Some(Verdict::Clean)]),
+            ThreadName::Suspicious
+        );
+        assert_eq!(aggregate_thread_name([None, None]), ThreadName::Error);
     }
 }

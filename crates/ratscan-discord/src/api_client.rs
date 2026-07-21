@@ -5,7 +5,7 @@ use std::{
 
 use futures::StreamExt;
 use ratscan_models::scan::{ScanResponse, ScanStatus};
-use reqwest::{multipart, StatusCode};
+use reqwest::{multipart, RequestBuilder, Response, StatusCode};
 use thiserror::Error;
 use tokio::{sync::Semaphore, time::sleep};
 
@@ -23,6 +23,8 @@ pub struct ApiClientConfig {
 pub enum ApiClientError {
     #[error("Discord CDN download failed: {0}")]
     DiscordCdn(#[source] reqwest::Error),
+    #[error("Discord CDN returned HTTP {status}")]
+    DiscordCdnHttp { status: StatusCode },
     #[error("attachment exceeds configured maximum size")]
     AttachmentTooLarge,
     #[error("RatScan API is unavailable: {0}")]
@@ -83,13 +85,13 @@ impl ScanApiClient {
             return Err(ApiClientError::AttachmentTooLarge);
         }
         let response = self
-            .client
-            .get(url)
-            .send()
+            .send_with_retry(deadline_from_now(self.config.scan_timeout), || {
+                self.client.get(url)
+            })
             .await
             .map_err(ApiClientError::DiscordCdn)?;
         if !response.status().is_success() {
-            return Err(ApiClientError::HttpFailure {
+            return Err(ApiClientError::DiscordCdnHttp {
                 status: response.status(),
             });
         }
@@ -126,13 +128,16 @@ impl ScanApiClient {
         filename: &str,
         deadline: Instant,
     ) -> Result<ScanResponse, ApiClientError> {
-        let part = multipart::Part::bytes(bytes)
-            .file_name(filename.to_owned())
-            .mime_str("application/java-archive")
-            .map_err(ApiClientError::InvalidResponse)?;
-        let form = multipart::Form::new().part("file", part);
         self.request_json(
-            self.client.post(self.url("/v1/scans")).multipart(form),
+            || {
+                let part = multipart::Part::bytes(bytes.clone())
+                    .file_name(filename.to_owned())
+                    .mime_str("application/java-archive")
+                    .expect("fixed JAR MIME type is valid");
+                self.client
+                    .post(self.url("/v1/scans"))
+                    .multipart(multipart::Form::new().part("file", part))
+            },
             deadline,
         )
         .await
@@ -160,8 +165,10 @@ impl ScanApiClient {
             .await;
             response = self
                 .request_json(
-                    self.client
-                        .get(self.url(&format!("/v1/scans/{}", response.scan_id))),
+                    || {
+                        self.client
+                            .get(self.url(&format!("/v1/scans/{}", response.scan_id)))
+                    },
                     deadline,
                 )
                 .await?;
@@ -170,12 +177,11 @@ impl ScanApiClient {
 
     async fn request_json(
         &self,
-        request: reqwest::RequestBuilder,
+        request: impl Fn() -> RequestBuilder,
         deadline: Instant,
     ) -> Result<ScanResponse, ApiClientError> {
-        let response = request
-            .timeout(deadline.saturating_duration_since(Instant::now()))
-            .send()
+        let response = self
+            .send_with_retry(deadline, request)
             .await
             .map_err(ApiClientError::ApiUnavailable)?;
         if !response.status().is_success() {
@@ -191,5 +197,185 @@ impl ScanApiClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.config.base_url.trim_end_matches('/'), path)
+    }
+
+    async fn send_with_retry(
+        &self,
+        deadline: Instant,
+        request: impl Fn() -> RequestBuilder,
+    ) -> Result<Response, reqwest::Error> {
+        const RETRY_DELAYS: [Duration; 2] =
+            [Duration::from_millis(100), Duration::from_millis(300)];
+
+        for retry_delay in RETRY_DELAYS
+            .into_iter()
+            .chain(std::iter::once(Duration::ZERO))
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return request().timeout(Duration::ZERO).send().await;
+            }
+            match request().timeout(remaining).send().await {
+                Ok(response)
+                    if is_retryable_status(response.status()) && !retry_delay.is_zero() =>
+                {
+                    sleep(retry_delay.min(deadline.saturating_duration_since(Instant::now())))
+                        .await;
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if is_retryable_network_error(&error) && !retry_delay.is_zero() => {
+                    sleep(retry_delay.min(deadline.saturating_duration_since(Instant::now())))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("retry loop always returns on its final attempt")
+    }
+}
+
+fn deadline_from_now(timeout: Duration) -> Instant {
+    Instant::now() + timeout
+}
+
+pub fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+pub fn is_retryable_network_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashSet,
+        net::SocketAddr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
+
+    use axum::{
+        extract::State,
+        http::StatusCode as AxumStatusCode,
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn retries_only_temporary_http_statuses() {
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[derive(Clone)]
+    struct MockApiState {
+        polls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct InMemoryDiscordContextStore {
+        contexts: Mutex<HashSet<(uuid::Uuid, u64)>>,
+    }
+
+    impl InMemoryDiscordContextStore {
+        fn insert(&self, scan_id: uuid::Uuid, message_id: u64) -> bool {
+            self.contexts.lock().unwrap().insert((scan_id, message_id))
+        }
+    }
+
+    async fn attachment() -> impl IntoResponse {
+        (
+            AxumStatusCode::OK,
+            [("content-type", "application/java-archive")],
+            vec![1_u8, 2, 3],
+        )
+    }
+
+    async fn create_scan() -> Json<serde_json::Value> {
+        Json(scan_response("pending"))
+    }
+
+    async fn get_scan(State(state): State<MockApiState>) -> Json<serde_json::Value> {
+        let status = if state.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            "pending"
+        } else {
+            "done"
+        };
+        Json(scan_response(status))
+    }
+
+    fn scan_response(status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "scan_id": "00000000-0000-0000-0000-000000000000", "status": status, "sha256": "abc",
+            "verdict": if status == "done" { serde_json::Value::String("clean".into()) } else { serde_json::Value::Null },
+            "risk_score": 0, "confidence": "high", "obfuscation_score": 0,
+            "analysis_coverage": {"score": 100, "overall_score": 100, "total_classes": 1, "parsed_classes": 1, "total_resources": 0, "analyzed_resources": 0},
+            "capabilities": [], "decoded_strings": [], "text_resources": [], "findings": [], "confirmed_chains": [],
+            "obfuscation": {"level": "none", "score": 0}, "limitations": []
+        })
+    }
+
+    #[tokio::test]
+    async fn mock_http_scan_flow_downloads_uploads_polls_reports_and_persists_context() {
+        let state = MockApiState {
+            polls: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/attachment.jar", get(attachment))
+            .route("/v1/scans", post(create_scan))
+            .route("/v1/scans/{id}", get(get_scan))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = ScanApiClient::new(ApiClientConfig {
+            base_url: format!("http://{address}"),
+            max_attachment_bytes: 1024,
+            scan_timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(1),
+            health_timeout: Duration::from_secs(1),
+            max_concurrent_scans: 1,
+        })
+        .unwrap();
+        let bytes = client
+            .download_attachment(&format!("http://{address}/attachment.jar"), Some(3))
+            .await
+            .unwrap();
+        let scan = client.scan_attachment(bytes, "mod.jar").await.unwrap();
+        assert_eq!(scan.status, ScanStatus::Done);
+        assert_eq!(state.polls.load(Ordering::SeqCst), 2);
+        let contexts = InMemoryDiscordContextStore::default();
+        assert!(contexts.insert(scan.scan_id, 42));
+        let report = crate::report::format_report(
+            &scan,
+            &crate::report::ReportContext {
+                filename: "mod.jar".into(),
+                author_id: 1,
+                channel_id: 2,
+                thread_url: "thread".into(),
+                coverage_warning_threshold: 80,
+                report_virustotal: false,
+                report_behavior: false,
+            },
+        );
+        assert!(!report.is_empty());
+        server.abort();
     }
 }

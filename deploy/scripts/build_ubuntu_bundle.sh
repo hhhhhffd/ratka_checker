@@ -13,6 +13,7 @@ rm -rf "$APP_DIR/config" "$APP_DIR/telegram_bot"
 install -d -m 0755 "$APP_DIR"
 install -m 0755 target/release/ratscan "$APP_DIR/ratscan"
 install -m 0755 target/release/ratscan-discord "$APP_DIR/ratscan-discord"
+install -m 0755 scripts/migrate_discord_settings.sh "$APP_DIR/migrate_discord_settings.sh"
 cp -R config "$APP_DIR/config"
 cp -R telegram_bot "$APP_DIR/telegram_bot"
 rm -f "$APP_DIR/telegram_bot/Dockerfile"
@@ -38,6 +39,8 @@ sudo bash scripts/install_ubuntu.sh
 The installer uses this directory:
 
 - `ratscan` - release API binary;
+- `ratscan-discord` - release Discord gateway binary;
+- `migrate_discord_settings.sh` - optional legacy Discord settings import;
 - `config/rules.yaml` - scanner rules;
 - `telegram_bot/` - independent aiogram Telegram client;
 - `.env` - optional local secrets copied by `build_ubuntu_bundle.sh`.
