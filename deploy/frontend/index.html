@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RatScan development UI</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101418; color: #edf2f7; }
+      * { box-sizing: border-box; } body { margin: 0; }
+      main { width: min(840px, calc(100% - 32px)); margin: 48px auto; }
+      header, .result-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+      .muted { color: #a9b4c0; } .status { border: 1px solid #455363; border-radius: 999px; padding: 6px 10px; font-size: .85rem; }
+      .ok { border-color: #27845d; color: #8ce0b7; } .error { border-color: #ae4a4a; color: #ffacac; }
+      .panel { margin-top: 20px; padding: 22px; border: 1px solid #2c3743; border-radius: 12px; background: #182029; }
+      label { display: grid; gap: 8px; font-weight: 700; } input { color: inherit; }
+      button { margin-top: 16px; border: 0; border-radius: 8px; padding: 10px 14px; background: #33a06f; color: #07140e; font: inherit; font-weight: 800; cursor: pointer; }
+      button:disabled { background: #65717d; cursor: wait; }
+      dl { display: grid; grid-template-columns: 150px 1fr; gap: 10px 16px; margin: 20px 0 0; } dt { color: #a9b4c0; }
+      dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }
+      .verdict { text-transform: uppercase; font-weight: 900; } .clean { color: #8ce0b7; } .suspicious { color: #ffd277; } .malicious { color: #ff9696; } .unknown { color: #b9c5ff; }
+      #message { margin: 16px 0 0; white-space: pre-wrap; } #findings { display: grid; gap: 10px; margin-top: 20px; }
+      .finding { padding: 12px; border-left: 3px solid #4b5b6d; background: #121920; } .finding strong, .finding span { display: block; } .finding span { margin-top: 5px; color: #c6d0dc; }
+      [hidden] { display: none; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><h1>RatScan</h1><p class="muted">Development upload UI</p></div>
+        <span id="health" class="status">Checking API</span>
+      </header>
+      <section class="panel">
+        <form id="scan-form">
+          <label for="file">JAR file <input id="file" name="file" type="file" accept=".jar,application/java-archive" required></label>
+          <button id="submit" type="submit">Scan file</button>
+        </form>
+        <p id="message" class="muted">Choose a JAR to start a scan.</p>
+      </section>
+      <section id="result" class="panel" hidden>
+        <div class="result-header"><h2>Scan result</h2><strong id="verdict" class="verdict">pending</strong></div>
+        <dl>
+          <dt>Scan ID</dt><dd id="scan-id">-</dd><dt>Status</dt><dd id="scan-status">-</dd>
+          <dt>Risk</dt><dd id="risk">-</dd><dt>SHA-256</dt><dd id="sha256">-</dd>
+        </dl>
+        <p id="summary" class="muted"></p><div id="findings"></div>
+      </section>
+    </main>
+    <script>
+      const form = document.querySelector("#scan-form");
+      const fileInput = document.querySelector("#file");
+      const submit = document.querySelector("#submit");
+      const message = document.querySelector("#message");
+      const result = document.querySelector("#result");
+      const fields = {
+        verdict: document.querySelector("#verdict"), scanId: document.querySelector("#scan-id"),
+        status: document.querySelector("#scan-status"), risk: document.querySelector("#risk"),
+        sha256: document.querySelector("#sha256"), summary: document.querySelector("#summary"),
+        findings: document.querySelector("#findings"),
+      };
+      let pollController;
+
+      checkHealth();
+      form.addEventListener("submit", upload);
+
+      async function checkHealth() {
+        const indicator = document.querySelector("#health");
+        try {
+          const response = await fetch("/health", { cache: "no-store" });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          indicator.textContent = "API online"; indicator.className = "status ok";
+        } catch {
+          indicator.textContent = "API offline"; indicator.className = "status error";
+        }
+      }
+
+      async function upload(event) {
+        event.preventDefault();
+        const file = fileInput.files[0];
+        if (!file || !file.name.toLowerCase().endsWith(".jar")) return showMessage("Choose a .jar file.", true);
+        pollController?.abort(); submit.disabled = true; showMessage(`Uploading ${file.name}...`);
+        const body = new FormData(); body.append("file", file);
+        try {
+          const scan = await request("/api/scans", { method: "POST", body });
+          render(scan); if (scan.status === "pending") await poll(scan.scan_id);
+        } catch (error) {
+          showMessage(error.message, true);
+        } finally {
+          submit.disabled = false;
+        }
+      }
+
+      async function poll(scanId) {
+        pollController = new AbortController();
+        while (!pollController.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          const scan = await request(`/api/scans/${scanId}`, { signal: pollController.signal });
+          render(scan); if (scan.status !== "pending") return;
+        }
+      }
+
+      async function request(url, options = {}) {
+        const response = await fetch(url, options); const text = await response.text();
+        let payload = null;
+        try { payload = text ? JSON.parse(text) : null; } catch { throw new Error("Invalid JSON from API"); }
+        if (!response.ok) throw new Error(payload?.message || payload?.error || `HTTP ${response.status}`);
+        return payload;
+      }
+
+      function render(scan) {
+        result.hidden = false; const verdict = scan.verdict || "pending";
+        fields.verdict.textContent = verdict; fields.verdict.className = `verdict ${verdict}`;
+        fields.scanId.textContent = scan.scan_id || "-"; fields.status.textContent = scan.status || "-";
+        fields.risk.textContent = `${scan.risk_score || 0} / 100`; fields.sha256.textContent = scan.sha256 || "-";
+        fields.summary.textContent = scan.summary || "Scan is running."; fields.findings.replaceChildren();
+        for (const finding of (scan.findings || []).slice(0, 20)) {
+          const item = document.createElement("article"); item.className = "finding";
+          const title = document.createElement("strong"); title.textContent = `${finding.rule_id} · ${finding.severity}`;
+          const description = document.createElement("span"); description.textContent = finding.message;
+          item.append(title, description); fields.findings.append(item);
+        }
+      }
+
+      function showMessage(text, isError = false) { message.textContent = text; message.className = isError ? "status error" : "muted"; }
+    </script>
+  </body>
+</html>
