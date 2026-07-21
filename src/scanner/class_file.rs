@@ -1088,8 +1088,10 @@ fn has_backward_goto(code: &[u8], opcode: u8, operand_len: usize) -> bool {
 
 fn opcode_length(opcode: u8, code: &[u8], offset: usize) -> Option<usize> {
     match opcode {
-        0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => Some(2),
-        0x13 | 0x14 | 0x84 | 0x99..=0xa8 | 0xbb..=0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 => Some(3),
+        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => Some(2),
+        0x11 | 0x13 | 0x14 | 0x84 | 0x99..=0xa8 | 0xbb..=0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 => {
+            Some(3)
+        }
         0xb2..=0xb8 => Some(3),
         0xc5 => Some(4),
         0xb9 | 0xba | 0xc8 | 0xc9 => Some(5),
@@ -1290,6 +1292,17 @@ mod tests {
                 "https://example.invalid/payload".to_owned()
             ))]
         );
+    }
+
+    #[test]
+    fn decodes_bipush_and_sipush_with_their_operands() {
+        let code = [0x10, 0x7f, 0x11, 0x01, 0x00, 0xb1];
+
+        let method = super::parse_method_code(&[], &code, "example/Test", "numbers", "()V")
+            .expect("bounded static parse must succeed");
+
+        assert_eq!(method.instructions[0].operands, vec![0x7f]);
+        assert_eq!(method.instructions[1].operands, vec![0x01, 0x00]);
     }
 
     #[test]

@@ -801,7 +801,8 @@ impl ConstantPoolBuilder {
 mod tests {
     use super::*;
     use crate::models::scan::{
-        Capability, Confidence, Finding, Obfuscation, ObfuscationLevel, ScanReport,
+        AnalysisCoverage, Capability, Confidence, Finding, Obfuscation, ObfuscationLevel,
+        ScanReport,
     };
     use crate::scanner::class_file::{parse_class_file, ClassFileData};
     use std::io::Read;
@@ -858,6 +859,8 @@ mod tests {
                 verdict: Verdict::Clean,
                 risk_score: 0,
                 confidence: Confidence::High,
+                obfuscation_score: 0,
+                analysis_coverage: AnalysisCoverage::default(),
                 capabilities: vec![Capability {
                     rule_id: "CONFIG_FILE_WRITE".to_owned(),
                     message: String::new(),

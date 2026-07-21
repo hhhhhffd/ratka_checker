@@ -2,7 +2,7 @@
   "name": "Discord RPC native integration",
   "scenario": "discord_rpc",
   "expected_verdict": ["clean", "suspicious"],
-  "risk_score": { "min": 5, "max": 20 },
+  "risk_score": { "min": 0, "max": 0 },
   "required_findings": [],
   "forbidden_findings": ["NATIVE_LIB_REMOTE_LOAD"],
   "expected_capabilities": ["EMBEDDED_NATIVE_LIBRARY", "PROCESS_BUILDER"],

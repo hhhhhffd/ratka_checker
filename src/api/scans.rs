@@ -212,7 +212,8 @@ fn validate_filename(filename: &str) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use crate::models::scan::{
-        Capability, Confidence, Finding, Obfuscation, ScanReport, Severity, Verdict,
+        AnalysisCoverage, Capability, Confidence, Finding, Obfuscation, ScanReport, Severity,
+        Verdict,
     };
 
     use super::merge_virustotal_findings;
@@ -228,6 +229,8 @@ mod tests {
             verdict: Verdict::Clean,
             risk_score: 0,
             confidence: Confidence::High,
+            obfuscation_score: 0,
+            analysis_coverage: AnalysisCoverage::default(),
             capabilities: vec![capability.clone()],
             findings: Vec::new(),
             confirmed_chains: Vec::new(),

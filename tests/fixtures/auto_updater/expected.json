@@ -1,8 +1,8 @@
 {
   "name": "JAR auto updater",
   "scenario": "auto_updater",
-  "expected_verdict": "suspicious",
-  "risk_score": { "min": 15, "max": 30 },
+  "expected_verdict": "malicious",
+  "risk_score": { "min": 70, "max": 100 },
   "required_findings": ["AUTO_UPDATER_WITHOUT_HASH_CHECK"],
   "forbidden_findings": [],
   "expected_capabilities": ["AUTO_UPDATER_DOWNLOAD", "AUTO_UPDATER_WRITE_JAR", "AUTO_UPDATER_LAUNCH"],

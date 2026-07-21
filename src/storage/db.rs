@@ -5,9 +5,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::scan::{
-    Capability, CodeScope, Confidence, ConfirmedChain, Finding, FindingKind, Limitation,
-    Obfuscation, ScanReport, ScanResponse, ScanStatus, Severity, Verdict, VirusTotalReport,
-    VirusTotalSource,
+    AnalysisCoverage, Capability, CodeScope, Confidence, ConfirmedChain, Finding, FindingKind,
+    Limitation, Obfuscation, ScanReport, ScanResponse, ScanStatus, Severity, Verdict,
+    VirusTotalReport, VirusTotalSource,
 };
 use crate::virustotal;
 
@@ -21,6 +21,7 @@ pub struct ScanRow {
     pub risk_score: i32,
     pub confidence: String,
     pub obfuscation: serde_json::Value,
+    pub analysis_coverage: serde_json::Value,
 }
 
 /// Database row for findings before conversion into typed API/domain objects.
@@ -112,7 +113,7 @@ pub async fn find_latest_scan_by_sha256(
 ) -> anyhow::Result<Option<ScanResponse>> {
     let row = sqlx::query_as::<_, ScanRow>(
         r#"
-        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation
+        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation, analysis_coverage
         FROM scans
         WHERE sha256 = $1
         ORDER BY created_at DESC
@@ -133,7 +134,7 @@ pub async fn find_latest_scan_by_sha256(
 pub async fn find_scan_by_id(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Option<ScanResponse>> {
     let row = sqlx::query_as::<_, ScanRow>(
         r#"
-        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation
+        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation, analysis_coverage
         FROM scans
         WHERE id = $1
         LIMIT 1
@@ -193,10 +194,12 @@ pub async fn complete_scan_report(
 ) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     let obfuscation = serde_json::to_value(&report.obfuscation)?;
+    let analysis_coverage = serde_json::to_value(&report.analysis_coverage)?;
     sqlx::query(
         r#"
         UPDATE scans SET status = 'done', verdict = $2, risk_score = $3, summary = $4,
-            confidence = $5, obfuscation = $6, error_code = NULL, error_message = NULL,
+            confidence = $5, obfuscation = $6, analysis_coverage = $7,
+            error_code = NULL, error_message = NULL,
             updated_at = now(), completed_at = now()
         WHERE id = $1
         "#,
@@ -207,6 +210,7 @@ pub async fn complete_scan_report(
     .bind(summary)
     .bind(report.confidence.as_str())
     .bind(obfuscation)
+    .bind(analysis_coverage)
     .execute(&mut *tx)
     .await?;
     replace_findings(&mut tx, scan_id, &report.findings).await?;
@@ -456,6 +460,8 @@ async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<
         verdict: scan.verdict.as_deref().map(Verdict::from_db).transpose()?,
         risk_score: scan.risk_score.clamp(0, 100) as u8,
         confidence: Confidence::from_db(&scan.confidence)?,
+        obfuscation_score: serde_json::from_value::<Obfuscation>(scan.obfuscation.clone())?.score,
+        analysis_coverage: serde_json::from_value::<AnalysisCoverage>(scan.analysis_coverage)?,
         capabilities,
         findings,
         confirmed_chains,

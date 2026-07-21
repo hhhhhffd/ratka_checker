@@ -16,13 +16,181 @@ const DESKTOP_OPEN_CONFIG_DIRECTORY_RULE_ID: &str = "DESKTOP_OPEN_CONFIG_DIRECTO
 const GENERIC_NAMESPACE_RULE_ID: &str = "GENERIC_OR_UNUSUAL_NAMESPACE";
 const THREAD_SLEEP_RULE_ID: &str = "THREAD_SLEEP";
 const LONG_SLEEP_RULE_ID: &str = "LONG_SLEEP";
+const TIMESTAMP_OUTLIER_RULE_ID: &str = "TIMESTAMP_OUTLIER";
+const RAW_GITHUB_URL_RULE_ID: &str = "RAW_GITHUB_URL";
 
 const FILES_WRITE_RULE_ID: &str = "FILES_WRITE";
 const DESKTOP_GET_DESKTOP_RULE_ID: &str = "DESKTOP_GET_DESKTOP";
 const MODID_PACKAGE_MISMATCH_RULE_ID: &str = "MODID_PACKAGE_MISMATCH";
 const SYSTEM_LOAD_RULE_ID: &str = "SYSTEM_LOAD";
 const SYSTEM_LOAD_LIBRARY_RULE_ID: &str = "SYSTEM_LOAD_LIBRARY";
-const REFLECTION_METHOD_INVOKE_RULE_ID: &str = "REFLECTION_METHOD_INVOKE";
+
+type NeutralApiCapability = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+
+/// API references are observations, not risk findings. A chain recognizer may later
+/// connect their inputs and outputs and emit a score-bearing result.
+const NEUTRAL_API_CAPABILITIES: &[NeutralApiCapability] = &[
+    (
+        "java/lang/Runtime.exec",
+        "RUNTIME_EXEC",
+        "PROCESS_EXECUTION",
+        "Мод использует Runtime.exec; запуск опасного файла не подтверждён.",
+        "runtime_exec",
+    ),
+    (
+        "java/lang/ProcessBuilder",
+        "PROCESS_BUILDER",
+        "PROCESS_BUILDER",
+        "Мод использует ProcessBuilder; запуск опасного файла не подтверждён.",
+        "process_builder",
+    ),
+    (
+        "java/net/URLClassLoader",
+        "URL_CLASS_LOADER",
+        "URL_CLASS_LOADER",
+        "Мод использует URLClassLoader; удалённая загрузка кода не подтверждена.",
+        "url_class_loader",
+    ),
+    (
+        "java/lang/ClassLoader.defineClass",
+        "CLASS_LOADER_DEFINE_CLASS",
+        "CLASS_LOADER_DEFINE_CLASS",
+        "Мод определяет классы динамически; источник байтов не подтверждён.",
+        "define_class",
+    ),
+    (
+        "java/lang/reflect/Method.invoke",
+        "REFLECTION_METHOD_INVOKE",
+        "REFLECTION",
+        "Мод использует Java reflection.",
+        "reflection",
+    ),
+    (
+        "java/awt/Desktop.getDesktop",
+        "DESKTOP_GET_DESKTOP",
+        "DESKTOP_API",
+        "Мод использует Desktop API.",
+        "desktop_api",
+    ),
+    (
+        "java/lang/System.load",
+        "SYSTEM_LOAD",
+        "NATIVE_LOADING",
+        "Мод загружает native-библиотеку; удалённое происхождение не подтверждено.",
+        "system_load",
+    ),
+    (
+        "java/lang/System.loadLibrary",
+        "SYSTEM_LOAD_LIBRARY",
+        "NATIVE_LOADING",
+        "Мод загружает native-библиотеку; удалённое происхождение не подтверждено.",
+        "system_load_library",
+    ),
+    (
+        "java/nio/file/Files.write",
+        "FILES_WRITE",
+        "FILES_WRITE",
+        "Мод записывает файлы; запись полученных из сети байтов не подтверждена.",
+        "files_write",
+    ),
+    (
+        "java/io/FileOutputStream",
+        "",
+        "FILE_OUTPUT_STREAM",
+        "Мод записывает файлы через FileOutputStream; опасная цепочка не подтверждена.",
+        "file_output_stream",
+    ),
+    (
+        "java/net/Socket",
+        "SOCKET_API",
+        "SOCKET",
+        "Мод использует Socket API.",
+        "socket",
+    ),
+    (
+        "java/net/URL",
+        "URL_API",
+        "URL",
+        "Мод использует URL API.",
+        "url",
+    ),
+    (
+        "java/net/HttpURLConnection",
+        "HTTP_URL_CONNECTION",
+        "HTTP_CLIENT",
+        "Мод использует HTTP-клиент.",
+        "http_url_connection",
+    ),
+    (
+        "javax/net/ssl/HttpsURLConnection",
+        "HTTPS_URL_CONNECTION",
+        "HTTPS_CLIENT",
+        "Мод использует HTTPS-клиент.",
+        "https_url_connection",
+    ),
+    (
+        "java/net/http/HttpClient",
+        "JAVA_HTTP_CLIENT",
+        "HTTP_CLIENT",
+        "Мод использует Java HTTP-клиент.",
+        "java_http_client",
+    ),
+    (
+        "java/net/http/HttpRequest",
+        "JAVA_HTTP_REQUEST",
+        "HTTP_REQUEST",
+        "Мод создаёт HTTP-запросы.",
+        "java_http_request",
+    ),
+    (
+        "java/net/URL.openConnection",
+        "URL_OPEN_CONNECTION",
+        "URL_CONNECTION",
+        "Мод открывает сетевые соединения через URL.",
+        "url_open_connection",
+    ),
+    (
+        "okhttp3/OkHttpClient",
+        "OKHTTP_CLIENT",
+        "HTTP_CLIENT",
+        "Мод использует OkHttp-клиент.",
+        "okhttp_client",
+    ),
+    (
+        "java/util/Base64",
+        "BASE64_API",
+        "BASE64",
+        "Мод использует Base64-преобразования.",
+        "base64",
+    ),
+    (
+        "javax/crypto/Cipher",
+        "CIPHER_API",
+        "CIPHER",
+        "Мод использует криптографический Cipher API.",
+        "cipher",
+    ),
+    (
+        "javax/crypto/spec/SecretKeySpec",
+        "SECRET_KEY_SPEC",
+        "SECRET_KEY_SPEC",
+        "Мод использует SecretKeySpec.",
+        "secret_key_spec",
+    ),
+    (
+        "java/security/MessageDigest",
+        "MESSAGE_DIGEST",
+        "MESSAGE_DIGEST",
+        "Мод вычисляет криптографические хеши.",
+        "message_digest",
+    ),
+];
 
 const CONFIG_EXTENSIONS: &[&str] = &[
     ".json",
@@ -53,6 +221,15 @@ pub fn recognize(data: &ScanData) -> ContextRecognition {
     let mut result = ContextRecognition::default();
     let mut emitted_capabilities = HashSet::new();
 
+    // Standalone API matches never establish harmful behaviour. Suppress their
+    // configurable findings even if a class could not be attributed precisely;
+    // evidence-backed flow analysis remains responsible for risk findings.
+    for (_, rule_id, _, _, _) in NEUTRAL_API_CAPABILITIES {
+        if !rule_id.is_empty() {
+            result.suppressed_rule_ids.insert(rule_id);
+        }
+    }
+
     // Creating Desktop performs no externally observable operation.
     result
         .suppressed_rule_ids
@@ -73,6 +250,7 @@ pub fn recognize(data: &ScanData) -> ContextRecognition {
         recognize_sleep(class_file, &mut result, &mut emitted_capabilities);
         recognize_neutral_java_capabilities(class_file, &mut result, &mut emitted_capabilities);
     }
+    recognize_unattributed_neutral_api_capabilities(data, &mut result, &mut emitted_capabilities);
 
     for layer in data
         .archive_layers
@@ -116,6 +294,36 @@ pub fn recognize(data: &ScanData) -> ContextRecognition {
         );
     }
 
+    if data
+        .strings
+        .iter()
+        .any(|value| value.contains("raw.githubusercontent.com"))
+    {
+        result.suppressed_rule_ids.insert(RAW_GITHUB_URL_RULE_ID);
+        push_capability_once(
+            &mut result.capabilities,
+            &mut emitted_capabilities,
+            "RAW_GITHUB_URL",
+            "Мод содержит ссылку raw.githubusercontent.com; загрузка и выполнение данных не подтверждены.",
+            Vec::new(),
+        );
+    }
+
+    if data
+        .archive_signals
+        .iter()
+        .any(|signal| signal == "timestamp_outlier")
+    {
+        result.suppressed_rule_ids.insert(TIMESTAMP_OUTLIER_RULE_ID);
+        push_capability_once(
+            &mut result.capabilities,
+            &mut emitted_capabilities,
+            "BUILD_TIMESTAMP_OUTLIER",
+            "В архиве есть файл с отличающимся timestamp; это факт сборки, а не признак угрозы.",
+            Vec::new(),
+        );
+    }
+
     result
 }
 
@@ -124,34 +332,47 @@ fn recognize_neutral_java_capabilities(
     result: &mut ContextRecognition,
     emitted_capabilities: &mut HashSet<String>,
 ) {
-    if has_ref(class_file, "java/lang/reflect/Method.invoke") {
-        result
-            .suppressed_rule_ids
-            .insert(REFLECTION_METHOD_INVOKE_RULE_ID);
+    for (reference, rule_id, capability_id, message, operation) in NEUTRAL_API_CAPABILITIES {
+        if !has_ref(class_file, reference) {
+            continue;
+        }
+        if !rule_id.is_empty() {
+            result.suppressed_rule_ids.insert(rule_id);
+        }
         push_capability_once(
             &mut result.capabilities,
             emitted_capabilities,
-            "REFLECTION",
-            "Мод использует Java reflection.",
-            vec![class_evidence(class_file, "reflection", None)],
+            capability_id,
+            message,
+            vec![class_evidence(class_file, operation, None)],
         );
     }
-    if has_ref(class_file, "java/util/Base64") || has_ref(class_file, "Base64.getDecoder") {
+}
+
+/// Preserves the capability/risk separation when class attribution is incomplete.
+/// The rule engine has already limited these references to first-party code.
+fn recognize_unattributed_neutral_api_capabilities(
+    data: &ScanData,
+    result: &mut ContextRecognition,
+    emitted_capabilities: &mut HashSet<String>,
+) {
+    for (reference, rule_id, capability_id, message, _operation) in NEUTRAL_API_CAPABILITIES {
+        if !data
+            .first_party_bytecode_refs
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(reference))
+        {
+            continue;
+        }
+        if !rule_id.is_empty() {
+            result.suppressed_rule_ids.insert(rule_id);
+        }
         push_capability_once(
             &mut result.capabilities,
             emitted_capabilities,
-            "BASE64",
-            "Мод использует Base64-преобразования.",
-            vec![class_evidence(class_file, "base64", None)],
-        );
-    }
-    if has_ref(class_file, "java/lang/ProcessBuilder") {
-        push_capability_once(
-            &mut result.capabilities,
-            emitted_capabilities,
-            "PROCESS_BUILDER",
-            "Мод использует ProcessBuilder; запуск не подтверждён анализом потока данных.",
-            vec![class_evidence(class_file, "process_builder", None)],
+            capability_id,
+            message,
+            Vec::new(),
         );
     }
 }
@@ -433,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_write_keeps_the_broad_rule_even_when_another_write_is_config() {
+    fn unsafe_write_is_a_capability_until_a_chain_proves_the_written_value_is_dangerous() {
         let data = ScanData {
             class_files: vec![
                 class(
@@ -447,11 +668,15 @@ mod tests {
 
         let recognition = recognize(&data);
 
-        assert!(!recognition.suppresses("FILES_WRITE"));
+        assert!(recognition.suppresses("FILES_WRITE"));
         assert!(recognition
             .capabilities
             .iter()
             .any(|capability| capability.rule_id == "CONFIG_FILE_WRITE"));
+        assert!(recognition
+            .capabilities
+            .iter()
+            .any(|capability| capability.rule_id == "FILES_WRITE"));
     }
 
     #[test]

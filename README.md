@@ -55,9 +55,15 @@ evidence when available. `obfuscation` is reported independently and lowers
 analysis confidence; it is not a malicious verdict by itself. `limitations`
 describe bounded parsing or attribution gaps.
 
+`analysis_coverage` is a separate 0–100 completeness measure with class and
+resource counters. It is never a risk score. Standalone APIs, embedded native
+binaries, large assets, and build metadata are reported as `capabilities`; they
+become risk-bearing only when evidence links them into a dangerous chain.
+
 `malicious` requires a confirmed dangerous chain (for example credential
-exfiltration or decoded dynamic loading) or a trusted VirusTotal detection;
-weak API matches cannot produce it by accumulation alone.
+exfiltration, remote download → write → execute, or decoded dynamic loading)
+or a trusted VirusTotal detection; weak API matches cannot produce it by
+accumulation alone.
 
 ## VirusTotal
 

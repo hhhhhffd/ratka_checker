@@ -264,6 +264,20 @@ pub struct Obfuscation {
     pub signals: Vec<String>,
 }
 
+/// Measured completeness of the static-analysis pass.
+///
+/// The score is a coverage metric, not a risk signal. It lets callers distinguish
+/// an uneventful fully parsed archive from one where part of the code could not
+/// be inspected.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AnalysisCoverage {
+    pub score: u8,
+    pub total_classes: u32,
+    pub parsed_classes: u32,
+    pub total_resources: u32,
+    pub analyzed_resources: u32,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ObfuscationLevel {
@@ -290,6 +304,10 @@ pub struct ScanReport {
     pub risk_score: u8,
     #[serde(default)]
     pub confidence: Confidence,
+    #[serde(default)]
+    pub obfuscation_score: u8,
+    #[serde(default)]
+    pub analysis_coverage: AnalysisCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<Capability>,
     #[serde(default)]
@@ -588,6 +606,10 @@ pub struct ScanResponse {
     #[serde(default)]
     pub confidence: Confidence,
     #[serde(default)]
+    pub obfuscation_score: u8,
+    #[serde(default)]
+    pub analysis_coverage: AnalysisCoverage,
+    #[serde(default)]
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub findings: Vec<Finding>,
@@ -680,6 +702,8 @@ mod tests {
             verdict: Some(Verdict::Clean),
             risk_score: 0,
             confidence: Confidence::High,
+            obfuscation_score: 0,
+            analysis_coverage: AnalysisCoverage::default(),
             capabilities: Vec::new(),
             findings: Vec::new(),
             confirmed_chains: Vec::new(),
@@ -722,6 +746,8 @@ mod tests {
         .expect("legacy response deserializes");
 
         assert_eq!(response.confidence, Confidence::Medium);
+        assert_eq!(response.obfuscation_score, 0);
+        assert_eq!(response.analysis_coverage, AnalysisCoverage::default());
         assert!(response.capabilities.is_empty());
         assert_eq!(response.findings[0].scope, CodeScope::Unknown);
         assert_eq!(response.obfuscation, Obfuscation::default());

@@ -9,8 +9,8 @@ use zip::ZipArchive;
 
 use crate::{
     models::scan::{
-        Capability, CodeScope, Confidence, ConfirmedChain, Evidence, Finding, Limitation,
-        Obfuscation, ScanReport, Severity, Verdict,
+        AnalysisCoverage, Capability, CodeScope, Confidence, ConfirmedChain, Evidence, Finding,
+        Limitation, Obfuscation, ObfuscationLevel, ScanReport, Severity, Verdict,
     },
     rules::engine::RulesEngine,
     scanner::{
@@ -32,9 +32,7 @@ use crate::{
 
 const NESTED_JAR_SIGNAL: &str = "nested_jar";
 const NESTED_ZIP_SIGNAL: &str = "nested_zip";
-const NATIVE_BINARY_SIGNAL: &str = "native_binary";
 const SCRIPT_FILE_SIGNAL: &str = "script_file";
-const LARGE_ASSET_SIGNAL: &str = "large_asset";
 const INVALID_CLASS_CONSTANT_POOL_SIGNAL: &str = "invalid_class_constant_pool";
 const BYTECODE_VERSION_MISMATCH_SIGNAL: &str = "bytecode_version_mismatch";
 const TIMESTAMP_OUTLIER_SIGNAL: &str = "timestamp_outlier";
@@ -107,6 +105,8 @@ pub struct ScanData {
     /// their parent archive.
     pub archive_layers: Vec<ArchiveLayer>,
     pub resource_files: Vec<ResourceScanData>,
+    /// Neutral archive facts such as bundled native libraries and large assets.
+    pub archive_capabilities: Vec<Capability>,
     pub embedded_native_capabilities: Vec<Capability>,
 }
 
@@ -214,7 +214,7 @@ fn scan_bytes(
     let contextual_results = context_recognizers::recognize(&context.data);
     let mut findings = rules_engine.evaluate(&context.data);
     findings.retain(|finding| !contextual_results.suppresses(&finding.rule_id));
-    findings.retain(|finding| finding.rule_id != "SHORT_NAMES_WITHOUT_MIXIN");
+    findings.retain(|finding| finding.category != "obfuscation");
     findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
     let confirmed_chains = data_flow
@@ -244,7 +244,7 @@ fn scan_bytes(
             related_chain_id: confirmed_chains.first().map(|chain| chain.chain_id.clone()),
         });
     }
-    let limitations = data_flow
+    let mut limitations = data_flow
         .limitations
         .iter()
         .map(|limitation| Limitation {
@@ -253,6 +253,23 @@ fn scan_bytes(
             evidence: Vec::new(),
         })
         .collect::<Vec<_>>();
+    if !matches!(obfuscation.obfuscation.level, ObfuscationLevel::None) {
+        limitations.push(Limitation {
+            code: "OBFUSCATED_CODE".to_owned(),
+            message: "Обфускация ограничивает полноту статического анализа; для важных решений нужна ручная проверка.".to_owned(),
+            evidence: Vec::new(),
+        });
+    }
+    let analysis_coverage = analysis_coverage(&context.data);
+    if analysis_coverage.parsed_classes < analysis_coverage.total_classes {
+        limitations.push(Limitation {
+            code: "CLASS_PARSE_LIMITATION".to_owned(),
+            message:
+                "Часть class-файлов не удалось разобрать; покрытие статического анализа снижено."
+                    .to_owned(),
+            evidence: Vec::new(),
+        });
+    }
     let (verdict, risk_score, summary) =
         finalize_report(&findings, &confirmed_chains, &obfuscation.obfuscation);
 
@@ -260,10 +277,13 @@ fn scan_bytes(
         verdict: verdict.clone(),
         risk_score,
         confidence: obfuscation.confidence,
+        obfuscation_score: obfuscation.obfuscation.score,
+        analysis_coverage,
         capabilities: context
             .data
-            .embedded_native_capabilities
+            .archive_capabilities
             .into_iter()
+            .chain(context.data.embedded_native_capabilities)
             .chain(contextual_results.capabilities)
             .chain(chain_capabilities)
             .collect(),
@@ -507,7 +527,7 @@ impl ArchiveContext {
         let lower = name.to_ascii_lowercase();
         self.observe_magic_bytes(archive_id, name, &lower, bytes)?;
 
-        self.observe_asset(name, bytes);
+        self.observe_asset(archive_id, name, bytes)?;
 
         if lower.ends_with(".jar") || lower.ends_with(".zip") {
             let parent = self.archive_layer(archive_id)?;
@@ -599,31 +619,40 @@ impl ArchiveContext {
         bytes: &[u8],
     ) -> Result<(), ScanAbort> {
         if let Some(analysis) = native::inspect_native_file(name, bytes) {
-            if let Some(known_library) = analysis.known_library {
-                let archive_path = self.archive_path(archive_id)?;
-                self.data.embedded_native_capabilities.push(Capability {
-                    rule_id: "EMBEDDED_NATIVE_LIBRARY".to_owned(),
-                    message: format!("Встроенная native-библиотека {known_library:?} распознана по штатному пути загрузчика."),
-                    evidence: vec![Evidence {
-                        archive_id: archive_id.to_owned(),
-                        archive_path,
-                        class_name: None,
-                        method_name: None,
-                        method_descriptor: None,
-                        bytecode_offset: None,
-                        resource_path: Some(name.to_owned()),
-                        operation: "embedded_native_library".to_owned(),
-                        value_preview: Some(format!("{known_library:?}")),
-                        scope: CodeScope::Resource,
-                    }],
-                });
-                return Ok(());
+            let archive_path = self.archive_path(archive_id)?;
+            let (rule_id, message, value_preview) = match analysis.known_library {
+                Some(known_library) => (
+                    "EMBEDDED_NATIVE_LIBRARY",
+                    format!("Встроенная native-библиотека {known_library:?} распознана по штатному пути загрузчика."),
+                    Some(format!("{known_library:?}")),
+                ),
+                None => (
+                    "EMBEDDED_NATIVE_BINARY",
+                    "В архиве есть native-бинарный ресурс; его загрузка или выполнение не подтверждены.".to_owned(),
+                    None,
+                ),
+            };
+            let capability = Capability {
+                rule_id: rule_id.to_owned(),
+                message,
+                evidence: vec![Evidence {
+                    archive_id: archive_id.to_owned(),
+                    archive_path,
+                    class_name: None,
+                    method_name: None,
+                    method_descriptor: None,
+                    bytecode_offset: None,
+                    resource_path: Some(name.to_owned()),
+                    operation: "embedded_native_binary".to_owned(),
+                    value_preview,
+                    scope: CodeScope::Resource,
+                }],
+            };
+            if analysis.known_library.is_some() {
+                self.data.embedded_native_capabilities.push(capability);
+            } else {
+                self.data.archive_capabilities.push(capability);
             }
-        }
-        if is_native_binary(bytes) && !is_known_dependency_native_path(lower_name) {
-            self.data
-                .archive_signals
-                .push(NATIVE_BINARY_SIGNAL.to_owned());
         }
         if bytes.starts_with(b"PK\x03\x04") && !is_fabric_declared_nested_jar(lower_name) {
             self.data.archive_signals.push(NESTED_ZIP_SIGNAL.to_owned());
@@ -631,21 +660,40 @@ impl ArchiveContext {
         Ok(())
     }
 
-    fn observe_asset(&mut self, name: &str, bytes: &[u8]) {
+    fn observe_asset(
+        &mut self,
+        archive_id: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), ScanAbort> {
         if !name.to_ascii_lowercase().starts_with("assets/")
             || (bytes.len() as u64) < LARGE_ASSET_THRESHOLD_BYTES
         {
-            return;
+            return Ok(());
         }
         let analysis = asset::inspect_asset(name, bytes);
         let valid_image = analysis.detected_format.is_some()
             && analysis.extension_matches_magic
             && analysis.trailing_payload.is_none();
         if !valid_image {
-            self.data
-                .archive_signals
-                .push(LARGE_ASSET_SIGNAL.to_owned());
+            self.data.archive_capabilities.push(Capability {
+                rule_id: "LARGE_ASSET_RESOURCE".to_owned(),
+                message: "Архив содержит большой ресурс в assets/; скрытая нагрузка или выполнение не подтверждены.".to_owned(),
+                evidence: vec![Evidence {
+                    archive_id: archive_id.to_owned(),
+                    archive_path: self.archive_path(archive_id)?,
+                    class_name: None,
+                    method_name: None,
+                    method_descriptor: None,
+                    bytecode_offset: None,
+                    resource_path: Some(name.to_owned()),
+                    operation: "large_asset".to_owned(),
+                    value_preview: Some(format!("{} bytes", bytes.len())),
+                    scope: CodeScope::Resource,
+                }],
+            });
         }
+        Ok(())
     }
 
     /// Adds aggregate signals that require seeing multiple files before deciding.
@@ -999,15 +1047,6 @@ fn strings_contain_external_url(strings: &[String]) -> bool {
     })
 }
 
-fn is_native_binary(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"MZ")
-        || bytes.starts_with(b"\x7fELF")
-        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xce])
-        || bytes.starts_with(&[0xfe, 0xed, 0xfa, 0xcf])
-        || bytes.starts_with(&[0xce, 0xfa, 0xed, 0xfe])
-        || bytes.starts_with(&[0xcf, 0xfa, 0xed, 0xfe])
-}
-
 /// Returns Shannon entropy in thousandths of a bit per byte without retaining
 /// resource content after archive parsing.
 fn shannon_entropy_milli_bits(bytes: &[u8]) -> u16 {
@@ -1032,11 +1071,6 @@ fn shannon_entropy_milli_bits(bytes: &[u8]) -> u16 {
 
 fn is_fabric_declared_nested_jar(lower_name: &str) -> bool {
     lower_name.starts_with("meta-inf/jars/") && lower_name.ends_with(".jar")
-}
-
-fn is_known_dependency_native_path(lower_name: &str) -> bool {
-    (lower_name.starts_with("jni/") && lower_name.contains("jffi"))
-        || lower_name.starts_with("mediaplayerinfo/natives/")
 }
 
 fn dependency_metadata_from_archive_path(path: &str) -> DependencyMetadata {
@@ -1553,6 +1587,42 @@ fn risk_score(
         .min(100) as u8
 }
 
+/// Reports how much archive content reached the bounded static analyzers.
+fn analysis_coverage(data: &ScanData) -> AnalysisCoverage {
+    let total_classes = data
+        .archive_layers
+        .iter()
+        .flat_map(|layer| &layer.entries)
+        .filter(|entry| entry.path.to_ascii_lowercase().ends_with(".class"))
+        .count() as u32;
+    let total_resources = data
+        .archive_layers
+        .iter()
+        .flat_map(|layer| &layer.entries)
+        .filter(|entry| {
+            let path = entry.path.to_ascii_lowercase();
+            !path.ends_with(".class") && !path.ends_with(".jar") && !path.ends_with(".zip")
+        })
+        .count() as u32;
+    let parsed_classes = data.class_files.len().min(total_classes as usize) as u32;
+    let analyzed_resources = data.resource_files.len().min(total_resources as usize) as u32;
+    let total_items = total_classes + total_resources;
+    let analyzed_items = parsed_classes + analyzed_resources;
+    let score = if total_items == 0 {
+        100
+    } else {
+        (u64::from(analyzed_items) * 100 / u64::from(total_items)) as u8
+    };
+
+    AnalysisCoverage {
+        score,
+        total_classes,
+        parsed_classes,
+        total_resources,
+        analyzed_resources,
+    }
+}
+
 fn category_score_cap(category: &str) -> u16 {
     match category {
         "network" | "dangerous_api" | "obfuscation" => 5,
@@ -1564,7 +1634,7 @@ fn category_score_cap(category: &str) -> u16 {
 fn verdict_from_evidence(
     findings: &[Finding],
     confirmed_chains: &[ConfirmedChain],
-    obfuscation: &Obfuscation,
+    _obfuscation: &Obfuscation,
     risk_score: u8,
 ) -> Verdict {
     let has_malicious_chain = confirmed_chains.iter().any(|chain| {
@@ -1573,11 +1643,7 @@ fn verdict_from_evidence(
             "CONFIRMED_CREDENTIAL_EXFILTRATION"
                 | "CONFIRMED_DECODED_DYNAMIC_LOAD"
                 | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
-        ) || (chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC"
-            && matches!(
-                obfuscation.level,
-                crate::models::scan::ObfuscationLevel::High
-            ))
+        ) || chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC"
     });
     let trusted_vt_detection = findings
         .iter()
@@ -1627,6 +1693,8 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
         verdict: Verdict::Unknown,
         risk_score: 0,
         confidence: Confidence::Low,
+        obfuscation_score: 0,
+        analysis_coverage: AnalysisCoverage::default(),
         capabilities: Vec::new(),
         findings: vec![finding.clone()],
         confirmed_chains: Vec::new(),
@@ -1646,13 +1714,17 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 mod tests {
     use super::{
         add_contextual_findings, has_significant_identifier_overlap, parse_zip_bytes, risk_score,
-        summarize, ArchiveContext, ClassScanData, ScanData, ScanLimits,
+        scan_file, summarize, ArchiveContext, ClassScanData, ScanData, ScanLimits,
         EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
         TIMESTAMP_OUTLIER_SIGNAL,
     };
 
     use crate::models::scan::{CodeScope, Confidence, Finding, Obfuscation, Severity, Verdict};
-    use std::io::{Cursor, Write};
+    use crate::rules::engine::RulesEngine;
+    use std::{
+        io::{Cursor, Write},
+        path::Path,
+    };
     use zip::{write::SimpleFileOptions, DateTime, ZipWriter};
 
     /// Verifies the fixed severity weights are capped at 100.
@@ -1947,6 +2019,48 @@ mod tests {
             .data
             .archive_signals
             .contains(&TIMESTAMP_OUTLIER_SIGNAL.to_owned()));
+    }
+
+    /// Real mods previously received false positives from isolated API, asset, and namespace facts.
+    #[test]
+    fn real_mods_are_clean_without_confirmed_dangerous_chains() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let corpus = root.join("tests/realmods");
+        if !corpus.is_dir() {
+            // The real-mod corpus is intentionally local and is not required to
+            // build the scanner from a source distribution.
+            return;
+        }
+        let rules = RulesEngine::load_from_file(&root.join("config/rules.yaml"))
+            .expect("production rules load");
+        let limits = ScanLimits {
+            max_total_uncompressed_bytes: 200 * 1024 * 1024,
+            max_files_in_archive: 5_000,
+            max_nesting_depth: 3,
+            max_single_file_bytes: 50 * 1024 * 1024,
+        };
+
+        for filename in [
+            "Apple Hands.jar",
+            "Inv-Collector-v1.21.8-1.10.jar",
+            "abusevisuals-1.2.jar",
+            "playerglow.jar",
+            "shift tap.jar",
+        ] {
+            let outcome = scan_file(&corpus.join(filename), limits, &rules);
+            assert_eq!(
+                outcome.report.verdict,
+                Verdict::Clean,
+                "{filename}: {:?}",
+                outcome.report.findings
+            );
+            assert!(
+                outcome.report.findings.is_empty(),
+                "{filename}: {:?}",
+                outcome.report.findings
+            );
+            assert!(outcome.report.confirmed_chains.is_empty(), "{filename}");
+        }
     }
 
     fn test_context(class_files: Vec<ClassScanData>) -> ArchiveContext {
