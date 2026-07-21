@@ -169,6 +169,7 @@ pub async fn find_scan_by_id(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Opt
 }
 
 /// Marks a scan complete and replaces findings in one transaction to keep responses consistent.
+#[allow(dead_code)]
 pub async fn complete_scan(
     pool: &PgPool,
     scan_id: Uuid,

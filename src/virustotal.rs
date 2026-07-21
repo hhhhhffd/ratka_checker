@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant, clippy::unnecessary_lazy_evaluations)]
+
 use std::{
     collections::{HashMap, HashSet},
     net::IpAddr,

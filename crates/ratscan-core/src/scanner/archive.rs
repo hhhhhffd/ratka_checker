@@ -3139,7 +3139,7 @@ mod tests {
     /// Real mods previously received false positives from isolated API, asset, and namespace facts.
     #[test]
     fn real_mods_are_clean_without_confirmed_dangerous_chains() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let corpus = root.join("tests/realmods");
         if !corpus.is_dir() {
             // The real-mod corpus is intentionally local and is not required to

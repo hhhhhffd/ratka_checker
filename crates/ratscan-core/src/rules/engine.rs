@@ -230,7 +230,8 @@ mod tests {
     /// Verifies that the default production rules file remains loadable.
     #[test]
     fn default_rules_file_loads() {
-        let engine = RulesEngine::load_from_file(Path::new("config/rules.yaml"));
+        let rules_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules.yaml");
+        let engine = RulesEngine::load_from_file(&rules_path);
 
         assert!(engine.is_ok());
     }

@@ -6,16 +6,16 @@
 //! fixture methods contain synthetic call sequences so the static data-flow
 //! parser can be regression-tested without executing a JAR.
 
-// This standalone binary imports scanner modules directly until the application
-// exposes a library crate; the API-only model types are intentionally unused.
-#![allow(dead_code)]
-
-#[path = "../models/mod.rs"]
-mod models;
-#[path = "../rules/mod.rs"]
-mod rules;
-#[path = "../scanner/mod.rs"]
-mod scanner;
+// The regression runner consumes the same scanner crate as the API service.
+mod models {
+    pub use ratscan_core::models::*;
+}
+mod rules {
+    pub use ratscan_core::rules::*;
+}
+mod scanner {
+    pub use ratscan_core::scanner::*;
+}
 
 use std::{
     env, fs,
@@ -65,7 +65,7 @@ struct FixtureSpec {
     required_limitations: Vec<String>,
     #[serde(default)]
     forbidden_limitations: Vec<String>,
-    expected_obfuscation_level: crate::models::scan::ObfuscationLevel,
+    expected_obfuscation_level: models::scan::ObfuscationLevel,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -1136,7 +1136,7 @@ mod tests {
         let finding = Finding::legacy(
             "REQUIRED",
             "test",
-            crate::models::scan::Severity::Low,
+            models::scan::Severity::Low,
             String::new(),
         );
         let outcome = ScanOutcome {

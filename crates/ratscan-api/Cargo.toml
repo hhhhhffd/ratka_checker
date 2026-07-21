@@ -1,0 +1,13 @@
+[package]
+name = "ratscan-api-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ratscan-api"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+ratscan-api = { path = "../.." }

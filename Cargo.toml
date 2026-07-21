@@ -1,7 +1,22 @@
 [package]
-name = "ratscan"
+name = "ratscan-api"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "ratscan"
+path = "src/main.rs"
+
+[workspace]
+members = [
+    ".",
+    "crates/ratscan-models",
+    "crates/ratscan-core",
+    "crates/ratscan-storage",
+    "crates/ratscan-api",
+    "crates/ratscan-discord",
+]
+resolver = "2"
 
 [dependencies]
 anyhow = "1.0"
@@ -26,3 +41,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 zip = "2.2"
+ratscan-models = { path = "crates/ratscan-models" }
+ratscan-core = { path = "crates/ratscan-core" }

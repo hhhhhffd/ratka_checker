@@ -1,1 +1,1 @@
-pub mod scan;
+pub use ratscan_models::scan;
