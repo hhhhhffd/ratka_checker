@@ -12,7 +12,9 @@
       .muted { color: #a9b4c0; } .status { border: 1px solid #455363; border-radius: 999px; padding: 6px 10px; font-size: .85rem; }
       .ok { border-color: #27845d; color: #8ce0b7; } .error { border-color: #ae4a4a; color: #ffacac; }
       .panel { margin-top: 20px; padding: 22px; border: 1px solid #2c3743; border-radius: 12px; background: #182029; }
-      label { display: grid; gap: 8px; font-weight: 700; } input { color: inherit; }
+      .dropzone { display: grid; min-height: 160px; place-items: center; gap: 8px; border: 2px dashed #526476; border-radius: 10px; padding: 24px; cursor: pointer; text-align: center; }
+      .dropzone.dragging { border-color: #49bd85; background: #152c23; } .dropzone input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+      .dropzone strong, .dropzone span { display: block; } .dropzone span { color: #a9b4c0; font-size: .9rem; }
       button { margin-top: 16px; border: 0; border-radius: 8px; padding: 10px 14px; background: #33a06f; color: #07140e; font: inherit; font-weight: 800; cursor: pointer; }
       button:disabled { background: #65717d; cursor: wait; }
       dl { display: grid; grid-template-columns: 150px 1fr; gap: 10px 16px; margin: 20px 0 0; } dt { color: #a9b4c0; }
@@ -31,7 +33,11 @@
       </header>
       <section class="panel">
         <form id="scan-form">
-          <label for="file">JAR file <input id="file" name="file" type="file" accept=".jar,application/java-archive" required></label>
+          <label id="dropzone" class="dropzone" for="file">
+            <input id="file" name="file" type="file" accept=".jar,application/java-archive" required>
+            <strong id="file-title">Drop a .jar file here</strong>
+            <span id="file-meta">or click to choose one</span>
+          </label>
           <button id="submit" type="submit">Scan file</button>
         </form>
         <p id="message" class="muted">Choose a JAR to start a scan.</p>
@@ -48,6 +54,9 @@
     <script>
       const form = document.querySelector("#scan-form");
       const fileInput = document.querySelector("#file");
+      const dropzone = document.querySelector("#dropzone");
+      const fileTitle = document.querySelector("#file-title");
+      const fileMeta = document.querySelector("#file-meta");
       const submit = document.querySelector("#submit");
       const message = document.querySelector("#message");
       const result = document.querySelector("#result");
@@ -61,6 +70,27 @@
 
       checkHealth();
       form.addEventListener("submit", upload);
+      fileInput.addEventListener("change", updateSelectedFile);
+      for (const eventName of ["dragenter", "dragover"]) {
+        dropzone.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          dropzone.classList.add("dragging");
+        });
+      }
+      for (const eventName of ["dragleave", "drop"]) {
+        dropzone.addEventListener(eventName, (event) => {
+          event.preventDefault();
+          dropzone.classList.remove("dragging");
+        });
+      }
+      dropzone.addEventListener("drop", (event) => {
+        const file = event.dataTransfer.files[0];
+        if (!file) return;
+        const files = new DataTransfer();
+        files.items.add(file);
+        fileInput.files = files.files;
+        updateSelectedFile();
+      });
 
       async function checkHealth() {
         const indicator = document.querySelector("#health");
@@ -87,6 +117,17 @@
         } finally {
           submit.disabled = false;
         }
+      }
+
+      function updateSelectedFile() {
+        const file = fileInput.files[0];
+        if (!file) {
+          fileTitle.textContent = "Drop a .jar file here";
+          fileMeta.textContent = "or click to choose one";
+          return;
+        }
+        fileTitle.textContent = file.name;
+        fileMeta.textContent = `${formatBytes(file.size)} selected`;
       }
 
       async function poll(scanId) {
@@ -121,6 +162,14 @@
       }
 
       function showMessage(text, isError = false) { message.textContent = text; message.className = isError ? "status error" : "muted"; }
+
+      function formatBytes(bytes) {
+        const units = ["B", "KB", "MB", "GB"];
+        let value = bytes;
+        let index = 0;
+        while (value >= 1024 && index < units.length - 1) { value /= 1024; index += 1; }
+        return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+      }
     </script>
   </body>
 </html>
