@@ -247,6 +247,7 @@ impl Default for DataFlowConfig {
 pub struct DataFlowResult {
     pub confirmed_chains: Vec<ConfirmedChainCandidate>,
     pub limitations: Vec<FlowLimitation>,
+    pub analyzed_method_ids: BTreeSet<MethodId>,
     pub analyzed_methods: u32,
     pub resolved_calls: u32,
     pub unresolved_calls: u32,
@@ -262,6 +263,77 @@ pub fn analyze_method_flows(methods: &[MethodFlow], config: &DataFlowConfig) -> 
         .map(|method| method.id.clone())
         .collect::<Vec<_>>();
     analyze_method_flows_from_roots(methods, &roots, config)
+}
+
+/// Selects bounded call-tree roots around operations that can terminate a
+/// dangerous chain. Benign methods such as configuration writes never become
+/// roots by themselves.
+pub fn dangerous_flow_roots(methods: &[MethodFlow], max_depth: u8) -> Vec<MethodId> {
+    let method_index = methods
+        .iter()
+        .map(|method| (method.id.clone(), method))
+        .collect::<HashMap<_, _>>();
+    let mut callers = HashMap::<MethodId, BTreeSet<MethodId>>::new();
+    for method in methods {
+        if method.scope == CodeScope::BundledDependency {
+            continue;
+        }
+        for operation in &method.operations {
+            if let Operation::Call { callee, .. } = operation {
+                callers
+                    .entry(callee.clone())
+                    .or_default()
+                    .insert(method.id.clone());
+            }
+        }
+    }
+
+    let terminal_methods = methods
+        .iter()
+        .filter(|method| method.scope != CodeScope::BundledDependency)
+        .filter(|method| method.operations.iter().any(is_dangerous_terminal))
+        .map(|method| method.id.clone())
+        .collect::<Vec<_>>();
+    let mut roots = BTreeSet::new();
+    for terminal in terminal_methods {
+        collect_root_candidates(&terminal, max_depth, &callers, &method_index, &mut roots);
+    }
+    roots.into_iter().collect()
+}
+
+fn is_dangerous_terminal(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::NetworkSend { .. }
+            | Operation::ExecuteFile { .. }
+            | Operation::DynamicLoad { .. }
+    )
+}
+
+fn collect_root_candidates(
+    method_id: &MethodId,
+    remaining_depth: u8,
+    callers: &HashMap<MethodId, BTreeSet<MethodId>>,
+    method_index: &HashMap<MethodId, &MethodFlow>,
+    roots: &mut BTreeSet<MethodId>,
+) {
+    let eligible_callers = callers
+        .get(method_id)
+        .into_iter()
+        .flatten()
+        .filter(|caller| {
+            method_index
+                .get(*caller)
+                .is_some_and(|method| method.scope != CodeScope::BundledDependency)
+        })
+        .collect::<Vec<_>>();
+    if remaining_depth == 0 || eligible_callers.is_empty() {
+        roots.insert(method_id.clone());
+        return;
+    }
+    for caller in eligible_callers {
+        collect_root_candidates(caller, remaining_depth - 1, callers, method_index, roots);
+    }
 }
 
 /// Runs only from first-party/nested roots. Dependency methods can still be
@@ -363,6 +435,7 @@ impl<'a> Analyzer<'a> {
         }
 
         let mut locals = HashMap::<LocalId, Vec<Taint>>::new();
+        self.result.analyzed_method_ids.insert(method_id.clone());
         self.result.analyzed_methods = self.result.analyzed_methods.saturating_add(1);
         for (index, value) in arguments.into_iter().enumerate() {
             if index < method.parameter_count as usize {
@@ -656,6 +729,108 @@ mod tests {
         assert_eq!(
             result.confirmed_chains[0].kind,
             ConfirmedChainKind::DownloadWriteExecute
+        );
+    }
+
+    #[test]
+    fn demand_driven_roots_skip_configuration_only_methods() {
+        let config_id = method("saveConfig", Vec::new()).id;
+        let sender_id = MethodId {
+            method_name: "send".into(),
+            ..config_id.clone()
+        };
+        let config = MethodFlow {
+            id: config_id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![Operation::WriteFile {
+                input: 0,
+                destination: FileTarget::Known("config.json".into()),
+                evidence: evidence(&config_id, 1, "config_write"),
+            }],
+        };
+        let sender = MethodFlow {
+            id: sender_id.clone(),
+            parameter_count: 1,
+            parameter_slots: vec![0],
+            scope: CodeScope::FirstParty,
+            operations: vec![Operation::NetworkSend {
+                body: 0,
+                evidence: evidence(&sender_id, 2, "network_send"),
+            }],
+        };
+
+        let roots = dangerous_flow_roots(&[config, sender], 2);
+        assert_eq!(roots, vec![sender_id]);
+    }
+
+    #[test]
+    fn demand_driven_roots_preserve_source_to_sink_chains() {
+        let root_id = method("run", Vec::new()).id;
+        let source_id = MethodId {
+            method_name: "readCredentials".into(),
+            descriptor: "()[B".into(),
+            ..root_id.clone()
+        };
+        let sink_id = MethodId {
+            method_name: "send".into(),
+            descriptor: "([B)V".into(),
+            ..root_id.clone()
+        };
+        let root = MethodFlow {
+            id: root_id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Call {
+                    callee: source_id.clone(),
+                    arguments: Vec::new(),
+                    return_to: Some(0),
+                    evidence: evidence(&root_id, 1, "read_credentials"),
+                },
+                Operation::Call {
+                    callee: sink_id.clone(),
+                    arguments: vec![0],
+                    return_to: None,
+                    evidence: evidence(&root_id, 2, "send"),
+                },
+            ],
+        };
+        let source = MethodFlow {
+            id: source_id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Source {
+                    output: 0,
+                    kind: SourceKind::CredentialFile,
+                    evidence: evidence(&source_id, 3, "credential_read"),
+                },
+                Operation::Return { value: Some(0) },
+            ],
+        };
+        let sink = MethodFlow {
+            id: sink_id.clone(),
+            parameter_count: 1,
+            parameter_slots: vec![0],
+            scope: CodeScope::FirstParty,
+            operations: vec![Operation::NetworkSend {
+                body: 0,
+                evidence: evidence(&sink_id, 4, "network_send"),
+            }],
+        };
+        let flows = vec![root.clone(), source, sink];
+        let roots = dangerous_flow_roots(&flows, 2);
+
+        assert_eq!(roots, vec![root_id]);
+        assert!(
+            analyze_method_flows_from_roots(&flows, &roots, &DataFlowConfig::default())
+                .confirmed_chains
+                .iter()
+                .any(|chain| chain.kind == ConfirmedChainKind::CredentialExfiltration)
         );
     }
 

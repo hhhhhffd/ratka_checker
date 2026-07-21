@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::{Cursor, Read},
     path::Path,
@@ -19,9 +19,9 @@ use crate::{
         class_file::{self, ConstantValue, MethodScanData, ValueOrigin},
         context_recognizers,
         dataflow::{
-            analyze_method_flows, ConfirmedChainCandidate, ConfirmedChainKind, DataFlowConfig,
-            FileTarget, FlowEvidence, FlowLimitation, MethodFlow, MethodId, Operation, SourceKind,
-            TransformKind,
+            analyze_method_flows_from_roots, dangerous_flow_roots, ConfirmedChainCandidate,
+            ConfirmedChainKind, DataFlowConfig, FileTarget, FlowEvidence, FlowLimitation,
+            MethodFlow, MethodId, Operation, SourceKind, TransformKind,
         },
         metadata, native, obfuscation, paths,
         scope::{
@@ -256,6 +256,7 @@ fn scan_bytes(
             evidence: Vec::new(),
         });
     }
+    let limitations = aggregate_limitations(limitations);
     let (verdict, risk_score, summary) = finalize_report_with_analysis_limits(
         &findings,
         &confirmed_chains,
@@ -359,6 +360,46 @@ fn flow_limitation(limitation: &FlowLimitation) -> Limitation {
             scope: CodeScope::Unknown,
         }],
     }
+}
+
+const MAX_LIMITATION_EXAMPLES: usize = 3;
+
+/// Keeps scan reports bounded: limitations describe analyzer coverage, not one
+/// user-facing finding per bytecode location.
+fn aggregate_limitations(limitations: Vec<Limitation>) -> Vec<Limitation> {
+    let mut grouped = BTreeMap::<String, Vec<Limitation>>::new();
+    for limitation in limitations {
+        grouped
+            .entry(limitation.code.clone())
+            .or_default()
+            .push(limitation);
+    }
+    grouped
+        .into_values()
+        .map(|values| {
+            let count = values.len();
+            let first = &values[0];
+            let evidence = values
+                .iter()
+                .flat_map(|limitation| limitation.evidence.iter().cloned())
+                .take(MAX_LIMITATION_EXAMPLES)
+                .collect::<Vec<_>>();
+            let message = if count == 1 {
+                first.message.clone()
+            } else {
+                format!(
+                    "{} Всего: {count}; показаны первые {} примера.",
+                    first.message,
+                    evidence.len()
+                )
+            };
+            Limitation {
+                code: first.code.clone(),
+                message,
+                evidence,
+            }
+        })
+        .collect()
 }
 
 /// Recomputes verdict fields after callers add non-static findings such as VirusTotal signals.
@@ -1420,7 +1461,9 @@ fn analyze_scan_data_flow(data: &ScanData) -> crate::scanner::dataflow::DataFlow
                 .map(|method| method_flow_from_scan_data(class_file, method))
         })
         .collect::<Vec<_>>();
-    let mut result = analyze_method_flows(&flows, &DataFlowConfig::default());
+    let config = DataFlowConfig::default();
+    let roots = dangerous_flow_roots(&flows, config.max_interprocedural_depth);
+    let mut result = analyze_method_flows_from_roots(&flows, &roots, &config);
     for class_file in &data.class_files {
         if !matches!(
             class_file.scope,
@@ -1435,6 +1478,9 @@ fn analyze_scan_data_flow(data: &ScanData) -> crate::scanner::dataflow::DataFlow
                 method_name: method.method_name.clone(),
                 descriptor: method.descriptor.clone(),
             };
+            if !result.analyzed_method_ids.contains(&method_id) {
+                continue;
+            }
             for instruction in &method.instructions {
                 if !is_flow_supported_instruction(instruction.opcode) {
                     result
@@ -2829,8 +2875,8 @@ mod tests {
     };
 
     use crate::models::scan::{
-        AnalysisCoverage, CodeScope, Confidence, Evidence, Finding, Obfuscation, ObfuscationLevel,
-        Severity, Verdict,
+        AnalysisCoverage, CodeScope, Confidence, Evidence, Finding, Limitation, Obfuscation,
+        ObfuscationLevel, Severity, Verdict,
     };
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
@@ -2870,6 +2916,29 @@ mod tests {
         ];
 
         assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
+    }
+
+    #[test]
+    fn repeated_limitations_are_aggregated_by_code() {
+        let limitations = (0..10)
+            .map(|_| Limitation {
+                code: "INTERPROCEDURAL_DEPTH_LIMIT".into(),
+                message: "Depth limit reached.".into(),
+                evidence: Vec::new(),
+            })
+            .chain(std::iter::once(Limitation {
+                code: "UNRESOLVED_CALL".into(),
+                message: "Call could not be resolved.".into(),
+                evidence: Vec::new(),
+            }))
+            .collect();
+
+        let aggregated = super::aggregate_limitations(limitations);
+
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0].code, "INTERPROCEDURAL_DEPTH_LIMIT");
+        assert!(aggregated[0].message.contains("Всего: 10"));
+        assert_eq!(aggregated[1].code, "UNRESOLVED_CALL");
     }
 
     #[test]
