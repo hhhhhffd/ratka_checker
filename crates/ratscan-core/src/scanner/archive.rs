@@ -52,6 +52,9 @@ const NATIVE_LIB_REMOTE_LOAD_SIGNAL: &str = "native_lib_remote_load";
 const SCRIPT_DOWNLOAD_EXEC_SIGNAL: &str = "script_download_exec";
 const EXTERNAL_URLCLASSLOADER_SIGNAL: &str = "urlclassloader_external_target";
 const PRIVACY_NETWORK_SYNC_RULE_ID: &str = "PRIVACY_NETWORK_SYNC";
+const CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID: &str = "CONFIRMED_REMOTE_MEMORY_LOAD";
+const CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID: &str = "CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER";
+const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
 const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
@@ -192,7 +195,7 @@ pub fn scan_file(path: &Path, limits: ScanLimits, rules_engine: &RulesEngine) ->
     }
 }
 
-/// Parses and evaluates in-memory jar bytes, stopping immediately on safety-limit violations.
+/// Parses and evaluates in-memory jar bytes without extracting unbounded entries.
 fn scan_bytes(
     bytes: &[u8],
     limits: ScanLimits,
@@ -203,6 +206,7 @@ fn scan_bytes(
         total_uncompressed_bytes: 0,
         file_count: 0,
         data: ScanData::default(),
+        structural_findings: Vec::new(),
         next_archive_id: 0,
     };
     let root_archive_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
@@ -220,6 +224,7 @@ fn scan_bytes(
     let data_flow = analyze_scan_data_flow(&context.data);
     let contextual_results = context_recognizers::recognize(&context.data);
     let mut findings = rules_engine.evaluate(&context.data);
+    findings.extend(context.structural_findings.clone());
     findings.retain(|finding| !contextual_results.suppresses(&finding.rule_id));
     findings.retain(|finding| finding.category != "obfuscation");
     findings.extend(contextual_results.findings);
@@ -229,6 +234,12 @@ fn scan_bytes(
         .iter()
         .map(confirmed_chain_from_candidate)
         .collect::<Vec<_>>();
+    if let Some(chain) = confirmed_remote_memory_load(&context.data) {
+        confirmed_chains.push(chain);
+    }
+    if let Some(chain) = confirmed_embedded_native_downloader(&context.data) {
+        confirmed_chains.push(chain);
+    }
     if let Some(safe_context) = confirmed_safe_updater_context(&confirmed_chains) {
         confirmed_chains.push(safe_context);
     }
@@ -477,13 +488,16 @@ fn parse_zip_bytes(
         let normalized_timestamp = entry
             .last_modified()
             .is_some_and(is_normalized_zip_timestamp);
-        context.observe_file(
+        let disposition = context.observe_file(
             archive_id,
             &name,
             uncompressed_size,
             timestamp,
             normalized_timestamp,
         )?;
+        if disposition == EntryDisposition::SkipOversized {
+            continue;
+        }
 
         let mut entry_bytes = Vec::new();
         entry
@@ -505,7 +519,14 @@ struct ArchiveContext {
     total_uncompressed_bytes: u64,
     file_count: usize,
     data: ScanData,
+    structural_findings: Vec<Finding>,
     next_archive_id: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryDisposition {
+    Extract,
+    SkipOversized,
 }
 
 impl ArchiveContext {
@@ -560,7 +581,7 @@ impl ArchiveContext {
         Ok(self.archive_layer(archive_id)?.path.clone())
     }
 
-    /// Records file metadata and enforces zip-bomb limits before any content processing.
+    /// Records file metadata and avoids extracting oversized archive entries.
     fn observe_file(
         &mut self,
         archive_id: &str,
@@ -568,7 +589,7 @@ impl ArchiveContext {
         uncompressed_size: u64,
         timestamp: Option<String>,
         normalized_timestamp: bool,
-    ) -> Result<(), ScanAbort> {
+    ) -> Result<EntryDisposition, ScanAbort> {
         self.file_count += 1;
         if self.file_count > self.limits.max_files_in_archive {
             return Err(ScanAbort::FileCount {
@@ -576,12 +597,19 @@ impl ArchiveContext {
             });
         }
 
-        if uncompressed_size > self.limits.max_single_file_bytes {
-            return Err(ScanAbort::SingleFileSize {
+        self.archive_layer_mut(archive_id)?
+            .entries
+            .push(ArchiveEntryData {
                 path: name.to_owned(),
-                limit: self.limits.max_single_file_bytes,
-                actual: uncompressed_size,
+                timestamp,
+                normalized_timestamp,
+                uncompressed_size,
             });
+        self.observe_archive_structure(name, uncompressed_size);
+
+        if uncompressed_size > self.limits.max_single_file_bytes {
+            self.record_oversized_entry(archive_id, name, uncompressed_size)?;
+            return Ok(EntryDisposition::SkipOversized);
         }
 
         self.total_uncompressed_bytes = self
@@ -596,15 +624,52 @@ impl ArchiveContext {
             });
         }
 
-        self.archive_layer_mut(archive_id)?
-            .entries
-            .push(ArchiveEntryData {
-                path: name.to_owned(),
-                timestamp,
-                normalized_timestamp,
-                uncompressed_size,
-            });
-        self.observe_archive_structure(name, uncompressed_size);
+        Ok(EntryDisposition::Extract)
+    }
+
+    /// Records a zip-bomb indicator while keeping other bounded entries analyzable.
+    fn record_oversized_entry(
+        &mut self,
+        archive_id: &str,
+        name: &str,
+        uncompressed_size: u64,
+    ) -> Result<(), ScanAbort> {
+        let archive_path = self.archive_path(archive_id)?;
+        let evidence = Evidence {
+            archive_id: archive_id.to_owned(),
+            archive_path,
+            class_name: None,
+            method_name: None,
+            method_descriptor: None,
+            bytecode_offset: None,
+            resource_path: Some(name.to_owned()),
+            operation: "oversized_archive_entry".to_owned(),
+            value_preview: Some(format!("{uncompressed_size} bytes")),
+            source_value: None,
+            target_value: None,
+            confidence: Confidence::High,
+            scope: CodeScope::Resource,
+        };
+        self.structural_findings.push(Finding {
+            rule_id: OVERSIZED_ARCHIVE_ENTRY_RULE_ID.to_owned(),
+            category: "archive_structure".to_owned(),
+            kind: crate::models::scan::FindingKind::Finding,
+            severity: Severity::High,
+            confidence: Confidence::High,
+            score_contribution: Severity::High.score_weight(),
+            scope: CodeScope::Resource,
+            message: "Обнаружен oversized-ресурс, характерный для zip-bomb; его содержимое безопасно не извлекалось.".to_owned(),
+            evidence: vec![evidence.clone()],
+            related_chain_id: None,
+        });
+        self.data.normalization_limitations.push(Limitation {
+            code: "ARCHIVE_ENTRY_SKIPPED_SIZE_LIMIT".to_owned(),
+            message: format!(
+                "Файл {name} имеет распакованный размер {uncompressed_size} байт и не был извлечён: лимит {} байт.",
+                self.limits.max_single_file_bytes,
+            ),
+            evidence: vec![evidence],
+        });
         Ok(())
     }
 
@@ -801,17 +866,27 @@ impl ArchiveContext {
     ) -> Result<(), ScanAbort> {
         if let Some(analysis) = native::inspect_native_file(name, bytes) {
             let archive_path = self.archive_path(archive_id)?;
-            let (rule_id, message, value_preview) = match analysis.known_library {
-                Some(known_library) => (
-                    "EMBEDDED_NATIVE_LIBRARY",
-                    format!("Встроенная native-библиотека {known_library:?} распознана по штатному пути загрузчика."),
-                    Some(format!("{known_library:?}")),
-                ),
-                None => (
-                    "EMBEDDED_NATIVE_BINARY",
-                    "В архиве есть native-бинарный ресурс; его загрузка или выполнение не подтверждены.".to_owned(),
-                    None,
-                ),
+            let (rule_id, message, value_preview) = if analysis.known_library.is_none()
+                && analysis.has_downloader_imports
+            {
+                (
+                    "EMBEDDED_NATIVE_DOWNLOADER",
+                    "Встроенная DLL импортирует URLDownloadToFile и ShellExecute; это признак native-загрузчика.".to_owned(),
+                    Some("URLDownloadToFile + ShellExecute".to_owned()),
+                )
+            } else {
+                match analysis.known_library {
+                    Some(known_library) => (
+                        "EMBEDDED_NATIVE_LIBRARY",
+                        format!("Встроенная native-библиотека {known_library:?} распознана по штатному пути загрузчика."),
+                        Some(format!("{known_library:?}")),
+                    ),
+                    None => (
+                        "EMBEDDED_NATIVE_BINARY",
+                        "В архиве есть native-бинарный ресурс; его загрузка или выполнение не подтверждены.".to_owned(),
+                        None,
+                    ),
+                }
             };
             let capability = Capability {
                 rule_id: rule_id.to_owned(),
@@ -2446,6 +2521,203 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
     }
 }
 
+/// Confirms a staged in-memory loader only when one first-party component links
+/// a network client, `JarInputStream`, and a custom `loadClass` implementation.
+/// This avoids treating a bundled class loader or a network client alone as malware.
+fn confirmed_remote_memory_load(data: &ScanData) -> Option<ConfirmedChain> {
+    let first_party = data
+        .class_files
+        .iter()
+        .filter(|class_file| class_file.scope == CodeScope::FirstParty)
+        .collect::<Vec<_>>();
+    let network_classes = first_party
+        .iter()
+        .filter(|class_file| refs_contain_any(&class_file.bytecode_refs, NETWORK_APIS))
+        .filter_map(|class_file| class_file.class_name.as_deref())
+        .collect::<HashSet<_>>();
+    let loader_classes = first_party
+        .iter()
+        .filter(|class_file| {
+            class_file
+                .methods
+                .iter()
+                .any(|method| method.calls.iter().any(|call| call.name == "defineClass"))
+        })
+        .filter_map(|class_file| class_file.class_name.as_deref())
+        .collect::<HashSet<_>>();
+
+    for staging_class in &first_party {
+        let has_jar_input = refs_contain_any(
+            &staging_class.bytecode_refs,
+            &["java/util/jar/JarInputStream"],
+        );
+        if !has_jar_input {
+            continue;
+        }
+        let network_call = staging_class.methods.iter().find_map(|method| {
+            method.calls.iter().find_map(|call| {
+                call.owner
+                    .as_deref()
+                    .filter(|owner| network_classes.contains(owner))
+                    .map(|_| (method, call))
+            })
+        })?;
+        let loader_call = staging_class.methods.iter().find_map(|method| {
+            method.calls.iter().find_map(|call| {
+                call.owner
+                    .as_deref()
+                    .filter(|owner| loader_classes.contains(owner) && call.name == "loadClass")
+                    .map(|_| (method, call))
+            })
+        })?;
+        let jar_call = staging_class
+            .methods
+            .iter()
+            .flat_map(|method| {
+                method.calls.iter().filter_map(move |call| {
+                    (call.owner.as_deref() == Some("java/util/jar/JarInputStream"))
+                        .then_some((method, call))
+                })
+            })
+            .next()?;
+        let loader_class_name = loader_call.1.owner.as_deref()?;
+        let loader_class = first_party
+            .iter()
+            .copied()
+            .find(|class_file| class_file.class_name.as_deref() == Some(loader_class_name))?;
+        let define_call = loader_class
+            .methods
+            .iter()
+            .flat_map(|method| {
+                method
+                    .calls
+                    .iter()
+                    .filter_map(move |call| (call.name == "defineClass").then_some((method, call)))
+            })
+            .next()?;
+
+        let network_evidence = flow_evidence(
+            staging_class,
+            &MethodId {
+                archive_id: staging_class.archive_id.clone(),
+                class_name: network_call.0.class_name.clone(),
+                method_name: network_call.0.method_name.clone(),
+                descriptor: network_call.0.descriptor.clone(),
+            },
+            network_call.1.offset,
+            network_call.1.owner.as_deref()?,
+            &network_call.1.name,
+        );
+        let jar_evidence = flow_evidence(
+            staging_class,
+            &MethodId {
+                archive_id: staging_class.archive_id.clone(),
+                class_name: jar_call.0.class_name.clone(),
+                method_name: jar_call.0.method_name.clone(),
+                descriptor: jar_call.0.descriptor.clone(),
+            },
+            jar_call.1.offset,
+            "java/util/jar/JarInputStream",
+            &jar_call.1.name,
+        );
+        let load_evidence = flow_evidence(
+            loader_class,
+            &MethodId {
+                archive_id: loader_class.archive_id.clone(),
+                class_name: define_call.0.class_name.clone(),
+                method_name: define_call.0.method_name.clone(),
+                descriptor: define_call.0.descriptor.clone(),
+            },
+            define_call.1.offset,
+            define_call.1.owner.as_deref()?,
+            "defineClass",
+        );
+        return Some(ConfirmedChain {
+            chain_id: format!("remote-memory-load-{}", staging_class.archive_id),
+            rule_id: CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID.to_owned(),
+            severity: Severity::Critical,
+            confidence: Confidence::High,
+            score_contribution: 80,
+            operations: vec![
+                network_evidence.operation.clone(),
+                jar_evidence.operation.clone(),
+                load_evidence.operation.clone(),
+            ],
+            evidence: [network_evidence, jar_evidence, load_evidence]
+                .into_iter()
+                .map(flow_evidence_to_evidence)
+                .collect(),
+        });
+    }
+    None
+}
+
+fn flow_evidence_to_evidence(flow: FlowEvidence) -> Evidence {
+    Evidence {
+        archive_id: flow.archive_id,
+        archive_path: flow.archive_path,
+        class_name: Some(flow.class_name),
+        method_name: Some(flow.method_name),
+        method_descriptor: Some(flow.method_descriptor),
+        bytecode_offset: Some(flow.bytecode_offset),
+        resource_path: None,
+        operation: flow.operation,
+        value_preview: flow.value_preview,
+        source_value: flow.source_value,
+        target_value: flow.target_value,
+        confidence: Confidence::High,
+        scope: flow.scope,
+    }
+}
+
+/// Confirms a bundled native downloader only when Java code also loads it.
+fn confirmed_embedded_native_downloader(data: &ScanData) -> Option<ConfirmedChain> {
+    let native_evidence = data
+        .archive_capabilities
+        .iter()
+        .find(|capability| capability.rule_id == "EMBEDDED_NATIVE_DOWNLOADER")?
+        .evidence
+        .first()?
+        .clone();
+    let (class_file, method, call) = data
+        .class_files
+        .iter()
+        .filter(|class_file| class_file.scope == CodeScope::FirstParty)
+        .find_map(|class_file| {
+            class_file.methods.iter().find_map(|method| {
+                method.calls.iter().find_map(|call| {
+                    (call.owner.as_deref() == Some("java/lang/System")
+                        && matches!(call.name.as_str(), "load" | "loadLibrary"))
+                    .then_some((class_file, method, call))
+                })
+            })
+        })?;
+    let load_evidence = flow_evidence(
+        class_file,
+        &MethodId {
+            archive_id: class_file.archive_id.clone(),
+            class_name: method.class_name.clone(),
+            method_name: method.method_name.clone(),
+            descriptor: method.descriptor.clone(),
+        },
+        call.offset,
+        "java/lang/System",
+        &call.name,
+    );
+    Some(ConfirmedChain {
+        chain_id: format!("embedded-native-downloader-{}", class_file.archive_id),
+        rule_id: CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID.to_owned(),
+        severity: Severity::Critical,
+        confidence: Confidence::High,
+        score_contribution: 80,
+        operations: vec![
+            native_evidence.operation.clone(),
+            load_evidence.operation.clone(),
+        ],
+        evidence: vec![native_evidence, flow_evidence_to_evidence(load_evidence)],
+    })
+}
+
 /// Recognizes a safe updater only when flow analysis has proven that the
 /// downloaded value was cryptographically verified before it was written and
 /// launched. Text such as "sha256" is intentionally irrelevant here.
@@ -2459,6 +2731,8 @@ fn confirmed_safe_updater_context(chains: &[ConfirmedChain]) -> Option<Confirmed
             "CONFIRMED_CREDENTIAL_EXFILTRATION"
                 | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
                 | "CONFIRMED_DECODED_DYNAMIC_LOAD"
+                | CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID
+                | CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID
         )
     });
     if has_credential_or_dynamic_risk {
@@ -2780,6 +3054,8 @@ fn verdict_from_evidence(
             "CONFIRMED_CREDENTIAL_EXFILTRATION"
                 | "CONFIRMED_DECODED_DYNAMIC_LOAD"
                 | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
+                | CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID
+                | CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID
         ) || (chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC" && !has_safe_updater_context)
     });
     let trusted_vt_detection = findings
@@ -2868,10 +3144,11 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 #[cfg(test)]
 mod tests {
     use super::{
-        add_contextual_findings, file_target_from_origin, has_significant_identifier_overlap,
-        is_credential_target, parse_zip_bytes, risk_score, scan_file, summarize, ArchiveContext,
-        ClassScanData, ScanData, ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL,
-        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
+        add_contextual_findings, confirmed_remote_memory_load, file_target_from_origin,
+        has_significant_identifier_overlap, is_credential_target, parse_zip_bytes, risk_score,
+        scan_file, summarize, verdict_from_evidence, ArchiveContext, ClassScanData, ScanData,
+        ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID,
+        REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
     use crate::models::scan::{
@@ -2880,7 +3157,7 @@ mod tests {
     };
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
-        class_file::{ConstantValue, ValueOrigin},
+        class_file::{CallSite, ConstantValue, InvokeKind, MethodScanData, ValueOrigin},
         dataflow::FileTarget,
     };
     use std::{
@@ -3262,6 +3539,74 @@ mod tests {
             .contains(&TIMESTAMP_OUTLIER_SIGNAL.to_owned()));
     }
 
+    #[test]
+    fn oversized_entry_is_skipped_without_discarding_other_archive_entries() {
+        let timestamp = zip_timestamp(2024, 1, 1);
+        let mut context = archive_test_context();
+        context.limits.max_single_file_bytes = 4;
+        context.limits.max_total_uncompressed_bytes = 64;
+        context.limits.max_files_in_archive = 4;
+        let root_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
+        let archive = zip_bytes(vec![
+            ("payload.bin".to_owned(), timestamp, b"12345".to_vec()),
+            ("safe.txt".to_owned(), timestamp, b"safe".to_vec()),
+        ]);
+
+        parse_zip_bytes(&archive, &root_id, &mut context).expect("archive parses safely");
+
+        assert_eq!(context.structural_findings.len(), 1);
+        assert_eq!(context.data.resource_files.len(), 1);
+        assert_eq!(context.data.resource_files[0].path, "safe.txt");
+        assert!(context
+            .data
+            .normalization_limitations
+            .iter()
+            .any(|limitation| { limitation.code == "ARCHIVE_ENTRY_SKIPPED_SIZE_LIMIT" }));
+    }
+
+    #[test]
+    fn confirms_network_backed_in_memory_class_loader() {
+        let network = class_scan_data(
+            "example/Network",
+            vec!["java/net/HttpURLConnection"],
+            Vec::new(),
+        );
+        let loader = class_scan_data(
+            "example/InMemoryLoader",
+            vec!["java/lang/ClassLoader.defineClass"],
+            vec![method_scan_data(
+                "example/InMemoryLoader",
+                vec![call_site("java/lang/ClassLoader", "defineClass")],
+            )],
+        );
+        let staging = class_scan_data(
+            "example/Staging",
+            vec!["java/util/jar/JarInputStream"],
+            vec![method_scan_data(
+                "example/Staging",
+                vec![
+                    call_site("example/Network", "fetch"),
+                    call_site("java/util/jar/JarInputStream", "<init>"),
+                    call_site("example/InMemoryLoader", "loadClass"),
+                ],
+            )],
+        );
+        let data = ScanData {
+            class_files: vec![network, loader, staging],
+            ..Default::default()
+        };
+
+        let chain = confirmed_remote_memory_load(&data).expect("remote loader is confirmed");
+
+        assert_eq!(chain.rule_id, "CONFIRMED_REMOTE_MEMORY_LOAD");
+        assert_eq!(chain.evidence.len(), 3);
+        assert_eq!(chain.score_contribution, 80);
+        assert_eq!(
+            verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 80),
+            Verdict::Malicious
+        );
+    }
+
     /// Real mods previously received false positives from isolated API, asset, and namespace facts.
     #[test]
     fn real_mods_are_clean_without_confirmed_dangerous_chains() {
@@ -3319,7 +3664,64 @@ mod tests {
                 entrypoint_classes: vec!["com.example.mod.Loader".to_owned()],
                 ..Default::default()
             },
+            structural_findings: Vec::new(),
             next_archive_id: 1,
+        }
+    }
+
+    fn class_scan_data(
+        class_name: &str,
+        bytecode_refs: Vec<&str>,
+        methods: Vec<MethodScanData>,
+    ) -> ClassScanData {
+        ClassScanData {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
+            path: format!("{}.class", class_name),
+            class_name: Some(class_name.to_owned()),
+            major_version: 65,
+            strings: Vec::new(),
+            bytecode_refs: bytecode_refs.into_iter().map(ToOwned::to_owned).collect(),
+            methods,
+            scope: CodeScope::FirstParty,
+            dependency_name: None,
+            dependency_version: None,
+            reachable_from_entrypoint: true,
+            classification_confidence: Confidence::High,
+        }
+    }
+
+    fn method_scan_data(class_name: &str, calls: Vec<CallSite>) -> MethodScanData {
+        MethodScanData {
+            class_name: class_name.to_owned(),
+            method_name: "run".to_owned(),
+            descriptor: "()V".to_owned(),
+            is_static: true,
+            instructions: Vec::new(),
+            constants: Vec::new(),
+            calls,
+            field_reads: Vec::new(),
+            field_writes: Vec::new(),
+            basic_blocks: Vec::new(),
+            control_flow_edges: Vec::new(),
+            local_origins: Vec::new(),
+            stack_origins: Vec::new(),
+            return_origins: Vec::new(),
+            array_elements: Vec::new(),
+            branch_conditions: Vec::new(),
+        }
+    }
+
+    fn call_site(owner: &str, name: &str) -> CallSite {
+        CallSite {
+            offset: 0,
+            kind: InvokeKind::Virtual,
+            owner: Some(owner.to_owned()),
+            name: name.to_owned(),
+            descriptor: "()V".to_owned(),
+            receiver_origin: None,
+            argument_origins: Vec::new(),
+            result_origin: None,
         }
     }
 
@@ -3354,6 +3756,7 @@ mod tests {
             total_uncompressed_bytes: 0,
             file_count: 0,
             data: ScanData::default(),
+            structural_findings: Vec::new(),
             next_archive_id: 0,
         }
     }

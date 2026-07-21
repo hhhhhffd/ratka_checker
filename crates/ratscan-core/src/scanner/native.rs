@@ -27,6 +27,9 @@ pub struct NativeFileAnalysis {
     /// A recognized dependency loader path is a capability candidate, not a
     /// security finding by itself.
     pub known_library: Option<KnownNativeLibrary>,
+    /// Windows downloader APIs combined with a shell launcher are a strong
+    /// static signal for a bundled native dropper.
+    pub has_downloader_imports: bool,
 }
 
 /// Inspects native magic bytes and classifies a known dependency path.
@@ -36,7 +39,17 @@ pub fn inspect_native_file(path: &str, bytes: &[u8]) -> Option<NativeFileAnalysi
     Some(NativeFileAnalysis {
         format: native_format(bytes)?,
         known_library: classify_known_native_path(path),
+        has_downloader_imports: has_windows_downloader_imports(bytes),
     })
+}
+
+fn has_windows_downloader_imports(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"URLDownloadToFile".len())
+        .any(|window| window == b"URLDownloadToFile")
+        && bytes
+            .windows(b"ShellExecute".len())
+            .any(|window| window == b"ShellExecute")
 }
 
 /// Returns the native format identified by the leading magic bytes.
@@ -145,5 +158,15 @@ mod tests {
             .expect("PE magic should be recognized");
         assert_eq!(analysis.format, NativeFormat::Pe);
         assert_eq!(analysis.known_library, None);
+        assert!(!analysis.has_downloader_imports);
+    }
+
+    #[test]
+    fn detects_windows_downloader_imports_without_loading_the_library() {
+        let analysis =
+            inspect_native_file("payload.dll", b"MZ...URLDownloadToFileW...ShellExecuteW...")
+                .expect("PE magic should be recognized");
+
+        assert!(analysis.has_downloader_imports);
     }
 }
