@@ -7,11 +7,12 @@ APP_DIR="$DEPLOY_DIR/app"
 
 cd "$REPO_DIR"
 
-cargo build --release
+cargo build --release --bins
 
 rm -rf "$APP_DIR/config" "$APP_DIR/telegram_bot"
 install -d -m 0755 "$APP_DIR"
 install -m 0755 target/release/ratscan "$APP_DIR/ratscan"
+install -m 0755 target/release/ratscan-discord "$APP_DIR/ratscan-discord"
 cp -R config "$APP_DIR/config"
 cp -R telegram_bot "$APP_DIR/telegram_bot"
 rm -f "$APP_DIR/telegram_bot/Dockerfile"

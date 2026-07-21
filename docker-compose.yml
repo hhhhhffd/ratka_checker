@@ -26,6 +26,22 @@ services:
       - "8080:8080"
     volumes:
       - ratscan-storage:/app/storage
+    restart: unless-stopped
+
+  discord-bot:
+    build: .
+    command: ["ratscan-discord"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://ratscan:ratscan@postgres:5432/ratscan
+      RATSCAN_API_BASE_URL: http://api:8080
+    restart: unless-stopped
 
   dev-ui:
     image: nginx:1.27-alpine
@@ -47,8 +63,6 @@ services:
       - .env
     environment:
       RATSCAN_API_BASE_URL: http://api:8080
-    profiles:
-      - telegram
     restart: unless-stopped
 
 volumes:

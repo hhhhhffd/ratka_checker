@@ -92,3 +92,43 @@ responses. Reports are cached by sha256 in PostgreSQL using
 `VIRUSTOTAL_CACHE_TTL_HOURS` to avoid repeated quota usage for the same jar.
 The `virustotal.behavior` field contains condensed VirusTotal sandbox artifacts
 when the behaviours relationship is available for the file.
+# RatScan
+
+RatScan is a single Cargo workspace with separate service binaries:
+
+```text
+crates/
+├── ratscan-models   # shared serializable scanner/API models
+├── ratscan-core     # rules and static scanner
+├── ratscan-storage  # PostgreSQL access shared by service clients
+├── ratscan-api      # dedicated API binary
+└── ratscan-discord  # Discord Gateway binary
+```
+
+`ratscan-discord` uses the same PostgreSQL database and SQLx migration history
+as the API. It does not create tables at startup and never stores duplicated
+verdict, SHA-256, or risk-score values; `discord_scan_context.scan_id` references
+the API-owned `scans` row.
+
+## Discord configuration
+
+Set the following in `.env` (keep this file out of version control):
+
+```text
+DISCORD_TOKEN=
+OWNER_USER_IDS=123,456
+DATABASE_URL=postgres://ratscan:ratscan@postgres:5432/ratscan
+RATSCAN_API_BASE_URL=http://api:8080
+DISCORD_MAX_JAR_BYTES=52428800
+DISCORD_MAX_CONCURRENT_SCANS=2
+DISCORD_MAX_QUEUED_SCANS=20
+DISCORD_PER_USER_SCANS_PER_MINUTE=10
+DISCORD_PER_GUILD_SCANS_PER_MINUTE=30
+```
+
+Start all local services with `docker compose up --build`. The Discord service
+uses `/health` and requires `{"status":"ok"}` before reporting API health.
+
+The legacy `ds-bot` remains temporarily as a parity reference. It must not run
+against the shared database and is removed only after its checklist and
+Discord-facing integration tests are complete.

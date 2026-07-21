@@ -20,6 +20,11 @@ if [ ! -x "$APP_DIR/ratscan" ]; then
     exit 1
 fi
 
+if [ ! -x "$APP_DIR/ratscan-discord" ]; then
+    echo "Missing executable: $APP_DIR/ratscan-discord" >&2
+    exit 1
+fi
+
 if [ ! -f "$APP_DIR/config/rules.yaml" ]; then
     echo "Missing scanner rules: $APP_DIR/config/rules.yaml" >&2
     exit 1
@@ -105,6 +110,7 @@ install -d -m 0755 /opt/ratscan/telegram_bot
 install -d -m 0750 /etc/ratscan
 
 install -m 0755 "$APP_DIR/ratscan" /opt/ratscan/bin/ratscan
+install -m 0755 "$APP_DIR/ratscan-discord" /opt/ratscan/bin/ratscan-discord
 cp -R "$APP_DIR/config/." /opt/ratscan/config/
 cp -R "$APP_DIR/telegram_bot/." /opt/ratscan/telegram_bot/
 
@@ -152,6 +158,15 @@ RATSCAN_API_BASE_URL=http://127.0.0.1:8080
 TG_BOT_REQUEST_TIMEOUT_SECONDS=$(env_value TG_BOT_REQUEST_TIMEOUT_SECONDS 30)
 TG_BOT_POLL_ATTEMPTS=$(env_value TG_BOT_POLL_ATTEMPTS 24)
 TG_BOT_POLL_INTERVAL_SECONDS=$(env_value TG_BOT_POLL_INTERVAL_SECONDS 5)
+DISCORD_TOKEN=$(env_value DISCORD_TOKEN "")
+OWNER_USER_IDS=$(env_value OWNER_USER_IDS "")
+DISCORD_MAX_JAR_BYTES=$(env_value DISCORD_MAX_JAR_BYTES 52428800)
+DISCORD_MAX_CONCURRENT_SCANS=$(env_value DISCORD_MAX_CONCURRENT_SCANS 2)
+DISCORD_MAX_QUEUED_SCANS=$(env_value DISCORD_MAX_QUEUED_SCANS 20)
+DISCORD_PER_USER_SCANS_PER_MINUTE=$(env_value DISCORD_PER_USER_SCANS_PER_MINUTE 10)
+DISCORD_PER_GUILD_SCANS_PER_MINUTE=$(env_value DISCORD_PER_GUILD_SCANS_PER_MINUTE 30)
+DISCORD_SCAN_TIMEOUT_SECONDS=$(env_value DISCORD_SCAN_TIMEOUT_SECONDS 120)
+DISCORD_SCAN_POLL_INTERVAL_SECONDS=$(env_value DISCORD_SCAN_POLL_INTERVAL_SECONDS 2)
 EOF
 chown root:ratscan /etc/ratscan
 chmod 0750 /etc/ratscan
@@ -159,6 +174,7 @@ chown root:ratscan /etc/ratscan/ratscan.env
 chmod 0640 /etc/ratscan/ratscan.env
 
 install -m 0644 "$DEPLOY_DIR/systemd/ratscan.service" /etc/systemd/system/ratscan.service
+install -m 0644 "$DEPLOY_DIR/systemd/ratscan-discord.service" /etc/systemd/system/ratscan-discord.service
 install -m 0644 "$DEPLOY_DIR/systemd/ratscan-telegram-bot.service" /etc/systemd/system/ratscan-telegram-bot.service
 
 if ! swapon --show=NAME | grep -qx "/swapfile"; then
@@ -176,6 +192,12 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now ratscan
+if [ -n "$(env_value DISCORD_TOKEN "")" ] && [ -n "$(env_value OWNER_USER_IDS "")" ]; then
+    systemctl enable --now ratscan-discord
+else
+    systemctl disable --now ratscan-discord >/dev/null 2>&1 || true
+    echo "Discord bot is installed but not started: DISCORD_TOKEN or OWNER_USER_IDS is empty."
+fi
 if [ -n "$(env_value TG_BOT_TOKEN "")" ] && [ -n "$(env_value ALLOWED_TG_ID "")" ]; then
     systemctl enable --now ratscan-telegram-bot
 else
