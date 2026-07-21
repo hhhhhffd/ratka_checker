@@ -31,6 +31,12 @@ pub struct MethodScanData {
     pub stack_origins: Vec<StackOrigin>,
     /// Values returned by explicit JVM return instructions.
     pub return_origins: Vec<ReturnOrigin>,
+    /// Element assignments observed for arrays assembled in the linear pass.
+    /// This is used for Java varargs and immutable list factories.
+    pub array_elements: Vec<ArrayElementOrigin>,
+    /// Conditional values retained so security recognizers can prove that a
+    /// rejecting branch guards a following sensitive operation.
+    pub branch_conditions: Vec<BranchCondition>,
 }
 
 /// A decoded JVM instruction. `operands` retain their original bytecode form.
@@ -143,6 +149,21 @@ pub struct StackOrigin {
 pub struct ReturnOrigin {
     pub offset: u32,
     pub value_origin: Option<ValueOrigin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayElementOrigin {
+    pub offset: u32,
+    pub array_origin: ValueOrigin,
+    pub index: Option<u16>,
+    pub value_origin: ValueOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchCondition {
+    pub offset: u32,
+    pub opcode: u8,
+    pub value_origin: ValueOrigin,
 }
 
 const XOR_LOOP_SIGNAL: &str = "xor_loop_string_decode";
@@ -741,9 +762,38 @@ fn populate_value_origins(
                 stack.push(ValueOrigin::Instruction(offset));
             }
             0x84 => {}
+            0x4f..=0x56 => store_array_element(&mut stack, data, offset, instruction.opcode),
+            0x99..=0x9e | 0xc6 | 0xc7 => {
+                let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                data.branch_conditions.push(BranchCondition {
+                    offset,
+                    opcode: instruction.opcode,
+                    value_origin,
+                });
+            }
+            0x9f..=0xa6 => {
+                let _ = stack.pop();
+                let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                data.branch_conditions.push(BranchCondition {
+                    offset,
+                    opcode: instruction.opcode,
+                    value_origin,
+                });
+            }
             0xb2..=0xb5 => populate_field_access(entries, &instruction, &mut stack, data)?,
             0xb6..=0xb9 | 0xba => populate_call(entries, &instruction, &mut stack, data)?,
-            0xbb | 0xbd | 0xc5 => stack.push(ValueOrigin::Instruction(offset)),
+            0xbb => stack.push(ValueOrigin::Instruction(offset)),
+            0xbd => {
+                let _ = stack.pop();
+                stack.push(ValueOrigin::Instruction(offset));
+            }
+            0xc5 => {
+                let dimensions = instruction.operands.get(2).copied().unwrap_or_default();
+                for _ in 0..dimensions {
+                    let _ = stack.pop();
+                }
+                stack.push(ValueOrigin::Instruction(offset));
+            }
             0xbc => {
                 let _ = stack.pop();
                 stack.push(ValueOrigin::Instruction(offset));
@@ -770,6 +820,30 @@ fn populate_value_origins(
         }
     }
     Ok(())
+}
+
+fn store_array_element(
+    stack: &mut Vec<ValueOrigin>,
+    data: &mut MethodScanData,
+    offset: u32,
+    opcode: u8,
+) {
+    let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+    let index = match stack.pop() {
+        Some(ValueOrigin::Constant(ConstantValue::Integer(value))) if value >= 0 => {
+            u16::try_from(value).ok()
+        }
+        _ => None,
+    };
+    let array_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+    if opcode == 0x53 {
+        data.array_elements.push(ArrayElementOrigin {
+            offset,
+            array_origin,
+            index,
+            value_origin,
+        });
+    }
 }
 
 fn store_local(

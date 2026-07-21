@@ -1,0 +1,1 @@
+{"name":"compiled intermethod downloader","expected_verdict":"malicious","risk_score":{"min":70,"max":100},"required_confirmed_chains":["CONFIRMED_DOWNLOAD_WRITE_EXEC"],"required_chain_evidence_operations":["Files.write","ProcessBuilder.start"],"required_chain_scope":"first_party","minimum_analysis_coverage":30,"expected_obfuscation_level":"none"}

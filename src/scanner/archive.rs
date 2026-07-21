@@ -228,7 +228,7 @@ fn scan_bytes(
         .iter()
         .map(confirmed_chain_from_candidate)
         .collect::<Vec<_>>();
-    if let Some(safe_context) = confirmed_safe_updater_context(&context.data, &confirmed_chains) {
+    if let Some(safe_context) = confirmed_safe_updater_context(&confirmed_chains) {
         confirmed_chains.push(safe_context);
     }
     let chain_capabilities = updater_capabilities(&confirmed_chains);
@@ -1447,6 +1447,8 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
     };
     let mut events = Vec::new();
     let mut object_targets = HashMap::<String, FileTarget>::new();
+    let mut process_builders = HashMap::<String, Vec<FileTarget>>::new();
+    let mut list_commands = HashMap::<String, Vec<FileTarget>>::new();
 
     for record in &method.local_origins {
         if let Some(input) = local_for_origin(method, &record.origin) {
@@ -1479,15 +1481,30 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
         if is_path_factory(owner, &call.name) {
             if let (Some(result), Some(target)) = (
                 &call.result_origin,
-                call.argument_origins
-                    .iter()
-                    .find_map(|origin| target_from_origin(origin, &object_targets)),
+                path_factory_target(call, &object_targets),
             ) {
                 object_targets.insert(object_key(result), target);
             }
             continue;
         }
-        if is_path_string_conversion(owner, &call.name) {
+        if is_path_resolution(owner, &call.name) {
+            if let (Some(result), Some(receiver), Some(child)) = (
+                &call.result_origin,
+                &call.receiver_origin,
+                call.argument_origins
+                    .first()
+                    .and_then(|origin| target_from_origin(origin, &object_targets)),
+            ) {
+                if let Some(parent) = target_from_origin(receiver, &object_targets) {
+                    object_targets.insert(
+                        object_key(result),
+                        resolve_path_target(parent, child, call.name.as_str()),
+                    );
+                }
+            }
+            continue;
+        }
+        if is_path_conversion(owner, &call.name) {
             if let (Some(result), Some(receiver)) = (&call.result_origin, &call.receiver_origin) {
                 if let Some(target) = target_from_origin(receiver, &object_targets) {
                     object_targets.insert(object_key(result), target);
@@ -1495,15 +1512,63 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             }
             continue;
         }
+        if is_list_factory(owner, &call.name) {
+            if let Some(result) = &call.result_origin {
+                if let Some(command) = command_from_origins(
+                    &call.argument_origins,
+                    method,
+                    &object_targets,
+                    &list_commands,
+                ) {
+                    list_commands.insert(object_key(result), command);
+                }
+            }
+            continue;
+        }
+        if is_mutable_list_constructor(owner, &call.name) {
+            if let Some(receiver) = &call.receiver_origin {
+                list_commands.entry(object_key(receiver)).or_default();
+            }
+            continue;
+        }
+        if is_list_append(owner, &call.name) {
+            if let Some(receiver) = &call.receiver_origin {
+                if let Some(command) = command_from_origins(
+                    &call.argument_origins,
+                    method,
+                    &object_targets,
+                    &list_commands,
+                ) {
+                    list_commands
+                        .entry(object_key(receiver))
+                        .or_default()
+                        .extend(command);
+                }
+            }
+            continue;
+        }
         if owner == "java/lang/ProcessBuilder" && call.name == "<init>" {
             if let Some(receiver) = &call.receiver_origin {
-                if let Some(target) = call
-                    .argument_origins
-                    .iter()
-                    .rev()
-                    .find_map(|origin| target_from_origin(origin, &object_targets))
-                {
-                    object_targets.insert(object_key(receiver), target);
+                if let Some(command) = command_from_origins(
+                    &call.argument_origins,
+                    method,
+                    &object_targets,
+                    &list_commands,
+                ) {
+                    process_builders.insert(object_key(receiver), command);
+                }
+            }
+            continue;
+        }
+        if owner == "java/lang/ProcessBuilder" && call.name == "command" {
+            if let Some(receiver) = &call.receiver_origin {
+                if let Some(command) = command_from_origins(
+                    &call.argument_origins,
+                    method,
+                    &object_targets,
+                    &list_commands,
+                ) {
+                    process_builders.insert(object_key(receiver), command);
                 }
             }
             continue;
@@ -1512,7 +1577,8 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             let target = call
                 .receiver_origin
                 .as_ref()
-                .and_then(|origin| target_from_origin(origin, &object_targets))
+                .and_then(|origin| process_builders.get(&object_key(origin)))
+                .and_then(|command| executable_target(command))
                 .unwrap_or(FileTarget::Unknown);
             let mut evidence = evidence;
             evidence.target_value = known_target_value(&target);
@@ -1571,12 +1637,26 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             }
             continue;
         }
+        if is_secret_extraction(owner, &call.name, &call.argument_origins) {
+            if let (Some(input), Some(output)) = (arguments.last().copied(), output) {
+                events.push((
+                    call.offset,
+                    Operation::Transform {
+                        input,
+                        output,
+                        kind: TransformKind::SecretExtract,
+                        evidence,
+                    },
+                ));
+            }
+            continue;
+        }
         if is_file_write(owner, &call.name) {
             if let Some(input) = arguments.last().copied() {
                 let destination = call
                     .argument_origins
                     .first()
-                    .and_then(file_target_from_origin)
+                    .and_then(|origin| target_from_origin(origin, &object_targets))
                     .unwrap_or(FileTarget::Unknown);
                 let mut evidence = evidence;
                 evidence.target_value = match &destination {
@@ -1598,7 +1678,16 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             let target = call
                 .argument_origins
                 .first()
-                .and_then(file_target_from_origin)
+                .and_then(|origin| {
+                    command_from_origins(
+                        std::slice::from_ref(origin),
+                        method,
+                        &object_targets,
+                        &list_commands,
+                    )
+                    .and_then(|command| executable_target(&command))
+                    .or_else(|| target_from_origin(origin, &object_targets))
+                })
                 .unwrap_or(FileTarget::Unknown);
             let mut evidence = evidence;
             evidence.target_value = match &target {
@@ -1616,6 +1705,12 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
         }
         if is_dynamic_load(owner, &call.name) {
             if let Some(input) = arguments.first().copied() {
+                let target = call
+                    .argument_origins
+                    .first()
+                    .and_then(|origin| target_from_origin(origin, &object_targets));
+                let mut evidence = evidence;
+                evidence.target_value = target.as_ref().and_then(known_target_value);
                 events.push((
                     call.offset,
                     Operation::DynamicLoad {
@@ -1644,6 +1739,15 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
                 },
             ));
         }
+    }
+    for verification in integrity_verifications(class_file, method, &id) {
+        events.push((
+            verification.offset,
+            Operation::IntegrityVerify {
+                input: verification.input,
+                evidence: verification.evidence,
+            },
+        ));
     }
     for returned in &method.return_origins {
         events.push((
@@ -1763,8 +1867,137 @@ fn is_path_factory(owner: &str, name: &str) -> bool {
         || (owner == "java/io/File" && name == "<init>")
 }
 
-fn is_path_string_conversion(owner: &str, name: &str) -> bool {
-    (owner == "java/nio/file/Path" || owner == "java/io/File") && name == "toString"
+fn path_factory_target(
+    call: &class_file::CallSite,
+    object_targets: &HashMap<String, FileTarget>,
+) -> Option<FileTarget> {
+    let mut arguments = call
+        .argument_origins
+        .iter()
+        .filter_map(|origin| target_from_origin(origin, object_targets));
+    let first = arguments.next()?;
+    let second = arguments.next();
+    Some(match second {
+        Some(child) if call.owner.as_deref() == Some("java/io/File") => {
+            resolve_path_target(first, child, "resolve")
+        }
+        _ => first,
+    })
+}
+
+fn is_path_resolution(owner: &str, name: &str) -> bool {
+    owner == "java/nio/file/Path" && matches!(name, "resolve" | "resolveSibling")
+}
+
+fn resolve_path_target(parent: FileTarget, child: FileTarget, operation: &str) -> FileTarget {
+    let (FileTarget::Known(parent), FileTarget::Known(child)) = (parent, child) else {
+        return FileTarget::Unknown;
+    };
+    let value = if operation == "resolveSibling" {
+        parent
+            .rsplit_once('/')
+            .map(|(base, _)| format!("{base}/{child}"))
+            .unwrap_or(child)
+    } else {
+        format!(
+            "{}/{}",
+            parent.trim_end_matches('/'),
+            child.trim_start_matches('/')
+        )
+    };
+    FileTarget::Known(
+        paths::normalize_symbolic_path(&value)
+            .map(|path| path.canonical)
+            .unwrap_or(value),
+    )
+}
+
+fn is_path_conversion(owner: &str, name: &str) -> bool {
+    (owner == "java/nio/file/Path" && matches!(name, "toString" | "toFile"))
+        || (owner == "java/io/File" && matches!(name, "toString" | "toPath"))
+}
+
+fn is_list_factory(owner: &str, name: &str) -> bool {
+    (owner == "java/util/List" && matches!(name, "of" | "copyOf"))
+        || (owner == "java/util/Arrays" && name == "asList")
+}
+
+fn is_mutable_list_constructor(owner: &str, name: &str) -> bool {
+    owner == "java/util/ArrayList" && name == "<init>"
+}
+
+fn is_list_append(owner: &str, name: &str) -> bool {
+    matches!(owner, "java/util/List" | "java/util/ArrayList") && name == "add"
+}
+
+fn command_from_origins(
+    origins: &[ValueOrigin],
+    method: &MethodScanData,
+    object_targets: &HashMap<String, FileTarget>,
+    list_commands: &HashMap<String, Vec<FileTarget>>,
+) -> Option<Vec<FileTarget>> {
+    let mut command = Vec::new();
+    for origin in origins {
+        if let Some(parts) = command_from_origin(origin, method, object_targets, list_commands) {
+            command.extend(parts);
+        } else {
+            return None;
+        }
+    }
+    (!command.is_empty()).then_some(command)
+}
+
+fn command_from_origin(
+    origin: &ValueOrigin,
+    method: &MethodScanData,
+    object_targets: &HashMap<String, FileTarget>,
+    list_commands: &HashMap<String, Vec<FileTarget>>,
+) -> Option<Vec<FileTarget>> {
+    if let Some(command) = list_commands.get(&object_key(origin)) {
+        return Some(command.clone());
+    }
+    let elements = method
+        .array_elements
+        .iter()
+        .filter(|element| element.array_origin == *origin)
+        .collect::<Vec<_>>();
+    if !elements.is_empty() {
+        let mut ordered = elements;
+        ordered.sort_by_key(|element| element.index);
+        return ordered
+            .into_iter()
+            .map(|element| target_from_origin(&element.value_origin, object_targets))
+            .collect();
+    }
+    target_from_origin(origin, object_targets).map(|target| match &target {
+        FileTarget::Known(value) if value.split_ascii_whitespace().count() > 1 => value
+            .split_ascii_whitespace()
+            .map(|part| FileTarget::Known(part.to_owned()))
+            .collect(),
+        _ => vec![target],
+    })
+}
+
+fn executable_target(command: &[FileTarget]) -> Option<FileTarget> {
+    let values = command
+        .iter()
+        .map(known_target_value)
+        .collect::<Option<Vec<_>>>()?;
+    let executable = values.first()?.to_ascii_lowercase();
+    let target_index = match executable.as_str() {
+        "java" | "java.exe" if values.get(1).is_some_and(|value| value == "-jar") => 2,
+        "cmd" | "cmd.exe"
+            if values
+                .get(1)
+                .is_some_and(|value| value.eq_ignore_ascii_case("/c")) =>
+        {
+            2
+        }
+        "sh" | "bash" => 1,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => values.len().checked_sub(1)?,
+        _ => return None,
+    };
+    command.get(target_index).cloned()
 }
 
 fn flow_evidence(
@@ -1802,22 +2035,60 @@ fn is_credential_target(target: &FileTarget) -> bool {
     let FileTarget::Known(value) = target else {
         return false;
     };
-    let value = value.to_ascii_lowercase();
-    [
-        "discord/local storage/leveldb",
-        "discord/leveldb",
-        "cookies",
-        "login data",
-        "web data",
-        "launcher_accounts",
-        "account",
-        "session",
-        "telegram/tdata",
-        "wallet",
-        "token",
+    let value = value.to_ascii_lowercase().replace('\\', "/");
+    let discord = value.contains("discord/local storage/leveldb")
+        || value.contains("discordcanary/local storage/leveldb")
+        || value.contains("discordptb/local storage/leveldb");
+    let chromium = value.contains("/user data/")
+        && [
+            "/login data",
+            "/network/cookies",
+            "/cookies",
+            "/local state",
+            "/local storage/leveldb",
+        ]
+        .iter()
+        .any(|suffix| value.ends_with(suffix) || value.contains(&format!("{suffix}/")));
+    let firefox = value.contains("mozilla/firefox/")
+        && ["/logins.json", "/key4.db", "/cookies.sqlite"]
+            .iter()
+            .any(|suffix| value.ends_with(suffix));
+    let minecraft = value.ends_with("minecraft/launcher_accounts.json")
+        || value.ends_with(".minecraft/launcher_accounts.json");
+    let telegram = value.contains("telegram desktop/tdata/") || value.ends_with("telegram/tdata");
+    let wallet = [
+        "/exodus/exodus.wallet",
+        "/electrum/wallets/",
+        "/atomic/wallets/",
+        "/metamask/local extension settings/",
     ]
     .iter()
-    .any(|needle| value.contains(needle))
+    .any(|needle| value.contains(needle));
+    discord || chromium || firefox || minecraft || telegram || wallet
+}
+
+fn is_secret_extraction(owner: &str, name: &str, arguments: &[ValueOrigin]) -> bool {
+    if !matches!(
+        name,
+        "getString" | "get" | "group" | "decrypt" | "unprotect"
+    ) {
+        return false;
+    }
+    let structured_parser = owner.contains("json")
+        || owner.contains("gson")
+        || owner.contains("jackson")
+        || owner.contains("sql")
+        || owner.contains("crypt");
+    if !structured_parser {
+        return false;
+    }
+    arguments.iter().any(|origin| {
+        matches!(
+            origin,
+            ValueOrigin::Constant(ConstantValue::String(value))
+                if matches!(value.to_ascii_lowercase().as_str(), "token" | "password" | "cookie" | "encrypted_key" | "authorization")
+        )
+    })
 }
 
 fn is_base64_decode(owner: &str, name: &str) -> bool {
@@ -1839,8 +2110,214 @@ fn is_http_send(owner: &str, name: &str) -> bool {
 }
 
 fn is_dynamic_load(owner: &str, name: &str) -> bool {
-    (owner.contains("ClassLoader") && name == "defineClass")
+    (name == "defineClass" && (owner.contains("ClassLoader") || !owner.starts_with("java/")))
         || (owner == "java/lang/System" && matches!(name, "load" | "loadLibrary"))
+}
+
+struct IntegrityVerificationFlow {
+    offset: u32,
+    input: u16,
+    evidence: Vec<FlowEvidence>,
+}
+
+fn integrity_verifications(
+    class_file: &ClassScanData,
+    method: &MethodScanData,
+    method_id: &MethodId,
+) -> Vec<IntegrityVerificationFlow> {
+    let mut verifications = Vec::new();
+    for comparison in &method.calls {
+        let Some(result) = comparison.result_origin.as_ref() else {
+            continue;
+        };
+        let Some(branch) = method.branch_conditions.iter().find(|branch| {
+            branch.value_origin == *result && branch_rejects_one_side(method, branch.offset)
+        }) else {
+            continue;
+        };
+        let Some((input_origin, mut evidence)) =
+            integrity_input_for_comparison(class_file, method, method_id, comparison)
+        else {
+            continue;
+        };
+        let Some(input) = local_for_origin(method, &input_origin) else {
+            continue;
+        };
+        evidence.push(FlowEvidence::for_method(
+            method_id,
+            branch.offset,
+            "integrity_success_branch",
+        ));
+        verifications.push(IntegrityVerificationFlow {
+            offset: branch.offset,
+            input,
+            evidence,
+        });
+    }
+    verifications
+}
+
+fn integrity_input_for_comparison(
+    class_file: &ClassScanData,
+    method: &MethodScanData,
+    method_id: &MethodId,
+    comparison: &class_file::CallSite,
+) -> Option<(ValueOrigin, Vec<FlowEvidence>)> {
+    let owner = comparison.owner.as_deref()?;
+    if owner == "java/security/Signature" && comparison.name == "verify" {
+        let receiver = comparison.receiver_origin.as_ref()?;
+        let input = method.calls.iter().rev().find_map(|call| {
+            (call.offset < comparison.offset
+                && call.owner.as_deref() == Some("java/security/Signature")
+                && call.name == "update"
+                && call.receiver_origin.as_ref() == Some(receiver))
+            .then(|| call.argument_origins.first().cloned())
+            .flatten()
+        })?;
+        let has_trusted_key = method.calls.iter().any(|call| {
+            call.offset < comparison.offset
+                && call.owner.as_deref() == Some("java/security/Signature")
+                && call.name == "initVerify"
+                && call.receiver_origin.as_ref() == Some(receiver)
+        });
+        if has_trusted_key {
+            return Some((
+                input,
+                vec![flow_evidence(
+                    class_file,
+                    method_id,
+                    comparison.offset,
+                    "java/security/Signature",
+                    "verify",
+                )],
+            ));
+        }
+    }
+    let actual = if owner == "java/util/Arrays" && comparison.name == "equals" {
+        comparison.argument_origins.iter().find_map(|origin| {
+            digest_input_from_origin(method, origin).map(|value| (origin, value))
+        })?
+    } else if owner == "java/lang/String" && comparison.name == "equals" {
+        let mut values = comparison
+            .receiver_origin
+            .iter()
+            .chain(comparison.argument_origins.iter());
+        values.find_map(|origin| {
+            digest_input_from_origin(method, origin).map(|value| (origin, value))
+        })?
+    } else {
+        return None;
+    };
+    let expected_is_separate = comparison
+        .argument_origins
+        .iter()
+        .chain(comparison.receiver_origin.iter())
+        .any(|origin| origin != actual.0 && !origin_depends_on(method, origin, &actual.1));
+    expected_is_separate.then(|| {
+        let mut evidence = method
+            .calls
+            .iter()
+            .filter(|call| {
+                call.owner.as_deref() == Some("java/security/MessageDigest")
+                    && call.name == "digest"
+                    && call.argument_origins.first() == Some(&actual.1)
+            })
+            .map(|call| {
+                flow_evidence(
+                    class_file,
+                    method_id,
+                    call.offset,
+                    "java/security/MessageDigest",
+                    "digest",
+                )
+            })
+            .collect::<Vec<_>>();
+        evidence.push(flow_evidence(
+            class_file,
+            method_id,
+            comparison.offset,
+            owner,
+            &comparison.name,
+        ));
+        (actual.1, evidence)
+    })
+}
+
+fn digest_input_from_origin(method: &MethodScanData, origin: &ValueOrigin) -> Option<ValueOrigin> {
+    let call = method
+        .calls
+        .iter()
+        .find(|call| call.result_origin.as_ref() == Some(origin))?;
+    let owner = call.owner.as_deref()?;
+    if owner == "java/security/MessageDigest" && call.name == "digest" {
+        let receiver = call.receiver_origin.as_ref()?;
+        let sha256 = method.calls.iter().any(|candidate| {
+            candidate.owner.as_deref() == Some("java/security/MessageDigest")
+                && candidate.name == "getInstance"
+                && candidate.result_origin.as_ref() == Some(receiver)
+                && candidate.argument_origins.iter().any(|argument| {
+                    matches!(argument, ValueOrigin::Constant(ConstantValue::String(value)) if value.eq_ignore_ascii_case("SHA-256"))
+                })
+        });
+        return sha256
+            .then(|| call.argument_origins.first().cloned())
+            .flatten();
+    }
+    if (owner == "java/util/HexFormat" && call.name == "formatHex")
+        || ((owner.contains("Base64") || owner.contains("Encoder"))
+            && matches!(call.name.as_str(), "encodeToString" | "encode"))
+    {
+        return call
+            .argument_origins
+            .first()
+            .and_then(|argument| digest_input_from_origin(method, argument));
+    }
+    None
+}
+
+fn origin_depends_on(method: &MethodScanData, origin: &ValueOrigin, source: &ValueOrigin) -> bool {
+    if origin == source {
+        return true;
+    }
+    method
+        .calls
+        .iter()
+        .find(|call| call.result_origin.as_ref() == Some(origin))
+        .is_some_and(|call| {
+            call.argument_origins
+                .iter()
+                .any(|argument| origin_depends_on(method, argument, source))
+        })
+}
+
+fn branch_rejects_one_side(method: &MethodScanData, branch_offset: u32) -> bool {
+    let Some(index) = method
+        .instructions
+        .iter()
+        .position(|instruction| instruction.offset == branch_offset)
+    else {
+        return false;
+    };
+    let instruction = &method.instructions[index];
+    let target = match instruction.operands.as_slice() {
+        [high, low, ..] => branch_offset as i64 + i64::from(i16::from_be_bytes([*high, *low])),
+        _ => return false,
+    };
+    immediately_rejects(method, index + 1)
+        || method
+            .instructions
+            .iter()
+            .position(|candidate| candidate.offset == target as u32)
+            .is_some_and(|target_index| immediately_rejects(method, target_index))
+}
+
+fn immediately_rejects(method: &MethodScanData, start: usize) -> bool {
+    method
+        .instructions
+        .iter()
+        .skip(start)
+        .take(12)
+        .any(|instruction| matches!(instruction.opcode, 0xac..=0xb1 | 0xbf))
 }
 
 fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> ConfirmedChain {
@@ -1864,6 +2341,11 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
             "CONFIRMED_REMOTE_DYNAMIC_LOAD".to_owned(),
             Severity::Critical,
             80,
+        ),
+        ConfirmedChainKind::IntegrityVerifiedDownloadWriteExecute => (
+            "CONFIRMED_INTEGRITY_VERIFIED_UPDATER".to_owned(),
+            Severity::Low,
+            0,
         ),
     };
     let evidence = std::iter::once(&candidate.source)
@@ -1900,32 +2382,13 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
     }
 }
 
-/// Recognizes a safe updater only when static evidence establishes several
-/// independent safeguards. A method/class name is deliberately not considered.
-fn confirmed_safe_updater_context(
-    data: &ScanData,
-    chains: &[ConfirmedChain],
-) -> Option<ConfirmedChain> {
-    let download = chains
+/// Recognizes a safe updater only when flow analysis has proven that the
+/// downloaded value was cryptographically verified before it was written and
+/// launched. Text such as "sha256" is intentionally irrelevant here.
+fn confirmed_safe_updater_context(chains: &[ConfirmedChain]) -> Option<ConfirmedChain> {
+    let verified = chains
         .iter()
-        .find(|chain| chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC")?;
-    let target_is_jar = download.evidence.iter().any(|evidence| {
-        evidence
-            .target_value
-            .as_deref()
-            .is_some_and(|target| target.to_ascii_lowercase().ends_with(".jar"))
-    });
-    let has_integrity = data.first_party_strings.iter().any(|value| {
-        let value = value.to_ascii_lowercase();
-        value.contains("sha-256")
-            || value.contains("sha256")
-            || value.contains("signature")
-            || value.contains("checksum")
-    });
-    let has_update_context = data.first_party_strings.iter().any(|value| {
-        let value = value.to_ascii_lowercase();
-        value.contains("update") || value.contains("version") || value.contains("release")
-    });
+        .find(|chain| chain.rule_id == "CONFIRMED_INTEGRITY_VERIFIED_UPDATER")?;
     let has_credential_or_dynamic_risk = chains.iter().any(|chain| {
         matches!(
             chain.rule_id.as_str(),
@@ -1934,17 +2397,17 @@ fn confirmed_safe_updater_context(
                 | "CONFIRMED_DECODED_DYNAMIC_LOAD"
         )
     });
-    if !(target_is_jar && has_integrity && has_update_context && !has_credential_or_dynamic_risk) {
+    if has_credential_or_dynamic_risk {
         return None;
     }
     Some(ConfirmedChain {
-        chain_id: format!("safe-updater-{}", download.chain_id),
+        chain_id: format!("safe-updater-{}", verified.chain_id),
         rule_id: "CONFIRMED_SAFE_UPDATER_CONTEXT".to_owned(),
         severity: Severity::Low,
         confidence: Confidence::Medium,
         score_contribution: 0,
         operations: vec!["integrity_verified_updater_context".to_owned()],
-        evidence: download.evidence.clone(),
+        evidence: verified.evidence.clone(),
     })
 }
 
@@ -2166,7 +2629,9 @@ fn is_flow_supported_instruction(opcode: u8) -> bool {
             | 0x3b..=0x4e
             | 0x57..=0x5f
             | 0x60..=0x98
+            | 0x99..=0xa6
             | 0xac..=0xb1
+            | 0x4f..=0x56
             | 0xb2..=0xb9
             | 0xbb..=0xbe
             | 0xc5
@@ -2324,9 +2789,9 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 mod tests {
     use super::{
         add_contextual_findings, file_target_from_origin, has_significant_identifier_overlap,
-        parse_zip_bytes, risk_score, scan_file, summarize, ArchiveContext, ClassScanData, ScanData,
-        ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID,
-        REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
+        is_credential_target, parse_zip_bytes, risk_score, scan_file, summarize, ArchiveContext,
+        ClassScanData, ScanData, ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL,
+        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
     use crate::models::scan::{
@@ -2391,6 +2856,19 @@ mod tests {
             file_target_from_origin(&windows_path),
             file_target_from_origin(&variable_path)
         );
+    }
+
+    #[test]
+    fn credential_paths_require_a_structured_storage_location() {
+        assert!(!is_credential_target(&FileTarget::Known(
+            "config/account-session.json".to_owned(),
+        )));
+        assert!(is_credential_target(&FileTarget::Known(
+            "Discord/Local Storage/leveldb/000005.ldb".to_owned(),
+        )));
+        assert!(is_credential_target(&FileTarget::Known(
+            "Google/Chrome/User Data/Default/Login Data".to_owned(),
+        )));
     }
 
     /// Verifies privacy/network sync is suspicious but not malicious by itself.

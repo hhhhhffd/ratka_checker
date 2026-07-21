@@ -1,0 +1,1 @@
+{"name":"compiled obfuscated clean mod","expected_verdict":"clean","risk_score":{"min":0,"max":5},"minimum_analysis_coverage":30,"expected_obfuscation_level":"high"}

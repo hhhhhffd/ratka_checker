@@ -1,0 +1,1 @@
+{"name":"compiled config read","expected_verdict":"clean","risk_score":{"min":0,"max":5},"forbidden_confirmed_chains":["CONFIRMED_CREDENTIAL_EXFILTRATION"],"minimum_analysis_coverage":30,"expected_obfuscation_level":"none"}

@@ -1,0 +1,1 @@
+{"name":"compiled credential exfiltration","expected_verdict":"malicious","risk_score":{"min":80,"max":100},"required_confirmed_chains":["CONFIRMED_CREDENTIAL_EXFILTRATION"],"required_chain_evidence_operations":["Files.readAllBytes","FixtureHttpClient.post"],"required_chain_scope":"first_party","minimum_analysis_coverage":30,"expected_obfuscation_level":"none"}

@@ -1,0 +1,1 @@
+{"name":"compiled fake SHA-256 updater","expected_verdict":"malicious","risk_score":{"min":70,"max":100},"required_confirmed_chains":["CONFIRMED_DOWNLOAD_WRITE_EXEC"],"forbidden_confirmed_chains":["CONFIRMED_INTEGRITY_VERIFIED_UPDATER","CONFIRMED_SAFE_UPDATER_CONTEXT"],"minimum_analysis_coverage":30,"expected_obfuscation_level":"none"}

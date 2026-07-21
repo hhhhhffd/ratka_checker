@@ -80,6 +80,8 @@ pub enum TransformKind {
     Decompress,
     BytesToString,
     StringToUrl,
+    /// Extracts a token, cookie, password, or browser secret from file data.
+    SecretExtract,
     Other,
 }
 
@@ -158,6 +160,13 @@ pub enum Operation {
         kind: DynamicLoadKind,
         evidence: FlowEvidence,
     },
+    /// A cryptographic verification that is proven to guard the success path.
+    /// The adapter emits this only after linking the downloaded value to a digest
+    /// or signature check and its boolean result to a rejecting branch.
+    IntegrityVerify {
+        input: LocalId,
+        evidence: Vec<FlowEvidence>,
+    },
     Call {
         callee: MethodId,
         arguments: Vec<LocalId>,
@@ -175,6 +184,7 @@ pub enum ConfirmedChainKind {
     CredentialExfiltration,
     DecodedDynamicLoad,
     RemoteDynamicLoad,
+    IntegrityVerifiedDownloadWriteExecute,
 }
 
 /// A chain is emitted only after all its listed operations carry the same taint.
@@ -282,12 +292,19 @@ struct Taint {
     source: FlowEvidence,
     transformations: Vec<FlowEvidence>,
     decoded: bool,
+    secret_extracted: bool,
 }
 
 #[derive(Clone, Debug)]
 struct WrittenValue {
     taint: Taint,
     evidence: FlowEvidence,
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedValue {
+    source: FlowEvidence,
+    evidence: Vec<FlowEvidence>,
 }
 
 struct FrameResult {
@@ -301,6 +318,7 @@ struct ExecutionState {
     /// an execution in another independent class merely because both spell a path
     /// the same way.
     written_files: BTreeMap<FileTarget, Vec<WrittenValue>>,
+    verified_values: Vec<VerifiedValue>,
 }
 
 struct Analyzer<'a> {
@@ -367,6 +385,7 @@ impl<'a> Analyzer<'a> {
                         source: evidence.clone(),
                         transformations: Vec::new(),
                         decoded: false,
+                        secret_extracted: false,
                     };
                     locals.insert(*output, vec![taint]);
                 }
@@ -384,6 +403,7 @@ impl<'a> Analyzer<'a> {
                         .map(|mut taint| {
                             taint.transformations.push(evidence.clone());
                             taint.decoded |= kind.is_decoder();
+                            taint.secret_extracted |= matches!(kind, TransformKind::SecretExtract);
                             taint
                         })
                         .collect();
@@ -430,8 +450,22 @@ impl<'a> Analyzer<'a> {
                                 self.emit(
                                     ConfirmedChainKind::DownloadWriteExecute,
                                     &write.taint,
-                                    vec![write.evidence, evidence.clone()],
+                                    vec![write.evidence.clone(), evidence.clone()],
                                 );
+                                if let Some(verification) = state
+                                    .verified_values
+                                    .iter()
+                                    .find(|verified| verified.source == write.taint.source)
+                                {
+                                    let mut operations = verification.evidence.clone();
+                                    operations.push(write.evidence);
+                                    operations.push(evidence.clone());
+                                    self.emit(
+                                        ConfirmedChainKind::IntegrityVerifiedDownloadWriteExecute,
+                                        &write.taint,
+                                        operations,
+                                    );
+                                }
                             }
                         }
                     }
@@ -448,7 +482,8 @@ impl<'a> Analyzer<'a> {
                 }
                 Operation::NetworkSend { body, evidence } => {
                     for taint in values(&locals, *body) {
-                        if taint.source_kind == SourceKind::CredentialFile {
+                        if taint.source_kind == SourceKind::CredentialFile || taint.secret_extracted
+                        {
                             self.emit(
                                 ConfirmedChainKind::CredentialExfiltration,
                                 &taint,
@@ -475,6 +510,16 @@ impl<'a> Analyzer<'a> {
                                 &taint,
                                 vec![evidence.clone()],
                             );
+                        }
+                    }
+                }
+                Operation::IntegrityVerify { input, evidence } => {
+                    for taint in values(&locals, *input) {
+                        if taint.source_kind == SourceKind::HttpResponse {
+                            state.verified_values.push(VerifiedValue {
+                                source: taint.source,
+                                evidence: evidence.clone(),
+                            });
                         }
                     }
                 }
@@ -612,6 +657,46 @@ mod tests {
             result.confirmed_chains[0].kind,
             ConfirmedChainKind::DownloadWriteExecute
         );
+    }
+
+    #[test]
+    fn records_an_integrity_verified_chain_only_after_the_guard() {
+        let id = method("run", Vec::new()).id;
+        let flow = MethodFlow {
+            id: id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Source {
+                    output: 0,
+                    kind: SourceKind::HttpResponse,
+                    evidence: evidence(&id, 1, "http_response"),
+                },
+                Operation::IntegrityVerify {
+                    input: 0,
+                    evidence: vec![
+                        evidence(&id, 2, "java/security/MessageDigest.digest"),
+                        evidence(&id, 3, "java/util/Arrays.equals"),
+                        evidence(&id, 4, "integrity_success_branch"),
+                    ],
+                },
+                Operation::WriteFile {
+                    input: 0,
+                    destination: FileTarget::Known("/tmp/update.jar".into()),
+                    evidence: evidence(&id, 5, "file_write"),
+                },
+                Operation::ExecuteFile {
+                    target: FileTarget::Known("/tmp/update.jar".into()),
+                    evidence: evidence(&id, 6, "java_launch"),
+                },
+            ],
+        };
+
+        let result = analyze_method_flows(&[flow], &DataFlowConfig::default());
+        assert!(result.confirmed_chains.iter().any(|chain| {
+            chain.kind == ConfirmedChainKind::IntegrityVerifiedDownloadWriteExecute
+        }));
     }
 
     #[test]

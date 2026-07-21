@@ -41,7 +41,8 @@ const FIXTURE_CLASS_NAME: &str = "example/regression/Fixture";
 #[derive(Debug, Deserialize)]
 struct FixtureSpec {
     name: String,
-    scenario: Scenario,
+    #[serde(default)]
+    scenario: Option<Scenario>,
     expected_verdict: ExpectedVerdict,
     risk_score: ScoreRange,
     #[serde(default)]
@@ -58,6 +59,12 @@ struct FixtureSpec {
     minimum_analysis_coverage: u8,
     #[serde(default)]
     required_chain_scope: Option<CodeScope>,
+    #[serde(default)]
+    required_chain_evidence_operations: Vec<String>,
+    #[serde(default)]
+    required_limitations: Vec<String>,
+    #[serde(default)]
+    forbidden_limitations: Vec<String>,
     expected_obfuscation_level: crate::models::scan::ObfuscationLevel,
 }
 
@@ -220,22 +227,42 @@ fn run_fixture(path: &Path, spec: &FixtureSpec, rules: &RulesEngine) -> FixtureR
             };
         }
     };
-    let archive_path = temporary_directory.path().join(GENERATED_JAR_NAME);
-    if let Err(error) = materialize_fixture(&archive_path, spec.scenario) {
-        errors.push(format!(
-            "could not generate safe fixture archive: {error:#}"
-        ));
-        return FixtureResult {
-            name: spec.name.clone(),
-            errors,
-            limitations,
+    let compiled_archive = path.join(GENERATED_JAR_NAME);
+    let using_compiled_archive = compiled_archive.is_file();
+    let archive_path = if using_compiled_archive {
+        compiled_archive
+    } else {
+        let archive_path = temporary_directory.path().join(GENERATED_JAR_NAME);
+        let Some(scenario) = spec.scenario else {
+            errors.push("fixture must provide fixture.jar or a synthetic scenario".to_owned());
+            return FixtureResult {
+                name: spec.name.clone(),
+                errors,
+                limitations,
+            };
         };
-    }
+        if let Err(error) = materialize_fixture(&archive_path, scenario) {
+            errors.push(format!(
+                "could not generate safe fixture archive: {error:#}"
+            ));
+            return FixtureResult {
+                name: spec.name.clone(),
+                errors,
+                limitations,
+            };
+        }
+        archive_path
+    };
 
     let outcome = archive::scan_file(&archive_path, default_limits(), rules);
     errors.extend(assert_report(spec, &outcome));
+    let source_kind = if using_compiled_archive {
+        "compiled JAR; no code was executed"
+    } else {
+        "generated at scan time; no code was executed"
+    };
     limitations.push(format!(
-        "fixture source: {} (generated at scan time; no code was executed)",
+        "fixture source: {} ({source_kind})",
         path.display()
     ));
     FixtureResult {
@@ -327,6 +354,33 @@ fn assert_report(spec: &FixtureSpec, outcome: &ScanOutcome) -> Vec<String> {
     for forbidden in &spec.forbidden_confirmed_chains {
         if confirmed_chain_ids.contains(&forbidden.as_str()) {
             errors.push(format!("forbidden confirmed chain {forbidden} was present"));
+        }
+    }
+    for operation in &spec.required_chain_evidence_operations {
+        if !report.confirmed_chains.iter().any(|chain| {
+            chain
+                .evidence
+                .iter()
+                .any(|evidence| evidence.operation.contains(operation))
+        }) {
+            errors.push(format!(
+                "required chain evidence operation {operation} was absent"
+            ));
+        }
+    }
+    let limitation_codes = report
+        .limitations
+        .iter()
+        .map(|limitation| limitation.code.as_str())
+        .collect::<Vec<_>>();
+    for required in &spec.required_limitations {
+        if !limitation_codes.contains(&required.as_str()) {
+            errors.push(format!("required limitation {required} was absent"));
+        }
+    }
+    for forbidden in &spec.forbidden_limitations {
+        if limitation_codes.contains(&forbidden.as_str()) {
+            errors.push(format!("forbidden limitation {forbidden} was present"));
         }
     }
     if let Some(scope) = &spec.required_chain_scope {
@@ -1048,7 +1102,7 @@ mod tests {
             let archive_path = temporary_directory
                 .path()
                 .join(format!("{}.jar", spec.name));
-            materialize_fixture(&archive_path, spec.scenario)
+            materialize_fixture(&archive_path, spec.scenario.expect("synthetic scenario"))
                 .expect("fixture archive materializes");
             let archive =
                 zip::ZipArchive::new(fs::File::open(&archive_path).expect("fixture opens"));
@@ -1064,7 +1118,7 @@ mod tests {
     fn legacy_assertions_check_only_fields_available_in_scan_outcome() {
         let spec = FixtureSpec {
             name: "test".to_owned(),
-            scenario: Scenario::ConfigWrite,
+            scenario: Some(Scenario::ConfigWrite),
             expected_verdict: ExpectedVerdict::One(Verdict::Clean),
             risk_score: ScoreRange { min: 0, max: 3 },
             required_findings: vec!["REQUIRED".to_owned()],
@@ -1074,6 +1128,9 @@ mod tests {
             forbidden_confirmed_chains: Vec::new(),
             minimum_analysis_coverage: 0,
             required_chain_scope: None,
+            required_chain_evidence_operations: Vec::new(),
+            required_limitations: Vec::new(),
+            forbidden_limitations: Vec::new(),
             expected_obfuscation_level: ObfuscationLevel::None,
         };
         let finding = Finding::legacy(
