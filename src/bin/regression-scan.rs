@@ -866,6 +866,8 @@ mod tests {
                     message: String::new(),
                     evidence: Vec::new(),
                 }],
+                decoded_strings: Vec::new(),
+                text_resources: Vec::new(),
                 findings: vec![finding.clone()],
                 confirmed_chains: Vec::new(),
                 obfuscation: Obfuscation::default(),

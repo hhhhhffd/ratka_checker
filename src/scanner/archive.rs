@@ -9,8 +9,9 @@ use zip::ZipArchive;
 
 use crate::{
     models::scan::{
-        AnalysisCoverage, Capability, CodeScope, Confidence, ConfirmedChain, Evidence, Finding,
-        Limitation, Obfuscation, ObfuscationLevel, ScanReport, Severity, Verdict,
+        AnalysisCoverage, Capability, CodeScope, Confidence, ConfirmedChain, DecodedString,
+        Evidence, Finding, Limitation, Obfuscation, ObfuscationLevel, ScanReport, Severity,
+        TextResource, Verdict,
     },
     rules::engine::RulesEngine,
     scanner::{
@@ -21,7 +22,7 @@ use crate::{
             analyze_method_flows, ConfirmedChainCandidate, ConfirmedChainKind, DataFlowConfig,
             FileTarget, FlowEvidence, MethodFlow, MethodId, Operation, SourceKind, TransformKind,
         },
-        metadata, native, obfuscation,
+        metadata, native, obfuscation, paths,
         scope::{
             classify_classes, ArchiveScopeInput, ClassScopeInput, DependencyMetadata,
             ScopeClassificationInput,
@@ -105,6 +106,8 @@ pub struct ScanData {
     /// their parent archive.
     pub archive_layers: Vec<ArchiveLayer>,
     pub resource_files: Vec<ResourceScanData>,
+    /// Decoding failures are retained as limitations, never transformed into strings.
+    pub normalization_limitations: Vec<Limitation>,
     /// Neutral archive facts such as bundled native libraries and large assets.
     pub archive_capabilities: Vec<Capability>,
     pub embedded_native_capabilities: Vec<Capability>,
@@ -143,6 +146,8 @@ pub struct ResourceScanData {
     /// Shannon entropy in thousandths of a bit per byte. Keeping an integer
     /// makes resource metadata comparable without retaining resource bytes.
     pub entropy_milli_bits: u16,
+    pub detected_encoding: Option<String>,
+    pub decoding_confidence: Confidence,
 }
 
 /// Per-class data used for lower-noise correlation signals.
@@ -253,6 +258,7 @@ fn scan_bytes(
             evidence: Vec::new(),
         })
         .collect::<Vec<_>>();
+    limitations.extend(context.data.normalization_limitations.clone());
     if !matches!(obfuscation.obfuscation.level, ObfuscationLevel::None) {
         limitations.push(Limitation {
             code: "OBFUSCATED_CODE".to_owned(),
@@ -287,6 +293,8 @@ fn scan_bytes(
             .chain(contextual_results.capabilities)
             .chain(chain_capabilities)
             .collect(),
+        decoded_strings: decoded_strings(&obfuscation.decoded_values),
+        text_resources: text_resources(&context.data.resource_files),
         findings: findings.clone(),
         confirmed_chains,
         obfuscation: obfuscation.obfuscation,
@@ -541,11 +549,31 @@ impl ArchiveContext {
             return parse_zip_bytes(bytes, &child_archive_id, self);
         }
 
+        let decoded_text = strings::decode_text_resource(name, bytes);
         if metadata::is_metadata_file(name) {
+            let decoded = match &decoded_text {
+                Ok(Some(decoded)) => decoded,
+                Ok(None) => {
+                    self.add_text_decoding_limitation(
+                        archive_id,
+                        name,
+                        "ресурс metadata не распознан как текст",
+                    )?;
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.add_text_decoding_limitation(
+                        archive_id,
+                        name,
+                        "не удалось определить корректную кодировку metadata",
+                    )?;
+                    return Ok(());
+                }
+            };
             self.archive_layer_mut(archive_id)?
                 .mod_metadata
                 .push(name.to_owned());
-            let metadata = metadata::extract_metadata(name, bytes);
+            let metadata = metadata::extract_metadata(name, &decoded.text);
             self.archive_layer_mut(archive_id)?
                 .entrypoint_classes
                 .extend(metadata.entrypoint_classes.clone());
@@ -602,12 +630,60 @@ impl ArchiveContext {
                 path: name.to_owned(),
                 uncompressed_size: bytes.len() as u64,
                 entropy_milli_bits: shannon_entropy_milli_bits(bytes),
+                detected_encoding: decoded_text
+                    .as_ref()
+                    .ok()
+                    .and_then(|decoded| decoded.as_ref())
+                    .map(|decoded| decoded.encoding.as_str().to_owned()),
+                decoding_confidence: decoded_text
+                    .as_ref()
+                    .ok()
+                    .and_then(|decoded| decoded.as_ref())
+                    .map(|decoded| decoded.confidence.clone())
+                    .unwrap_or(Confidence::Low),
             });
-            self.data
-                .strings
-                .extend(strings::extract_printable_strings(bytes));
+            match decoded_text {
+                Ok(Some(decoded)) => self.data.strings.push(decoded.text),
+                Ok(None) => self
+                    .data
+                    .strings
+                    .extend(strings::extract_printable_strings(bytes)),
+                Err(_) => self.add_text_decoding_limitation(
+                    archive_id,
+                    name,
+                    "не удалось определить корректную кодировку текстового ресурса",
+                )?,
+            }
         }
 
+        Ok(())
+    }
+
+    fn add_text_decoding_limitation(
+        &mut self,
+        archive_id: &str,
+        path: &str,
+        message: &str,
+    ) -> Result<(), ScanAbort> {
+        self.data.normalization_limitations.push(Limitation {
+            code: "TEXT_DECODING_LIMITATION".to_owned(),
+            message: format!("{message}: {path}"),
+            evidence: vec![Evidence {
+                archive_id: archive_id.to_owned(),
+                archive_path: self.archive_path(archive_id)?,
+                class_name: None,
+                method_name: None,
+                method_descriptor: None,
+                bytecode_offset: None,
+                resource_path: Some(path.to_owned()),
+                operation: "text_decoding".to_owned(),
+                value_preview: None,
+                source_value: None,
+                target_value: None,
+                confidence: Confidence::Low,
+                scope: CodeScope::Resource,
+            }],
+        });
         Ok(())
     }
 
@@ -645,6 +721,9 @@ impl ArchiveContext {
                     resource_path: Some(name.to_owned()),
                     operation: "embedded_native_binary".to_owned(),
                     value_preview,
+                    source_value: None,
+                    target_value: None,
+                    confidence: Confidence::High,
                     scope: CodeScope::Resource,
                 }],
             };
@@ -689,6 +768,9 @@ impl ArchiveContext {
                     resource_path: Some(name.to_owned()),
                     operation: "large_asset".to_owned(),
                     value_preview: Some(format!("{} bytes", bytes.len())),
+                    source_value: None,
+                    target_value: None,
+                    confidence: Confidence::High,
                     scope: CodeScope::Resource,
                 }],
             });
@@ -1213,12 +1295,18 @@ fn add_contextual_findings(findings: &mut Vec<Finding>, data: &ScanData) {
     }
 
     if has_privacy_network_sync(data) {
-        findings.push(Finding::legacy(
-            PRIVACY_NETWORK_SYNC_RULE_ID,
-            "privacy",
-            Severity::Medium,
-            "Обнаружена связка сеть/WebSocket + идентификаторы игрока/сервера + Authorization/Bearer; похоже на privacy/network sync, но не на RAT без exec/classload/credential цепочки.",
-        ));
+        findings.push(Finding {
+            rule_id: PRIVACY_NETWORK_SYNC_RULE_ID.to_owned(),
+            category: "privacy".to_owned(),
+            kind: crate::models::scan::FindingKind::Heuristic,
+            severity: Severity::Medium,
+            confidence: Confidence::Low,
+            score_contribution: 0,
+            scope: CodeScope::FirstParty,
+            message: "Обнаружена связка сеть/WebSocket + идентификаторы игрока/сервера + Authorization/Bearer; без доказанного потока данных это требует ручной проверки.".to_owned(),
+            evidence: Vec::new(),
+            related_chain_id: None,
+        });
     }
 }
 
@@ -1307,6 +1395,15 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
         }
         if is_credential_read(owner, &call.name) {
             if let Some(output) = output {
+                let mut evidence = evidence;
+                evidence.source_value = call
+                    .argument_origins
+                    .first()
+                    .and_then(file_target_from_origin)
+                    .and_then(|target| match target {
+                        FileTarget::Known(value) => Some(value),
+                        FileTarget::Unknown => None,
+                    });
                 operations.push(Operation::Source {
                     output,
                     kind: SourceKind::CredentialFile,
@@ -1328,27 +1425,36 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
         }
         if is_file_write(owner, &call.name) {
             if let Some(input) = arguments.last().copied() {
+                let destination = call
+                    .argument_origins
+                    .first()
+                    .and_then(file_target_from_origin)
+                    .unwrap_or(FileTarget::Unknown);
+                let mut evidence = evidence;
+                evidence.target_value = match &destination {
+                    FileTarget::Known(value) => Some(value.clone()),
+                    FileTarget::Unknown => None,
+                };
                 operations.push(Operation::WriteFile {
                     input,
-                    destination: call
-                        .argument_origins
-                        .first()
-                        .and_then(file_target_from_origin)
-                        .unwrap_or(FileTarget::Unknown),
+                    destination,
                     evidence,
                 });
             }
             continue;
         }
         if is_process_execution(owner, &call.name) {
-            operations.push(Operation::ExecuteFile {
-                target: call
-                    .argument_origins
-                    .first()
-                    .and_then(file_target_from_origin)
-                    .unwrap_or(FileTarget::Unknown),
-                evidence,
-            });
+            let target = call
+                .argument_origins
+                .first()
+                .and_then(file_target_from_origin)
+                .unwrap_or(FileTarget::Unknown);
+            let mut evidence = evidence;
+            evidence.target_value = match &target {
+                FileTarget::Known(value) => Some(value.clone()),
+                FileTarget::Unknown => None,
+            };
+            operations.push(Operation::ExecuteFile { target, evidence });
             continue;
         }
         if is_http_send(owner, &call.name) {
@@ -1389,7 +1495,10 @@ fn local_for_origin(method: &MethodScanData, origin: &ValueOrigin) -> Option<u16
 fn file_target_from_origin(origin: &ValueOrigin) -> Option<FileTarget> {
     match origin {
         ValueOrigin::Constant(ConstantValue::String(value)) => {
-            Some(FileTarget::Known(value.clone()))
+            let normalized = paths::normalize_symbolic_path(value)
+                .map(|path| path.canonical)
+                .unwrap_or_else(|| value.replace('\\', "/"));
+            Some(FileTarget::Known(normalized))
         }
         _ => None,
     }
@@ -1411,6 +1520,8 @@ fn flow_evidence(
         bytecode_offset: offset,
         operation: format!("{owner}.{name}"),
         value_preview: None,
+        source_value: None,
+        target_value: None,
     }
 }
 
@@ -1482,6 +1593,9 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
             resource_path: None,
             operation: flow.operation.clone(),
             value_preview: flow.value_preview.clone(),
+            source_value: flow.source_value.clone(),
+            target_value: flow.target_value.clone(),
+            confidence: Confidence::High,
             scope: CodeScope::FirstParty,
         })
         .collect();
@@ -1570,6 +1684,9 @@ fn risk_score(
 ) -> u8 {
     let mut category_scores = HashMap::<&str, u16>::new();
     for finding in findings {
+        if !finding_is_risk_bearing(finding) {
+            continue;
+        }
         let cap = category_score_cap(&finding.category);
         let score = u16::from(finding_score_weight(finding)).min(cap);
         let total = category_scores.entry(&finding.category).or_default();
@@ -1585,6 +1702,13 @@ fn risk_score(
         .sum::<u16>()
         .saturating_add(chain_score)
         .min(100) as u8
+}
+
+/// Facts from broad rules are intentionally non-scoring until an analyzer can
+/// attach contextual source-level evidence to them.
+fn finding_is_risk_bearing(finding: &Finding) -> bool {
+    finding.kind != crate::models::scan::FindingKind::Heuristic
+        && (!finding.evidence.is_empty() || finding.category == "virustotal")
 }
 
 /// Reports how much archive content reached the bounded static analyzers.
@@ -1621,6 +1745,51 @@ fn analysis_coverage(data: &ScanData) -> AnalysisCoverage {
         total_resources,
         analyzed_resources,
     }
+}
+
+fn decoded_strings(values: &[obfuscation::DecodedValue]) -> Vec<DecodedString> {
+    values
+        .iter()
+        .map(|value| DecodedString {
+            original_value: value.original_value.clone(),
+            decoder_method: value.transform.to_owned(),
+            decoded_value: value.value.clone(),
+            confidence: value.confidence.clone(),
+            evidence: Evidence {
+                archive_id: value.archive_id.clone(),
+                archive_path: value.archive_path.clone(),
+                class_name: Some(value.class_name.clone()),
+                method_name: Some(value.method_name.clone()),
+                method_descriptor: Some(value.method_descriptor.clone()),
+                bytecode_offset: Some(value.bytecode_offset),
+                resource_path: None,
+                operation: "decoded_string".to_owned(),
+                value_preview: Some(value.value.clone()),
+                source_value: Some(value.original_value.clone()),
+                target_value: Some(value.value.clone()),
+                confidence: value.confidence.clone(),
+                scope: CodeScope::FirstParty,
+            },
+        })
+        .collect()
+}
+
+fn text_resources(resources: &[ResourceScanData]) -> Vec<TextResource> {
+    resources
+        .iter()
+        .filter_map(|resource| {
+            resource
+                .detected_encoding
+                .as_ref()
+                .map(|encoding| TextResource {
+                    archive_id: resource.archive_id.clone(),
+                    archive_path: resource.archive_path.clone(),
+                    resource_path: resource.path.clone(),
+                    detected_encoding: encoding.clone(),
+                    confidence: resource.decoding_confidence.clone(),
+                })
+        })
+        .collect()
 }
 
 fn category_score_cap(category: &str) -> u16 {
@@ -1696,6 +1865,8 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
         obfuscation_score: 0,
         analysis_coverage: AnalysisCoverage::default(),
         capabilities: Vec::new(),
+        decoded_strings: Vec::new(),
+        text_resources: Vec::new(),
         findings: vec![finding.clone()],
         confirmed_chains: Vec::new(),
         obfuscation: Obfuscation::default(),
@@ -1713,14 +1884,20 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 #[cfg(test)]
 mod tests {
     use super::{
-        add_contextual_findings, has_significant_identifier_overlap, parse_zip_bytes, risk_score,
-        scan_file, summarize, ArchiveContext, ClassScanData, ScanData, ScanLimits,
-        EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
-        TIMESTAMP_OUTLIER_SIGNAL,
+        add_contextual_findings, file_target_from_origin, has_significant_identifier_overlap,
+        parse_zip_bytes, risk_score, scan_file, summarize, ArchiveContext, ClassScanData, ScanData,
+        ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID,
+        REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
-    use crate::models::scan::{CodeScope, Confidence, Finding, Obfuscation, Severity, Verdict};
+    use crate::models::scan::{
+        CodeScope, Confidence, Evidence, Finding, Obfuscation, Severity, Verdict,
+    };
     use crate::rules::engine::RulesEngine;
+    use crate::scanner::{
+        class_file::{ConstantValue, ValueOrigin},
+        dataflow::FileTarget,
+    };
     use std::{
         io::{Cursor, Write},
         path::Path,
@@ -1731,16 +1908,16 @@ mod tests {
     #[test]
     fn risk_score_caps_at_100() {
         let findings = vec![
-            Finding::legacy("A", "x", Severity::Critical, "a"),
-            Finding::legacy("B", "x", Severity::Critical, "b"),
-            Finding::legacy("C", "x", Severity::High, "c"),
+            evidenced_finding("A", "x", Severity::Critical),
+            evidenced_finding("B", "x", Severity::Critical),
+            evidenced_finding("C", "x", Severity::High),
         ];
         assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 100);
     }
 
     /// Verifies noisy standalone rules stay below the malicious threshold.
     #[test]
-    fn risk_score_discounts_weak_false_positive_rules() {
+    fn risk_score_ignores_legacy_matches_without_evidence() {
         let findings = vec![
             Finding::legacy(
                 "TIMESTAMP_OUTLIER",
@@ -1753,12 +1930,33 @@ mod tests {
             Finding::legacy("XOR_LOOP_HINT", "obfuscation", Severity::Low, "xor"),
         ];
 
-        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 10);
+        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
+    }
+
+    #[test]
+    fn file_targets_use_symbolic_paths_for_data_flow_comparison() {
+        let windows_path = ValueOrigin::Constant(ConstantValue::String(
+            r"C:\Users\User\AppData\Roaming\ratka\loader.jar".to_owned(),
+        ));
+        let variable_path = ValueOrigin::Constant(ConstantValue::String(
+            "%APPDATA%/Roaming/ratka/loader.jar".to_owned(),
+        ));
+
+        assert_eq!(
+            file_target_from_origin(&windows_path),
+            Some(FileTarget::Known(
+                "AppData/Roaming/ratka/loader.jar".to_owned()
+            ))
+        );
+        assert_eq!(
+            file_target_from_origin(&windows_path),
+            file_target_from_origin(&variable_path)
+        );
     }
 
     /// Verifies privacy/network sync is suspicious but not malicious by itself.
     #[test]
-    fn privacy_network_sync_scores_as_suspicious() {
+    fn privacy_network_sync_requires_flow_evidence_before_scoring() {
         let mut findings = vec![
             Finding::legacy(
                 "TIMESTAMP_OUTLIER",
@@ -1789,7 +1987,7 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding.rule_id == PRIVACY_NETWORK_SYNC_RULE_ID));
-        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 30);
+        assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
     }
 
     /// Verifies related reversed/rotated identifiers do not produce namespace mismatch noise.
@@ -2080,6 +2278,26 @@ mod tests {
             },
             next_archive_id: 1,
         }
+    }
+
+    fn evidenced_finding(rule_id: &str, category: &str, severity: Severity) -> Finding {
+        let mut finding = Finding::legacy(rule_id, category, severity, "evidence-backed");
+        finding.evidence.push(Evidence {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
+            class_name: Some("example/Mod".to_owned()),
+            method_name: Some("run".to_owned()),
+            method_descriptor: Some("()V".to_owned()),
+            bytecode_offset: Some(0),
+            resource_path: None,
+            operation: "test".to_owned(),
+            value_preview: None,
+            source_value: None,
+            target_value: None,
+            confidence: Confidence::High,
+            scope: CodeScope::FirstParty,
+        });
+        finding
     }
 
     fn archive_test_context() -> ArchiveContext {

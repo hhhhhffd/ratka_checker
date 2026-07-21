@@ -5,9 +5,9 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::scan::{
-    AnalysisCoverage, Capability, CodeScope, Confidence, ConfirmedChain, Finding, FindingKind,
-    Limitation, Obfuscation, ScanReport, ScanResponse, ScanStatus, Severity, Verdict,
-    VirusTotalReport, VirusTotalSource,
+    AnalysisCoverage, Capability, CodeScope, Confidence, ConfirmedChain, DecodedString, Finding,
+    FindingKind, Limitation, Obfuscation, ScanReport, ScanResponse, ScanStatus, Severity,
+    TextResource, Verdict, VirusTotalReport, VirusTotalSource,
 };
 use crate::virustotal;
 
@@ -62,6 +62,24 @@ struct LimitationRow {
     code: String,
     message: String,
     evidence: serde_json::Value,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DecodedStringRow {
+    original_value: String,
+    decoder_method: String,
+    decoded_value: String,
+    confidence: String,
+    evidence: serde_json::Value,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct TextResourceRow {
+    archive_id: String,
+    archive_path: String,
+    resource_path: String,
+    detected_encoding: String,
+    confidence: String,
 }
 
 /// Database row for cached VirusTotal reports.
@@ -217,6 +235,8 @@ pub async fn complete_scan_report(
     replace_capabilities(&mut tx, scan_id, &report.capabilities).await?;
     replace_confirmed_chains(&mut tx, scan_id, &report.confirmed_chains).await?;
     replace_limitations(&mut tx, scan_id, &report.limitations).await?;
+    replace_decoded_strings(&mut tx, scan_id, &report.decoded_strings).await?;
+    replace_text_resources(&mut tx, scan_id, &report.text_resources).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -446,12 +466,68 @@ async fn replace_limitations(
     Ok(())
 }
 
+async fn replace_decoded_strings(
+    tx: &mut Transaction<'_, Postgres>,
+    scan_id: Uuid,
+    values: &[DecodedString],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM scan_decoded_strings WHERE scan_id = $1")
+        .bind(scan_id)
+        .execute(&mut **tx)
+        .await?;
+    for value in values {
+        sqlx::query(
+            r#"INSERT INTO scan_decoded_strings
+                (scan_id, original_value, decoder_method, decoded_value, confidence, evidence)
+                VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(scan_id)
+        .bind(&value.original_value)
+        .bind(&value.decoder_method)
+        .bind(&value.decoded_value)
+        .bind(value.confidence.as_str())
+        .bind(serde_json::to_value(&value.evidence)?)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn replace_text_resources(
+    tx: &mut Transaction<'_, Postgres>,
+    scan_id: Uuid,
+    resources: &[TextResource],
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM scan_text_resources WHERE scan_id = $1")
+        .bind(scan_id)
+        .execute(&mut **tx)
+        .await?;
+    for resource in resources {
+        sqlx::query(
+            r#"INSERT INTO scan_text_resources
+                (scan_id, archive_id, archive_path, resource_path, detected_encoding, confidence)
+                VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(scan_id)
+        .bind(&resource.archive_id)
+        .bind(&resource.archive_path)
+        .bind(&resource.resource_path)
+        .bind(&resource.detected_encoding)
+        .bind(resource.confidence.as_str())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Converts database rows to the public response and validates enum strings at the boundary.
 async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<ScanResponse> {
     let findings = scan_findings(pool, scan.id).await?;
     let capabilities = scan_capabilities(pool, scan.id).await?;
     let confirmed_chains = scan_confirmed_chains(pool, scan.id).await?;
     let limitations = scan_limitations(pool, scan.id).await?;
+    let decoded_strings = scan_decoded_strings(pool, scan.id).await?;
+    let text_resources = scan_text_resources(pool, scan.id).await?;
     let virustotal = find_virustotal_report_for_response(pool, &scan.sha256).await?;
     Ok(ScanResponse {
         scan_id: scan.id,
@@ -463,6 +539,8 @@ async fn scan_response_from_row(pool: &PgPool, scan: ScanRow) -> anyhow::Result<
         obfuscation_score: serde_json::from_value::<Obfuscation>(scan.obfuscation.clone())?.score,
         analysis_coverage: serde_json::from_value::<AnalysisCoverage>(scan.analysis_coverage)?,
         capabilities,
+        decoded_strings,
+        text_resources,
         findings,
         confirmed_chains,
         obfuscation: serde_json::from_value::<Obfuscation>(scan.obfuscation)?,
@@ -554,6 +632,48 @@ async fn scan_limitations(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<Li
                 code: row.code,
                 message: row.message,
                 evidence: serde_json::from_value(row.evidence)?,
+            })
+        })
+        .collect()
+}
+
+async fn scan_decoded_strings(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<DecodedString>> {
+    let rows = sqlx::query_as::<_, DecodedStringRow>(
+        r#"SELECT original_value, decoder_method, decoded_value, confidence, evidence
+           FROM scan_decoded_strings WHERE scan_id = $1 ORDER BY id ASC"#,
+    )
+    .bind(scan_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(DecodedString {
+                original_value: row.original_value,
+                decoder_method: row.decoder_method,
+                decoded_value: row.decoded_value,
+                confidence: Confidence::from_db(&row.confidence)?,
+                evidence: serde_json::from_value(row.evidence)?,
+            })
+        })
+        .collect()
+}
+
+async fn scan_text_resources(pool: &PgPool, scan_id: Uuid) -> anyhow::Result<Vec<TextResource>> {
+    let rows = sqlx::query_as::<_, TextResourceRow>(
+        r#"SELECT archive_id, archive_path, resource_path, detected_encoding, confidence
+           FROM scan_text_resources WHERE scan_id = $1 ORDER BY id ASC"#,
+    )
+    .bind(scan_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(TextResource {
+                archive_id: row.archive_id,
+                archive_path: row.archive_path,
+                resource_path: row.resource_path,
+                detected_encoding: row.detected_encoding,
+                confidence: Confidence::from_db(&row.confidence)?,
             })
         })
         .collect()

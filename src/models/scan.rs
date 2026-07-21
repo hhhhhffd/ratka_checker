@@ -227,6 +227,12 @@ pub struct Evidence {
     pub operation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_value: Option<String>,
+    #[serde(default)]
+    pub confidence: Confidence,
     #[serde(default)]
     pub scope: CodeScope,
 }
@@ -238,6 +244,26 @@ pub struct Capability {
     pub message: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+}
+
+/// A value recovered without executing submitted code, together with its origin.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DecodedString {
+    pub original_value: String,
+    pub decoder_method: String,
+    pub decoded_value: String,
+    pub confidence: Confidence,
+    pub evidence: Evidence,
+}
+
+/// A text resource decoded without executing archive code.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TextResource {
+    pub archive_id: String,
+    pub archive_path: String,
+    pub resource_path: String,
+    pub detected_encoding: String,
+    pub confidence: Confidence,
 }
 
 /// A sequence of operations connected by data-flow evidence.
@@ -310,6 +336,10 @@ pub struct ScanReport {
     pub analysis_coverage: AnalysisCoverage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<Capability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decoded_strings: Vec<DecodedString>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_resources: Vec<TextResource>,
     #[serde(default)]
     pub findings: Vec<Finding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -612,6 +642,10 @@ pub struct ScanResponse {
     #[serde(default)]
     pub capabilities: Vec<Capability>,
     #[serde(default)]
+    pub decoded_strings: Vec<DecodedString>,
+    #[serde(default)]
+    pub text_resources: Vec<TextResource>,
+    #[serde(default)]
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub confirmed_chains: Vec<ConfirmedChain>,
@@ -705,6 +739,8 @@ mod tests {
             obfuscation_score: 0,
             analysis_coverage: AnalysisCoverage::default(),
             capabilities: Vec::new(),
+            decoded_strings: Vec::new(),
+            text_resources: Vec::new(),
             findings: Vec::new(),
             confirmed_chains: Vec::new(),
             obfuscation: Obfuscation::default(),

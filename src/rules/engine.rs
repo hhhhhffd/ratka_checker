@@ -3,7 +3,7 @@ use std::{collections::HashSet, fs, path::Path};
 use regex::Regex;
 
 use crate::{
-    models::scan::Finding,
+    models::scan::{CodeScope, Confidence, Finding, FindingKind},
     rules::model::{MatchType, Rule},
     scanner::archive::ScanData,
 };
@@ -50,12 +50,7 @@ impl RulesEngine {
                 && self.rule_matches(compiled, data)
             {
                 emitted_rule_ids.insert(compiled.rule.rule_id.clone());
-                findings.push(Finding::legacy(
-                    compiled.rule.rule_id.clone(),
-                    compiled.rule.category.clone(),
-                    compiled.rule.severity.clone(),
-                    compiled.rule.message.clone(),
-                ));
+                findings.push(rule_observation(&compiled.rule));
             }
         }
 
@@ -96,6 +91,23 @@ impl RulesEngine {
                 .iter()
                 .any(|signal| signal.eq_ignore_ascii_case(&compiled.rule.pattern)),
         }
+    }
+}
+
+/// A YAML match is an observation only. It has no source-level evidence, so it
+/// cannot contribute to risk until a context or chain recognizer corroborates it.
+fn rule_observation(rule: &Rule) -> Finding {
+    Finding {
+        rule_id: rule.rule_id.clone(),
+        category: rule.category.clone(),
+        kind: FindingKind::Heuristic,
+        severity: rule.severity.clone(),
+        confidence: Confidence::Low,
+        score_contribution: 0,
+        scope: CodeScope::Unknown,
+        message: rule.message.clone(),
+        evidence: Vec::new(),
+        related_chain_id: None,
     }
 }
 
@@ -152,10 +164,18 @@ mod tests {
             entrypoint_classes: Vec::new(),
             archive_layers: Vec::new(),
             resource_files: Vec::new(),
+            normalization_limitations: Vec::new(),
             archive_capabilities: Vec::new(),
             embedded_native_capabilities: Vec::new(),
         };
-        assert_eq!(engine.evaluate(&data).len(), 1);
+        let findings = engine.evaluate(&data);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].kind,
+            crate::models::scan::FindingKind::Heuristic
+        );
+        assert_eq!(findings[0].score_contribution, 0);
+        assert!(findings[0].evidence.is_empty());
     }
 
     /// Verifies bytecode API rules use scoped first-party references, not vendored deps.

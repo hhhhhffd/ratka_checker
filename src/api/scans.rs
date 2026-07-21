@@ -232,6 +232,8 @@ mod tests {
             obfuscation_score: 0,
             analysis_coverage: AnalysisCoverage::default(),
             capabilities: vec![capability.clone()],
+            decoded_strings: Vec::new(),
+            text_resources: Vec::new(),
             findings: Vec::new(),
             confirmed_chains: Vec::new(),
             obfuscation: Obfuscation::default(),

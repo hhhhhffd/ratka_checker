@@ -7,7 +7,10 @@ use std::collections::HashSet;
 
 use crate::{
     models::scan::{Capability, CodeScope, Confidence, Evidence, Finding, FindingKind, Severity},
-    scanner::archive::{ClassScanData, ScanData},
+    scanner::{
+        archive::{ClassScanData, ScanData},
+        paths::normalize_symbolic_path,
+    },
 };
 
 const CONFIG_FILE_WRITE_RULE_ID: &str = "CONFIG_FILE_WRITE";
@@ -272,6 +275,9 @@ pub fn recognize(data: &ScanData) -> ContextRecognition {
                 resource_path: None,
                 operation: "nested_dependency".to_owned(),
                 value_preview: None,
+                source_value: None,
+                target_value: None,
+                confidence: Confidence::High,
                 scope: CodeScope::BundledDependency,
             }],
         );
@@ -542,8 +548,10 @@ fn has_ref(class_file: &ClassScanData, reference: &str) -> bool {
 }
 
 fn is_safe_config_path(value: &str) -> bool {
-    let normalized = value.replace('\\', "/").to_ascii_lowercase();
-    let is_config_path = normalized.starts_with("config/")
+    let normalized = normalize_symbolic_path(value)
+        .map(|path| path.canonical.to_ascii_lowercase())
+        .unwrap_or_else(|| value.replace('\\', "/").to_ascii_lowercase());
+    let is_config_path = normalized.starts_with("minecraft/config/")
         || normalized.contains("/config/")
         || normalized.starts_with("<fabric_config_dir>/");
     is_config_path
@@ -598,6 +606,9 @@ fn class_evidence(
         resource_path: Some(class_file.path.clone()),
         operation: operation.to_owned(),
         value_preview: value_preview.map(ToOwned::to_owned),
+        source_value: None,
+        target_value: None,
+        confidence: class_file.classification_confidence.clone(),
         scope: class_file.scope.clone(),
     }
 }

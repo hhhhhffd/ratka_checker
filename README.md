@@ -60,6 +60,18 @@ resource counters. It is never a risk score. Standalone APIs, embedded native
 binaries, large assets, and build metadata are reported as `capabilities`; they
 become risk-bearing only when evidence links them into a dangerous chain.
 
+Text resources are decoded only through a bounded detector (UTF-8, UTF-8 BOM,
+UTF-16 LE/BE, Windows-1251, ISO-8859-1). A resource whose text encoding cannot
+be established becomes a `limitation`, never a string-based finding. Responses
+also retain `text_resources` (encoding and confidence) and `decoded_strings`
+(original value, decoder, result, and bytecode provenance). File paths used by
+data-flow are compared symbolically, so equivalent `%APPDATA%`, Windows, and
+Java-home forms do not break a confirmed chain.
+
+YAML rule matches are non-scoring `heuristic` observations. Only contextual
+findings with source-level evidence, confirmed data-flow chains, or trusted
+VirusTotal evidence can affect `risk_score` and `verdict`.
+
 `malicious` requires a confirmed dangerous chain (for example credential
 exfiltration, remote download → write → execute, or decoded dynamic loading)
 or a trusted VirusTotal detection; weak API matches cannot produce it by

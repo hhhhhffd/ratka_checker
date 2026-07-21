@@ -30,6 +30,8 @@ pub struct FlowEvidence {
     pub bytecode_offset: u32,
     pub operation: String,
     pub value_preview: Option<String>,
+    pub source_value: Option<String>,
+    pub target_value: Option<String>,
 }
 
 impl FlowEvidence {
@@ -47,6 +49,8 @@ impl FlowEvidence {
             bytecode_offset,
             operation: operation.into(),
             value_preview: None,
+            source_value: None,
+            target_value: None,
         }
     }
 }

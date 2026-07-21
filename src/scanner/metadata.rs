@@ -29,11 +29,10 @@ pub struct MetadataData {
 }
 
 /// Extracts manifest-style fields, raw text, mod ids, and contextual modloader hints.
-pub fn extract_metadata(path: &str, bytes: &[u8]) -> MetadataData {
-    let text = String::from_utf8_lossy(bytes).to_string();
+pub fn extract_metadata(path: &str, text: &str) -> MetadataData {
     let mut data = MetadataData {
         manifest_fields: vec![path.to_owned()],
-        strings: vec![text.clone()],
+        strings: vec![text.to_owned()],
         mod_ids: Vec::new(),
         mod_aliases: Vec::new(),
         entrypoint_classes: Vec::new(),

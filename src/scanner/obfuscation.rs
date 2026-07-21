@@ -26,15 +26,19 @@ pub struct ObfuscationAnalysis {
     pub decoded_values: Vec<DecodedValue>,
 }
 
-/// A recovered value retained only long enough to re-run normal static rules.
+/// A recovered value and its static-analysis provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedValue {
     pub archive_id: String,
+    pub archive_path: String,
     pub class_name: String,
     pub method_name: String,
+    pub method_descriptor: String,
     pub bytecode_offset: u32,
     pub transform: &'static str,
+    pub original_value: String,
     pub value: String,
+    pub confidence: Confidence,
 }
 
 /// Calculates obfuscation independently from risk scoring and adds safely
@@ -256,8 +260,17 @@ fn decode_method_literals(class: &ClassScanData, method: &MethodScanData) -> Vec
     let mut values = Vec::new();
     if method.calls.iter().any(is_base64_decode_call) {
         values.extend(literals.iter().filter_map(|(offset, value)| {
-            decode_base64(value)
-                .and_then(|decoded| decoded_value(class, method, *offset, "base64", decoded))
+            decode_base64(value).and_then(|decoded| {
+                decoded_value(
+                    class,
+                    method,
+                    *offset,
+                    "base64",
+                    value,
+                    decoded,
+                    Confidence::Medium,
+                )
+            })
         }));
     }
     if method.calls.iter().any(is_reverse_call) {
@@ -267,7 +280,9 @@ fn decode_method_literals(class: &ClassScanData, method: &MethodScanData) -> Vec
                 method,
                 *offset,
                 "reverse",
+                value,
                 value.chars().rev().collect(),
+                Confidence::Medium,
             )
         }));
     }
@@ -276,8 +291,17 @@ fn decode_method_literals(class: &ClassScanData, method: &MethodScanData) -> Vec
     if is_confirmed_xor_decoder(method) && keys.len() == 1 {
         let key = keys[0];
         values.extend(literals.iter().filter_map(|(offset, value)| {
-            decode_xor(value, key)
-                .and_then(|decoded| decoded_value(class, method, *offset, "xor", decoded))
+            decode_xor(value, key).and_then(|decoded| {
+                decoded_value(
+                    class,
+                    method,
+                    *offset,
+                    "xor",
+                    value,
+                    decoded,
+                    Confidence::High,
+                )
+            })
         }));
     }
     if is_caesar_decoder(method) && keys.len() == 1 {
@@ -287,7 +311,15 @@ fn decode_method_literals(class: &ClassScanData, method: &MethodScanData) -> Vec
                 .into_iter()
                 .filter_map(move |direction| {
                     decode_caesar(value, direction).and_then(|decoded| {
-                        decoded_value(class, method, *offset, "caesar", decoded)
+                        decoded_value(
+                            class,
+                            method,
+                            *offset,
+                            "caesar",
+                            value,
+                            decoded,
+                            Confidence::High,
+                        )
                     })
                 })
         }));
@@ -345,16 +377,29 @@ fn decoded_value(
     method: &MethodScanData,
     offset: u32,
     transform: &'static str,
+    original_value: &str,
     value: String,
+    confidence: Confidence,
 ) -> Option<DecodedValue> {
-    is_security_relevant(&value).then(|| DecodedValue {
+    is_useful_decoded_value(&value).then(|| DecodedValue {
         archive_id: class.archive_id.clone(),
+        archive_path: class.archive_path.clone(),
         class_name: method.class_name.clone(),
         method_name: method.method_name.clone(),
+        method_descriptor: method.descriptor.clone(),
         bytecode_offset: offset,
         transform,
+        original_value: original_value.to_owned(),
         value,
+        confidence,
     })
+}
+
+fn is_useful_decoded_value(value: &str) -> bool {
+    value.len() >= 4
+        && value
+            .chars()
+            .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
 }
 
 fn decode_base64(value: &str) -> Option<String> {
