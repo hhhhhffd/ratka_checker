@@ -127,6 +127,16 @@ fn classify_class(
         .iter()
         .map(|entrypoint| normalize_entrypoint(entrypoint))
         .collect::<HashSet<_>>();
+    if archive.depth > 0 && archive.has_mod_metadata {
+        return classification(
+            class,
+            CodeScope::NestedMod,
+            None,
+            entrypoints.contains(&class_name),
+            Confidence::High,
+            ClassificationReason::NestedModMetadata,
+        );
+    }
     if entrypoints.contains(&class_name) {
         return classification(
             class,

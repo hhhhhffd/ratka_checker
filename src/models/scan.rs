@@ -137,7 +137,7 @@ impl Confidence {
 }
 
 /// Origin of code or data that produced a scan result.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeScope {
     FirstParty,
@@ -297,7 +297,22 @@ pub struct Obfuscation {
 /// be inspected.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AnalysisCoverage {
+    /// Backward-compatible alias of `overall_score`.
     pub score: u8,
+    #[serde(default)]
+    pub overall_score: u8,
+    #[serde(default)]
+    pub class_parse_coverage: u8,
+    #[serde(default)]
+    pub method_flow_coverage: u8,
+    #[serde(default)]
+    pub supported_instruction_coverage: u8,
+    #[serde(default)]
+    pub resolved_call_coverage: u8,
+    #[serde(default)]
+    pub resolved_value_target_coverage: u8,
+    #[serde(default)]
+    pub archive_scope_coverage: u8,
     pub total_classes: u32,
     pub parsed_classes: u32,
     pub total_resources: u32,

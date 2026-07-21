@@ -72,6 +72,13 @@ YAML rule matches are non-scoring `heuristic` observations. Only contextual
 findings with source-level evidence, confirmed data-flow chains, or trusted
 VirusTotal evidence can affect `risk_score` and `verdict`.
 
+The flow adapter follows bounded calls inside an archive layer, including JVM
+parameter slots, instance-method `this`, return values, and concrete
+`ProcessBuilder` command state. Generic file reads are neutral; credential
+exfiltration requires a recognized credential target and a proven network send.
+`analysis_coverage` separately reports class parsing, method-flow, supported
+instruction, call-resolution, target-resolution, scope, and overall coverage.
+
 `malicious` requires a confirmed dangerous chain (for example credential
 exfiltration, remote download → write → execute, or decoded dynamic loading)
 or a trusted VirusTotal detection; weak API matches cannot produce it by

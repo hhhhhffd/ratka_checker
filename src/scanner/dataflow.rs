@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::models::scan::CodeScope;
+
 /// Stable identity of a method in an archive layer.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct MethodId {
@@ -32,6 +34,7 @@ pub struct FlowEvidence {
     pub value_preview: Option<String>,
     pub source_value: Option<String>,
     pub target_value: Option<String>,
+    pub scope: CodeScope,
 }
 
 impl FlowEvidence {
@@ -51,6 +54,7 @@ impl FlowEvidence {
             value_preview: None,
             source_value: None,
             target_value: None,
+            scope: CodeScope::FirstParty,
         }
     }
 }
@@ -58,6 +62,7 @@ impl FlowEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceKind {
     HttpResponse,
+    FileRead,
     SocketInput,
     CredentialFile,
     EnvironmentVariable,
@@ -108,7 +113,12 @@ pub enum FileTarget {
 #[derive(Clone, Debug)]
 pub struct MethodFlow {
     pub id: MethodId,
+    /// Number of Java parameters, excluding the implicit `this` receiver.
     pub parameter_count: u16,
+    /// JVM local slots that receive the declared parameters. Instance methods
+    /// start at slot one because slot zero is `this`.
+    pub parameter_slots: Vec<LocalId>,
+    pub scope: CodeScope,
     pub operations: Vec<Operation>,
 }
 
@@ -179,9 +189,33 @@ pub struct ConfirmedChainCandidate {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FlowLimitation {
-    MissingMethod { caller: MethodId, callee: MethodId },
-    InterproceduralDepthReached { method: MethodId },
-    RecursiveCallSkipped { method: MethodId },
+    MissingMethod {
+        caller: MethodId,
+        callee: MethodId,
+    },
+    InterproceduralDepthReached {
+        method: MethodId,
+    },
+    RecursiveCallSkipped {
+        method: MethodId,
+    },
+    UnknownFileTarget {
+        method: MethodId,
+        offset: u32,
+    },
+    UnsupportedInstruction {
+        method: MethodId,
+        offset: u32,
+        opcode: u8,
+    },
+    ObjectTrackingUnavailable {
+        method: MethodId,
+        offset: u32,
+        object_type: String,
+    },
+    LinearControlFlow {
+        method: MethodId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -203,10 +237,30 @@ impl Default for DataFlowConfig {
 pub struct DataFlowResult {
     pub confirmed_chains: Vec<ConfirmedChainCandidate>,
     pub limitations: Vec<FlowLimitation>,
+    pub analyzed_methods: u32,
+    pub resolved_calls: u32,
+    pub unresolved_calls: u32,
+    pub unknown_file_targets: u32,
+    pub resolved_value_targets: u32,
 }
 
 /// Runs a conservative flow analysis over independently parsed methods.
 pub fn analyze_method_flows(methods: &[MethodFlow], config: &DataFlowConfig) -> DataFlowResult {
+    let roots = methods
+        .iter()
+        .filter(|method| method.scope != CodeScope::BundledDependency)
+        .map(|method| method.id.clone())
+        .collect::<Vec<_>>();
+    analyze_method_flows_from_roots(methods, &roots, config)
+}
+
+/// Runs only from first-party/nested roots. Dependency methods can still be
+/// traversed when reached through an explicit call from one of those roots.
+pub fn analyze_method_flows_from_roots(
+    methods: &[MethodFlow],
+    roots: &[MethodId],
+    config: &DataFlowConfig,
+) -> DataFlowResult {
     let method_index: HashMap<MethodId, &MethodFlow> = methods
         .iter()
         .map(|method| (method.id.clone(), method))
@@ -215,9 +269,9 @@ pub fn analyze_method_flows(methods: &[MethodFlow], config: &DataFlowConfig) -> 
 
     // Every method is a possible entry point. Parameter-only methods produce no
     // results here, but are analysed with real taints when reached by a call.
-    for method in methods {
+    for method_id in roots {
         let mut state = ExecutionState::default();
-        analyzer.execute(&method.id, Vec::new(), 0, &mut BTreeSet::new(), &mut state);
+        analyzer.execute(method_id, Vec::new(), 0, &mut BTreeSet::new(), &mut state);
     }
     analyzer.result
 }
@@ -291,9 +345,12 @@ impl<'a> Analyzer<'a> {
         }
 
         let mut locals = HashMap::<LocalId, Vec<Taint>>::new();
+        self.result.analyzed_methods = self.result.analyzed_methods.saturating_add(1);
         for (index, value) in arguments.into_iter().enumerate() {
             if index < method.parameter_count as usize {
-                locals.insert(index as LocalId, value);
+                if let Some(slot) = method.parameter_slots.get(index) {
+                    locals.insert(*slot, value);
+                }
             }
         }
         let mut returned = Vec::new();
@@ -337,6 +394,8 @@ impl<'a> Analyzer<'a> {
                     destination,
                     evidence,
                 } if !matches!(destination, FileTarget::Unknown) => {
+                    self.result.resolved_value_targets =
+                        self.result.resolved_value_targets.saturating_add(1);
                     state
                         .written_files
                         .entry(destination.clone())
@@ -350,10 +409,21 @@ impl<'a> Analyzer<'a> {
                                 }),
                         );
                 }
-                Operation::WriteFile { .. } => {}
+                Operation::WriteFile { evidence, .. } => {
+                    self.result.unknown_file_targets =
+                        self.result.unknown_file_targets.saturating_add(1);
+                    self.result
+                        .limitations
+                        .push(FlowLimitation::UnknownFileTarget {
+                            method: method_id.clone(),
+                            offset: evidence.bytecode_offset,
+                        });
+                }
                 Operation::ExecuteFile { target, evidence }
                     if !matches!(target, FileTarget::Unknown) =>
                 {
+                    self.result.resolved_value_targets =
+                        self.result.resolved_value_targets.saturating_add(1);
                     if let Some(writes) = state.written_files.get(target).cloned() {
                         for write in writes {
                             if write.taint.source_kind == SourceKind::HttpResponse {
@@ -366,7 +436,16 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                 }
-                Operation::ExecuteFile { .. } => {}
+                Operation::ExecuteFile { evidence, .. } => {
+                    self.result.unknown_file_targets =
+                        self.result.unknown_file_targets.saturating_add(1);
+                    self.result
+                        .limitations
+                        .push(FlowLimitation::UnknownFileTarget {
+                            method: method_id.clone(),
+                            offset: evidence.bytecode_offset,
+                        });
+                }
                 Operation::NetworkSend { body, evidence } => {
                     for taint in values(&locals, *body) {
                         if taint.source_kind == SourceKind::CredentialFile {
@@ -414,12 +493,15 @@ impl<'a> Analyzer<'a> {
                         continue;
                     }
                     if !self.methods.contains_key(callee) {
+                        self.result.unresolved_calls =
+                            self.result.unresolved_calls.saturating_add(1);
                         self.result.limitations.push(FlowLimitation::MissingMethod {
                             caller: method_id.clone(),
                             callee: callee.clone(),
                         });
                         continue;
                     }
+                    self.result.resolved_calls = self.result.resolved_calls.saturating_add(1);
                     let call_arguments = arguments
                         .iter()
                         .map(|local| values(&locals, *local))
@@ -488,6 +570,8 @@ mod tests {
                 descriptor: "()V".into(),
             },
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations,
         }
     }
@@ -502,6 +586,8 @@ mod tests {
         let flow = MethodFlow {
             id: id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -534,6 +620,8 @@ mod tests {
         let flow = MethodFlow {
             id: id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -562,6 +650,8 @@ mod tests {
         let flow = MethodFlow {
             id: id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -594,6 +684,8 @@ mod tests {
         let writer = MethodFlow {
             id: writer_id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -610,6 +702,8 @@ mod tests {
         let runner = MethodFlow {
             id: runner_id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![Operation::ExecuteFile {
                 target: FileTarget::Known("/tmp/update.jar".into()),
                 evidence: evidence(&runner_id, 3, "java_launch"),
@@ -633,6 +727,8 @@ mod tests {
         let caller = MethodFlow {
             id: caller_id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -650,6 +746,8 @@ mod tests {
         let helper = MethodFlow {
             id: helper_id.clone(),
             parameter_count: 1,
+            parameter_slots: vec![0],
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::WriteFile {
                     input: 0,
@@ -675,6 +773,8 @@ mod tests {
         let flow = MethodFlow {
             id: id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -703,6 +803,8 @@ mod tests {
         let flow = MethodFlow {
             id: id.clone(),
             parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
             operations: vec![
                 Operation::Source {
                     output: 0,
@@ -727,5 +829,81 @@ mod tests {
             result.confirmed_chains[0].kind,
             ConfirmedChainKind::DecodedDynamicLoad
         );
+    }
+
+    #[test]
+    fn propagates_return_value_through_an_instance_method_slot_layout() {
+        let caller_id = method("run", Vec::new()).id;
+        let helper_id = MethodId {
+            method_name: "identity".into(),
+            descriptor: "([B)[B".into(),
+            ..caller_id.clone()
+        };
+        let caller = MethodFlow {
+            id: caller_id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Source {
+                    output: 0,
+                    kind: SourceKind::HttpResponse,
+                    evidence: evidence(&caller_id, 1, "http_response"),
+                },
+                Operation::Call {
+                    callee: helper_id.clone(),
+                    arguments: vec![0],
+                    return_to: Some(1),
+                    evidence: evidence(&caller_id, 2, "call"),
+                },
+                Operation::WriteFile {
+                    input: 1,
+                    destination: FileTarget::Known("Temp/update.jar".into()),
+                    evidence: evidence(&caller_id, 3, "file_write"),
+                },
+                Operation::ExecuteFile {
+                    target: FileTarget::Known("Temp/update.jar".into()),
+                    evidence: evidence(&caller_id, 4, "exec"),
+                },
+            ],
+        };
+        let helper = MethodFlow {
+            id: helper_id,
+            parameter_count: 1,
+            parameter_slots: vec![1], // slot 0 is `this`
+            scope: CodeScope::FirstParty,
+            operations: vec![Operation::Return { value: Some(1) }],
+        };
+
+        let result = analyze_method_flows(&[caller, helper], &DataFlowConfig::default());
+        assert!(result
+            .confirmed_chains
+            .iter()
+            .any(|chain| chain.kind == ConfirmedChainKind::DownloadWriteExecute));
+        assert_eq!(result.resolved_calls, 1);
+    }
+
+    #[test]
+    fn excludes_unreached_dependency_roots_and_file_reads_from_credential_exfiltration() {
+        let id = method("dependency", Vec::new()).id;
+        let dependency = MethodFlow {
+            id: id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::BundledDependency,
+            operations: vec![
+                Operation::Source {
+                    output: 0,
+                    kind: SourceKind::FileRead,
+                    evidence: evidence(&id, 1, "read_config"),
+                },
+                Operation::NetworkSend {
+                    body: 0,
+                    evidence: evidence(&id, 2, "send"),
+                },
+            ],
+        };
+        let result = analyze_method_flows(&[dependency], &DataFlowConfig::default());
+        assert!(result.confirmed_chains.is_empty());
     }
 }

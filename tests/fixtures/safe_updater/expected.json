@@ -1,0 +1,10 @@
+{
+  "name": "verified updater context",
+  "scenario": "safe_updater",
+  "expected_verdict": "suspicious",
+  "risk_score": { "min": 20, "max": 59 },
+  "required_findings": ["CONFIRMED_SAFE_UPDATER_CONTEXT"],
+  "required_confirmed_chains": ["CONFIRMED_DOWNLOAD_WRITE_EXEC", "CONFIRMED_SAFE_UPDATER_CONTEXT"],
+  "minimum_analysis_coverage": 30,
+  "expected_obfuscation_level": "none"
+}

@@ -20,7 +20,8 @@ use crate::{
         context_recognizers,
         dataflow::{
             analyze_method_flows, ConfirmedChainCandidate, ConfirmedChainKind, DataFlowConfig,
-            FileTarget, FlowEvidence, MethodFlow, MethodId, Operation, SourceKind, TransformKind,
+            FileTarget, FlowEvidence, FlowLimitation, MethodFlow, MethodId, Operation, SourceKind,
+            TransformKind,
         },
         metadata, native, obfuscation, paths,
         scope::{
@@ -222,41 +223,19 @@ fn scan_bytes(
     findings.retain(|finding| finding.category != "obfuscation");
     findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
-    let confirmed_chains = data_flow
+    let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
         .map(confirmed_chain_from_candidate)
         .collect::<Vec<_>>();
-    let chain_capabilities = updater_capabilities(&confirmed_chains);
-    if confirmed_chains
-        .iter()
-        .any(|chain| chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC")
-    {
-        findings.push(Finding {
-            rule_id: "AUTO_UPDATER_WITHOUT_HASH_CHECK".to_owned(),
-            category: "updater".to_owned(),
-            kind: crate::models::scan::FindingKind::Heuristic,
-            severity: Severity::Medium,
-            confidence: Confidence::Medium,
-            score_contribution: 0,
-            scope: CodeScope::FirstParty,
-            message: "Автообновлятор скачивает и запускает JAR без подтверждённой проверки хеша."
-                .to_owned(),
-            evidence: confirmed_chains
-                .iter()
-                .flat_map(|chain| chain.evidence.clone())
-                .collect(),
-            related_chain_id: confirmed_chains.first().map(|chain| chain.chain_id.clone()),
-        });
+    if let Some(safe_context) = confirmed_safe_updater_context(&context.data, &confirmed_chains) {
+        confirmed_chains.push(safe_context);
     }
+    let chain_capabilities = updater_capabilities(&confirmed_chains);
     let mut limitations = data_flow
         .limitations
         .iter()
-        .map(|limitation| Limitation {
-            code: "DATA_FLOW_LIMITATION".to_owned(),
-            message: format!("{limitation:?}"),
-            evidence: Vec::new(),
-        })
+        .map(flow_limitation)
         .collect::<Vec<_>>();
     limitations.extend(context.data.normalization_limitations.clone());
     if !matches!(obfuscation.obfuscation.level, ObfuscationLevel::None) {
@@ -266,7 +245,7 @@ fn scan_bytes(
             evidence: Vec::new(),
         });
     }
-    let analysis_coverage = analysis_coverage(&context.data);
+    let analysis_coverage = analysis_coverage(&context.data, &data_flow);
     if analysis_coverage.parsed_classes < analysis_coverage.total_classes {
         limitations.push(Limitation {
             code: "CLASS_PARSE_LIMITATION".to_owned(),
@@ -293,7 +272,7 @@ fn scan_bytes(
             .chain(contextual_results.capabilities)
             .chain(chain_capabilities)
             .collect(),
-        decoded_strings: decoded_strings(&obfuscation.decoded_values),
+        decoded_strings: decoded_strings(&obfuscation.decoded_values, &context.data.class_files),
         text_resources: text_resources(&context.data.resource_files),
         findings: findings.clone(),
         confirmed_chains,
@@ -308,6 +287,73 @@ fn scan_bytes(
         summary,
         findings,
     })
+}
+
+fn flow_limitation(limitation: &FlowLimitation) -> Limitation {
+    let (code, message, method, offset) = match limitation {
+        FlowLimitation::MissingMethod { caller, callee } => (
+            "UNRESOLVED_CALL",
+            format!("Не удалось разрешить вызов {}.{}{}", callee.class_name, callee.method_name, callee.descriptor),
+            caller,
+            None,
+        ),
+        FlowLimitation::InterproceduralDepthReached { method } => (
+            "INTERPROCEDURAL_DEPTH_LIMIT",
+            "Достигнут лимит глубины межметодного анализа.".to_owned(),
+            method,
+            None,
+        ),
+        FlowLimitation::RecursiveCallSkipped { method } => (
+            "RECURSIVE_CALL_SKIPPED",
+            "Рекурсивный вызов не анализировался повторно.".to_owned(),
+            method,
+            None,
+        ),
+        FlowLimitation::UnknownFileTarget { method, offset } => (
+            "UNKNOWN_FILE_TARGET",
+            "Не удалось статически установить целевой путь операции с файлом.".to_owned(),
+            method,
+            Some(*offset),
+        ),
+        FlowLimitation::UnsupportedInstruction { method, offset, opcode } => (
+            "UNSUPPORTED_INSTRUCTION",
+            format!("Инструкция JVM 0x{opcode:02x} не поддержана flow-adapter."),
+            method,
+            Some(*offset),
+        ),
+        FlowLimitation::ObjectTrackingUnavailable { method, offset, object_type } => (
+            "OBJECT_TRACKING_LIMITATION",
+            format!("Невозможно отследить состояние объекта {object_type}."),
+            method,
+            Some(*offset),
+        ),
+        FlowLimitation::LinearControlFlow { method } => (
+            "LINEAR_CFG_ANALYSIS",
+            "Метод содержит ветвления и проанализирован линейно; значения на CFG-join не объединялись."
+                .to_owned(),
+            method,
+            None,
+        ),
+    };
+    Limitation {
+        code: code.to_owned(),
+        message,
+        evidence: vec![Evidence {
+            archive_id: method.archive_id.clone(),
+            archive_path: method.archive_id.clone(),
+            class_name: Some(method.class_name.clone()),
+            method_name: Some(method.method_name.clone()),
+            method_descriptor: Some(method.descriptor.clone()),
+            bytecode_offset: offset,
+            resource_path: None,
+            operation: "flow_limitation".to_owned(),
+            value_preview: None,
+            source_value: None,
+            target_value: None,
+            confidence: Confidence::Low,
+            scope: CodeScope::Unknown,
+        }],
+    }
 }
 
 /// Recomputes verdict fields after callers add non-static findings such as VirusTotal signals.
@@ -1349,7 +1395,6 @@ fn analyze_scan_data_flow(data: &ScanData) -> crate::scanner::dataflow::DataFlow
     let flows = data
         .class_files
         .iter()
-        .filter(|class_file| class_file.scope == CodeScope::FirstParty)
         .flat_map(|class_file| {
             class_file
                 .methods
@@ -1357,7 +1402,40 @@ fn analyze_scan_data_flow(data: &ScanData) -> crate::scanner::dataflow::DataFlow
                 .map(|method| method_flow_from_scan_data(class_file, method))
         })
         .collect::<Vec<_>>();
-    analyze_method_flows(&flows, &DataFlowConfig::default())
+    let mut result = analyze_method_flows(&flows, &DataFlowConfig::default());
+    for class_file in &data.class_files {
+        if !matches!(
+            class_file.scope,
+            CodeScope::FirstParty | CodeScope::NestedMod | CodeScope::Unknown
+        ) {
+            continue;
+        }
+        for method in &class_file.methods {
+            let method_id = MethodId {
+                archive_id: class_file.archive_id.clone(),
+                class_name: method.class_name.clone(),
+                method_name: method.method_name.clone(),
+                descriptor: method.descriptor.clone(),
+            };
+            for instruction in &method.instructions {
+                if !is_flow_supported_instruction(instruction.opcode) {
+                    result
+                        .limitations
+                        .push(FlowLimitation::UnsupportedInstruction {
+                            method: method_id.clone(),
+                            offset: instruction.offset,
+                            opcode: instruction.opcode,
+                        });
+                }
+            }
+            if !method.control_flow_edges.is_empty() {
+                result
+                    .limitations
+                    .push(FlowLimitation::LinearControlFlow { method: method_id });
+            }
+        }
+    }
+    result
 }
 
 fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanData) -> MethodFlow {
@@ -1367,7 +1445,22 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
         method_name: method.method_name.clone(),
         descriptor: method.descriptor.clone(),
     };
-    let mut operations = Vec::new();
+    let mut events = Vec::new();
+    let mut object_targets = HashMap::<String, FileTarget>::new();
+
+    for record in &method.local_origins {
+        if let Some(input) = local_for_origin(method, &record.origin) {
+            if input != record.local_index {
+                events.push((
+                    record.offset,
+                    Operation::Copy {
+                        input,
+                        output: record.local_index,
+                    },
+                ));
+            }
+        }
+    }
     for call in &method.calls {
         let Some(owner) = call.owner.as_deref() else {
             continue;
@@ -1383,43 +1476,98 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             .filter_map(|origin| local_for_origin(method, origin))
             .collect::<Vec<_>>();
 
-        if is_http_response(owner, &call.name) {
-            if let Some(output) = output {
-                operations.push(Operation::Source {
-                    output,
-                    kind: SourceKind::HttpResponse,
-                    evidence,
-                });
+        if is_path_factory(owner, &call.name) {
+            if let (Some(result), Some(target)) = (
+                &call.result_origin,
+                call.argument_origins
+                    .iter()
+                    .find_map(|origin| target_from_origin(origin, &object_targets)),
+            ) {
+                object_targets.insert(object_key(result), target);
             }
             continue;
         }
-        if is_credential_read(owner, &call.name) {
+        if is_path_string_conversion(owner, &call.name) {
+            if let (Some(result), Some(receiver)) = (&call.result_origin, &call.receiver_origin) {
+                if let Some(target) = target_from_origin(receiver, &object_targets) {
+                    object_targets.insert(object_key(result), target);
+                }
+            }
+            continue;
+        }
+        if owner == "java/lang/ProcessBuilder" && call.name == "<init>" {
+            if let Some(receiver) = &call.receiver_origin {
+                if let Some(target) = call
+                    .argument_origins
+                    .iter()
+                    .rev()
+                    .find_map(|origin| target_from_origin(origin, &object_targets))
+                {
+                    object_targets.insert(object_key(receiver), target);
+                }
+            }
+            continue;
+        }
+        if owner == "java/lang/ProcessBuilder" && call.name == "start" {
+            let target = call
+                .receiver_origin
+                .as_ref()
+                .and_then(|origin| target_from_origin(origin, &object_targets))
+                .unwrap_or(FileTarget::Unknown);
+            let mut evidence = evidence;
+            evidence.target_value = known_target_value(&target);
+            events.push((call.offset, Operation::ExecuteFile { target, evidence }));
+            continue;
+        }
+
+        if is_http_response(owner, &call.name) {
+            if let Some(output) = output {
+                events.push((
+                    call.offset,
+                    Operation::Source {
+                        output,
+                        kind: SourceKind::HttpResponse,
+                        evidence,
+                    },
+                ));
+            }
+            continue;
+        }
+        if is_file_read(owner, &call.name) {
             if let Some(output) = output {
                 let mut evidence = evidence;
-                evidence.source_value = call
+                let source = call
                     .argument_origins
                     .first()
-                    .and_then(file_target_from_origin)
-                    .and_then(|target| match target {
-                        FileTarget::Known(value) => Some(value),
-                        FileTarget::Unknown => None,
-                    });
-                operations.push(Operation::Source {
-                    output,
-                    kind: SourceKind::CredentialFile,
-                    evidence,
-                });
+                    .and_then(|origin| target_from_origin(origin, &object_targets));
+                evidence.source_value = source.as_ref().and_then(known_target_value);
+                let kind = source
+                    .as_ref()
+                    .is_some_and(is_credential_target)
+                    .then_some(SourceKind::CredentialFile)
+                    .unwrap_or(SourceKind::FileRead);
+                events.push((
+                    call.offset,
+                    Operation::Source {
+                        output,
+                        kind,
+                        evidence,
+                    },
+                ));
             }
             continue;
         }
         if is_base64_decode(owner, &call.name) {
             if let (Some(input), Some(output)) = (arguments.last().copied(), output) {
-                operations.push(Operation::Transform {
-                    input,
-                    output,
-                    kind: TransformKind::Base64Decode,
-                    evidence,
-                });
+                events.push((
+                    call.offset,
+                    Operation::Transform {
+                        input,
+                        output,
+                        kind: TransformKind::Base64Decode,
+                        evidence,
+                    },
+                ));
             }
             continue;
         }
@@ -1435,11 +1583,14 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
                     FileTarget::Known(value) => Some(value.clone()),
                     FileTarget::Unknown => None,
                 };
-                operations.push(Operation::WriteFile {
-                    input,
-                    destination,
-                    evidence,
-                });
+                events.push((
+                    call.offset,
+                    Operation::WriteFile {
+                        input,
+                        destination,
+                        evidence,
+                    },
+                ));
             }
             continue;
         }
@@ -1454,30 +1605,108 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
                 FileTarget::Known(value) => Some(value.clone()),
                 FileTarget::Unknown => None,
             };
-            operations.push(Operation::ExecuteFile { target, evidence });
+            events.push((call.offset, Operation::ExecuteFile { target, evidence }));
             continue;
         }
         if is_http_send(owner, &call.name) {
             if let Some(body) = arguments.last().copied() {
-                operations.push(Operation::NetworkSend { body, evidence });
+                events.push((call.offset, Operation::NetworkSend { body, evidence }));
             }
             continue;
         }
         if is_dynamic_load(owner, &call.name) {
             if let Some(input) = arguments.first().copied() {
-                operations.push(Operation::DynamicLoad {
-                    input,
-                    kind: crate::scanner::dataflow::DynamicLoadKind::ClassDefinition,
-                    evidence,
-                });
+                events.push((
+                    call.offset,
+                    Operation::DynamicLoad {
+                        input,
+                        kind: crate::scanner::dataflow::DynamicLoadKind::ClassDefinition,
+                        evidence,
+                    },
+                ));
             }
+            continue;
+        }
+        if !owner.starts_with("java/") && !owner.starts_with("javax/") {
+            let callee = MethodId {
+                archive_id: class_file.archive_id.clone(),
+                class_name: owner.to_owned(),
+                method_name: call.name.clone(),
+                descriptor: call.descriptor.clone(),
+            };
+            events.push((
+                call.offset,
+                Operation::Call {
+                    callee,
+                    arguments,
+                    return_to: output,
+                    evidence,
+                },
+            ));
         }
     }
+    for returned in &method.return_origins {
+        events.push((
+            returned.offset,
+            Operation::Return {
+                value: returned
+                    .value_origin
+                    .as_ref()
+                    .and_then(|origin| local_for_origin(method, origin)),
+            },
+        ));
+    }
+    events.sort_by_key(|(offset, _)| *offset);
+    let operations = events.into_iter().map(|(_, operation)| operation).collect();
     MethodFlow {
         id,
-        parameter_count: 0,
+        parameter_count: class_file::descriptor_shape(&method.descriptor)
+            .map(|(count, _)| count as u16)
+            .unwrap_or(0),
+        parameter_slots: parameter_slots(method),
+        scope: class_file.scope.clone(),
         operations,
     }
+}
+
+fn parameter_slots(method: &MethodScanData) -> Vec<u16> {
+    let bytes = method.descriptor.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return Vec::new();
+    }
+    let mut slots = Vec::new();
+    let mut index = 1;
+    let mut slot = u16::from(!method.is_static);
+    while bytes.get(index) != Some(&b')') {
+        slots.push(slot);
+        let start = index;
+        while bytes.get(index) == Some(&b'[') {
+            index += 1;
+        }
+        let width = match bytes.get(index) {
+            Some(b'L') => {
+                while bytes.get(index) != Some(&b';') {
+                    index += 1;
+                }
+                index += 1;
+                1
+            }
+            Some(b'J' | b'D') => {
+                index += 1;
+                2
+            }
+            Some(_) => {
+                index += 1;
+                1
+            }
+            None => return Vec::new(),
+        };
+        if start == index {
+            return Vec::new();
+        }
+        slot = slot.saturating_add(width);
+    }
+    slots
 }
 
 fn local_for_origin(method: &MethodScanData, origin: &ValueOrigin) -> Option<u16> {
@@ -1504,6 +1733,40 @@ fn file_target_from_origin(origin: &ValueOrigin) -> Option<FileTarget> {
     }
 }
 
+fn target_from_origin(
+    origin: &ValueOrigin,
+    object_targets: &HashMap<String, FileTarget>,
+) -> Option<FileTarget> {
+    file_target_from_origin(origin).or_else(|| object_targets.get(&object_key(origin)).cloned())
+}
+
+fn object_key(origin: &ValueOrigin) -> String {
+    match origin {
+        ValueOrigin::Instruction(offset) => format!("instruction:{offset}"),
+        ValueOrigin::Local(index) => format!("local:{index}"),
+        ValueOrigin::Field { owner, name, .. } => format!("field:{owner}.{name}"),
+        ValueOrigin::Constant(value) => format!("constant:{value:?}"),
+        ValueOrigin::Unknown => "unknown".to_owned(),
+    }
+}
+
+fn known_target_value(target: &FileTarget) -> Option<String> {
+    match target {
+        FileTarget::Known(value) => Some(value.clone()),
+        FileTarget::Unknown => None,
+    }
+}
+
+fn is_path_factory(owner: &str, name: &str) -> bool {
+    (owner == "java/nio/file/Paths" && name == "get")
+        || (owner == "java/nio/file/Path" && name == "of")
+        || (owner == "java/io/File" && name == "<init>")
+}
+
+fn is_path_string_conversion(owner: &str, name: &str) -> bool {
+    (owner == "java/nio/file/Path" || owner == "java/io/File") && name == "toString"
+}
+
 fn flow_evidence(
     class_file: &ClassScanData,
     method: &MethodId,
@@ -1522,6 +1785,7 @@ fn flow_evidence(
         value_preview: None,
         source_value: None,
         target_value: None,
+        scope: class_file.scope.clone(),
     }
 }
 
@@ -1529,9 +1793,31 @@ fn is_http_response(owner: &str, name: &str) -> bool {
     owner.contains("HttpClient") && matches!(name, "send" | "execute" | "get")
 }
 
-fn is_credential_read(owner: &str, name: &str) -> bool {
+fn is_file_read(owner: &str, name: &str) -> bool {
     (owner == "java/nio/file/Files" && matches!(name, "readAllBytes" | "readString"))
-        || owner.contains("InputStream") && name == "read"
+        || (owner.contains("InputStream") && name == "read")
+}
+
+fn is_credential_target(target: &FileTarget) -> bool {
+    let FileTarget::Known(value) = target else {
+        return false;
+    };
+    let value = value.to_ascii_lowercase();
+    [
+        "discord/local storage/leveldb",
+        "discord/leveldb",
+        "cookies",
+        "login data",
+        "web data",
+        "launcher_accounts",
+        "account",
+        "session",
+        "telegram/tdata",
+        "wallet",
+        "token",
+    ]
+    .iter()
+    .any(|needle| value.contains(needle))
 }
 
 fn is_base64_decode(owner: &str, name: &str) -> bool {
@@ -1561,8 +1847,8 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
     let (rule_id, severity, score_contribution) = match candidate.kind {
         ConfirmedChainKind::DownloadWriteExecute => (
             "CONFIRMED_DOWNLOAD_WRITE_EXEC".to_owned(),
-            Severity::Medium,
-            20,
+            Severity::Critical,
+            70,
         ),
         ConfirmedChainKind::CredentialExfiltration => (
             "CONFIRMED_CREDENTIAL_EXFILTRATION".to_owned(),
@@ -1596,7 +1882,7 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
             source_value: flow.source_value.clone(),
             target_value: flow.target_value.clone(),
             confidence: Confidence::High,
-            scope: CodeScope::FirstParty,
+            scope: flow.scope.clone(),
         })
         .collect();
     ConfirmedChain {
@@ -1612,6 +1898,54 @@ fn confirmed_chain_from_candidate(candidate: &ConfirmedChainCandidate) -> Confir
             .collect(),
         evidence,
     }
+}
+
+/// Recognizes a safe updater only when static evidence establishes several
+/// independent safeguards. A method/class name is deliberately not considered.
+fn confirmed_safe_updater_context(
+    data: &ScanData,
+    chains: &[ConfirmedChain],
+) -> Option<ConfirmedChain> {
+    let download = chains
+        .iter()
+        .find(|chain| chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC")?;
+    let target_is_jar = download.evidence.iter().any(|evidence| {
+        evidence
+            .target_value
+            .as_deref()
+            .is_some_and(|target| target.to_ascii_lowercase().ends_with(".jar"))
+    });
+    let has_integrity = data.first_party_strings.iter().any(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("sha-256")
+            || value.contains("sha256")
+            || value.contains("signature")
+            || value.contains("checksum")
+    });
+    let has_update_context = data.first_party_strings.iter().any(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("update") || value.contains("version") || value.contains("release")
+    });
+    let has_credential_or_dynamic_risk = chains.iter().any(|chain| {
+        matches!(
+            chain.rule_id.as_str(),
+            "CONFIRMED_CREDENTIAL_EXFILTRATION"
+                | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
+                | "CONFIRMED_DECODED_DYNAMIC_LOAD"
+        )
+    });
+    if !(target_is_jar && has_integrity && has_update_context && !has_credential_or_dynamic_risk) {
+        return None;
+    }
+    Some(ConfirmedChain {
+        chain_id: format!("safe-updater-{}", download.chain_id),
+        rule_id: "CONFIRMED_SAFE_UPDATER_CONTEXT".to_owned(),
+        severity: Severity::Low,
+        confidence: Confidence::Medium,
+        score_contribution: 0,
+        operations: vec!["integrity_verified_updater_context".to_owned()],
+        evidence: download.evidence.clone(),
+    })
 }
 
 fn updater_capabilities(chains: &[ConfirmedChain]) -> Vec<Capability> {
@@ -1692,9 +2026,18 @@ fn risk_score(
         let total = category_scores.entry(&finding.category).or_default();
         *total = (*total + score).min(cap);
     }
+    let has_safe_updater_context = confirmed_chains
+        .iter()
+        .any(|chain| chain.rule_id == "CONFIRMED_SAFE_UPDATER_CONTEXT");
     let chain_score = confirmed_chains
         .iter()
-        .map(|chain| u16::from(chain.score_contribution))
+        .map(|chain| {
+            if has_safe_updater_context && chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC" {
+                30
+            } else {
+                u16::from(chain.score_contribution)
+            }
+        })
         .sum::<u16>();
     category_scores
         .values()
@@ -1712,7 +2055,10 @@ fn finding_is_risk_bearing(finding: &Finding) -> bool {
 }
 
 /// Reports how much archive content reached the bounded static analyzers.
-fn analysis_coverage(data: &ScanData) -> AnalysisCoverage {
+fn analysis_coverage(
+    data: &ScanData,
+    data_flow: &crate::scanner::dataflow::DataFlowResult,
+) -> AnalysisCoverage {
     let total_classes = data
         .archive_layers
         .iter()
@@ -1730,16 +2076,72 @@ fn analysis_coverage(data: &ScanData) -> AnalysisCoverage {
         .count() as u32;
     let parsed_classes = data.class_files.len().min(total_classes as usize) as u32;
     let analyzed_resources = data.resource_files.len().min(total_resources as usize) as u32;
-    let total_items = total_classes + total_resources;
-    let analyzed_items = parsed_classes + analyzed_resources;
-    let score = if total_items == 0 {
-        100
-    } else {
-        (u64::from(analyzed_items) * 100 / u64::from(total_items)) as u8
-    };
+    let class_parse_coverage = percent(parsed_classes, total_classes);
+    let flow_eligible = data
+        .class_files
+        .iter()
+        .filter(|class| {
+            matches!(
+                class.scope,
+                CodeScope::FirstParty | CodeScope::NestedMod | CodeScope::Unknown
+            )
+        })
+        .flat_map(|class| &class.methods)
+        .count() as u32;
+    let method_flow_coverage =
+        percent(data_flow.analyzed_methods.min(flow_eligible), flow_eligible);
+    let instruction_total = data
+        .class_files
+        .iter()
+        .filter(|class| class.scope != CodeScope::BundledDependency)
+        .flat_map(|class| &class.methods)
+        .map(|method| method.instructions.len() as u32)
+        .sum();
+    let supported_instructions = data
+        .class_files
+        .iter()
+        .filter(|class| class.scope != CodeScope::BundledDependency)
+        .flat_map(|class| &class.methods)
+        .flat_map(|method| &method.instructions)
+        .filter(|instruction| is_flow_supported_instruction(instruction.opcode))
+        .count() as u32;
+    let supported_instruction_coverage = percent(supported_instructions, instruction_total);
+    let resolved_call_coverage = percent(
+        data_flow.resolved_calls,
+        data_flow.resolved_calls + data_flow.unresolved_calls,
+    );
+    let resolved_value_target_coverage = percent(
+        data_flow.resolved_value_targets,
+        data_flow.resolved_value_targets + data_flow.unknown_file_targets,
+    );
+    let classified_classes = data
+        .class_files
+        .iter()
+        .filter(|class| class.scope != CodeScope::Unknown)
+        .count() as u32;
+    let archive_scope_coverage = percent(classified_classes, parsed_classes);
+    let overall_score = [
+        class_parse_coverage,
+        method_flow_coverage,
+        supported_instruction_coverage,
+        resolved_call_coverage,
+        resolved_value_target_coverage,
+        archive_scope_coverage,
+    ]
+    .into_iter()
+    .map(u16::from)
+    .sum::<u16>()
+        / 6;
 
     AnalysisCoverage {
-        score,
+        score: overall_score as u8,
+        overall_score: overall_score as u8,
+        class_parse_coverage,
+        method_flow_coverage,
+        supported_instruction_coverage,
+        resolved_call_coverage,
+        resolved_value_target_coverage,
+        archive_scope_coverage,
         total_classes,
         parsed_classes,
         total_resources,
@@ -1747,7 +2149,34 @@ fn analysis_coverage(data: &ScanData) -> AnalysisCoverage {
     }
 }
 
-fn decoded_strings(values: &[obfuscation::DecodedValue]) -> Vec<DecodedString> {
+fn percent(numerator: u32, denominator: u32) -> u8 {
+    if denominator == 0 {
+        100
+    } else {
+        (u64::from(numerator.min(denominator)) * 100 / u64::from(denominator)) as u8
+    }
+}
+
+fn is_flow_supported_instruction(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x01..=0x19
+            | 0x1a..=0x2d
+            | 0x36..=0x3a
+            | 0x3b..=0x4e
+            | 0x57..=0x5f
+            | 0x60..=0x98
+            | 0xac..=0xb1
+            | 0xb2..=0xb9
+            | 0xbb..=0xbe
+            | 0xc5
+    )
+}
+
+fn decoded_strings(
+    values: &[obfuscation::DecodedValue],
+    class_files: &[ClassScanData],
+) -> Vec<DecodedString> {
     values
         .iter()
         .map(|value| DecodedString {
@@ -1768,7 +2197,14 @@ fn decoded_strings(values: &[obfuscation::DecodedValue]) -> Vec<DecodedString> {
                 source_value: Some(value.original_value.clone()),
                 target_value: Some(value.value.clone()),
                 confidence: value.confidence.clone(),
-                scope: CodeScope::FirstParty,
+                scope: class_files
+                    .iter()
+                    .find(|class| {
+                        class.archive_id == value.archive_id
+                            && class.class_name.as_deref() == Some(value.class_name.as_str())
+                    })
+                    .map(|class| class.scope.clone())
+                    .unwrap_or(CodeScope::Unknown),
             },
         })
         .collect()
@@ -1806,13 +2242,16 @@ fn verdict_from_evidence(
     _obfuscation: &Obfuscation,
     risk_score: u8,
 ) -> Verdict {
+    let has_safe_updater_context = confirmed_chains
+        .iter()
+        .any(|chain| chain.rule_id == "CONFIRMED_SAFE_UPDATER_CONTEXT");
     let has_malicious_chain = confirmed_chains.iter().any(|chain| {
         matches!(
             chain.rule_id.as_str(),
             "CONFIRMED_CREDENTIAL_EXFILTRATION"
                 | "CONFIRMED_DECODED_DYNAMIC_LOAD"
                 | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
-        ) || chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC"
+        ) || (chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC" && !has_safe_updater_context)
     });
     let trusted_vt_detection = findings
         .iter()

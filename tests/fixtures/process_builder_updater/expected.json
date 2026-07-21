@@ -1,0 +1,11 @@
+{
+  "name": "ProcessBuilder download write execute",
+  "scenario": "process_builder_updater",
+  "expected_verdict": "malicious",
+  "risk_score": { "min": 70, "max": 100 },
+  "required_findings": ["CONFIRMED_DOWNLOAD_WRITE_EXEC"],
+  "required_confirmed_chains": ["CONFIRMED_DOWNLOAD_WRITE_EXEC"],
+  "expected_capabilities": ["AUTO_UPDATER_DOWNLOAD", "AUTO_UPDATER_WRITE_JAR", "AUTO_UPDATER_LAUNCH"],
+  "minimum_analysis_coverage": 30,
+  "expected_obfuscation_level": "none"
+}

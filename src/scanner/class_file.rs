@@ -17,6 +17,7 @@ pub struct MethodScanData {
     pub class_name: String,
     pub method_name: String,
     pub descriptor: String,
+    pub is_static: bool,
     pub instructions: Vec<Instruction>,
     pub constants: Vec<LoadedConstant>,
     pub calls: Vec<CallSite>,
@@ -28,6 +29,8 @@ pub struct MethodScanData {
     pub local_origins: Vec<LocalValueOrigin>,
     /// Origins observed on the operand stack immediately before calls.
     pub stack_origins: Vec<StackOrigin>,
+    /// Values returned by explicit JVM return instructions.
+    pub return_origins: Vec<ReturnOrigin>,
 }
 
 /// A decoded JVM instruction. `operands` retain their original bytecode form.
@@ -134,6 +137,12 @@ pub struct LocalValueOrigin {
 pub struct StackOrigin {
     pub offset: u32,
     pub values: Vec<ValueOrigin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReturnOrigin {
+    pub offset: u32,
+    pub value_origin: Option<ValueOrigin>,
 }
 
 const XOR_LOOP_SIGNAL: &str = "xor_loop_string_decode";
@@ -361,7 +370,7 @@ fn parse_methods(
 ) -> anyhow::Result<()> {
     let method_count = cursor.read_u16()? as usize;
     for _ in 0..method_count {
-        let _access_flags = cursor.read_u16()?;
+        let access_flags = cursor.read_u16()?;
         let name_index = cursor.read_u16()?;
         let descriptor_index = cursor.read_u16()?;
         let method_name = utf8(entries, name_index)
@@ -385,6 +394,7 @@ fn parse_methods(
                     class_name,
                     &method_name,
                     &descriptor,
+                    access_flags & 0x0008 != 0,
                 )?;
                 methods.push(method);
             }
@@ -412,6 +422,7 @@ fn inspect_code_attribute(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
+    is_static: bool,
 ) -> anyhow::Result<MethodScanData> {
     let mut cursor = ClassCursor::new(bytes);
     let _max_stack = cursor.read_u16()?;
@@ -429,7 +440,14 @@ fn inspect_code_attribute(
         archive_signals.push(XOR_LOOP_SIGNAL.to_owned());
     }
 
-    parse_method_code(entries, code, class_name, method_name, descriptor)
+    parse_method_code(
+        entries,
+        code,
+        class_name,
+        method_name,
+        descriptor,
+        is_static,
+    )
 }
 
 fn parse_method_code(
@@ -438,6 +456,7 @@ fn parse_method_code(
     class_name: &str,
     method_name: &str,
     descriptor: &str,
+    is_static: bool,
 ) -> anyhow::Result<MethodScanData> {
     let instructions = decode_instructions(code)?;
     let (control_flow_edges, basic_blocks) = build_cfg(&instructions, code.len())?;
@@ -445,6 +464,7 @@ fn parse_method_code(
         class_name: class_name.to_owned(),
         method_name: method_name.to_owned(),
         descriptor: descriptor.to_owned(),
+        is_static,
         instructions,
         basic_blocks,
         control_flow_edges,
@@ -732,7 +752,14 @@ fn populate_value_origins(
                 let _ = stack.pop();
                 stack.push(ValueOrigin::Instruction(offset));
             }
-            0xbf | 0xac..=0xb1 => stack.clear(),
+            0xac..=0xb0 => {
+                data.return_origins.push(ReturnOrigin {
+                    offset,
+                    value_origin: stack.pop(),
+                });
+                stack.clear();
+            }
+            0xb1 | 0xbf => stack.clear(),
             _ => {}
         }
 
@@ -965,7 +992,7 @@ fn resolve_name_and_type(entries: &[ConstantPoolEntry], index: u16) -> Option<(S
     ))
 }
 
-fn descriptor_shape(descriptor: &str) -> Option<(usize, bool)> {
+pub fn descriptor_shape(descriptor: &str) -> Option<(usize, bool)> {
     let bytes = descriptor.as_bytes();
     if bytes.first().copied()? != b'(' {
         return None;
@@ -1274,7 +1301,7 @@ mod tests {
         ];
         let code = [0x12, 0x07, 0xb8, 0x00, 0x06, 0xb1];
 
-        let method = super::parse_method_code(&entries, &code, "example/Test", "run", "()V")
+        let method = super::parse_method_code(&entries, &code, "example/Test", "run", "()V", true)
             .expect("bounded static parse must succeed");
 
         assert_eq!(method.instructions[0].offset, 0);
@@ -1298,7 +1325,7 @@ mod tests {
     fn decodes_bipush_and_sipush_with_their_operands() {
         let code = [0x10, 0x7f, 0x11, 0x01, 0x00, 0xb1];
 
-        let method = super::parse_method_code(&[], &code, "example/Test", "numbers", "()V")
+        let method = super::parse_method_code(&[], &code, "example/Test", "numbers", "()V", true)
             .expect("bounded static parse must succeed");
 
         assert_eq!(method.instructions[0].operands, vec![0x7f]);
@@ -1309,7 +1336,7 @@ mod tests {
     fn builds_cfg_using_valid_bytecode_offsets() {
         // iconst_0; ifeq +4; return; return
         let code = [0x03, 0x99, 0x00, 0x04, 0xb1, 0xb1];
-        let method = super::parse_method_code(&[], &code, "example/Test", "branch", "()V")
+        let method = super::parse_method_code(&[], &code, "example/Test", "branch", "()V", true)
             .expect("bounded static parse must succeed");
 
         assert!(method.control_flow_edges.iter().any(|edge| {

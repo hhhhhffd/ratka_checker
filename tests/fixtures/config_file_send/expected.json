@@ -1,0 +1,12 @@
+{
+  "name": "ordinary config file synchronization",
+  "scenario": "config_file_send",
+  "expected_verdict": "clean",
+  "risk_score": { "min": 0, "max": 5 },
+  "required_findings": [],
+  "forbidden_findings": ["CONFIRMED_CREDENTIAL_EXFILTRATION"],
+  "forbidden_confirmed_chains": ["CONFIRMED_CREDENTIAL_EXFILTRATION"],
+  "expected_capabilities": [],
+  "minimum_analysis_coverage": 30,
+  "expected_obfuscation_level": "none"
+}

