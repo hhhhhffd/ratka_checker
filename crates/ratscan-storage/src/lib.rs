@@ -9,9 +9,6 @@ pub struct DiscordGuildConfig {
     pub log_channel_id: Option<i64>,
     pub error_channel_id: Option<i64>,
     pub danger_role_id: Option<i64>,
-    pub report_virustotal: bool,
-    pub report_behavior: bool,
-    pub coverage_warning_threshold: u8,
 }
 
 impl Default for DiscordGuildConfig {
@@ -21,9 +18,6 @@ impl Default for DiscordGuildConfig {
             log_channel_id: None,
             error_channel_id: None,
             danger_role_id: None,
-            report_virustotal: true,
-            report_behavior: true,
-            coverage_warning_threshold: 80,
         }
     }
 }
@@ -57,7 +51,7 @@ impl DiscordStorage {
         .execute(&self.pool)
         .await?;
         let row = sqlx::query_as::<_, GuildConfigRow>(
-            "SELECT enabled, log_channel_id, error_channel_id, danger_role_id, report_virustotal, report_behavior, coverage_warning_threshold FROM discord_guild_config WHERE guild_id = $1",
+            "SELECT enabled, log_channel_id, error_channel_id, danger_role_id FROM discord_guild_config WHERE guild_id = $1",
         )
         .bind(guild_id)
         .fetch_one(&self.pool)
@@ -122,34 +116,6 @@ impl DiscordStorage {
             .bind(role_id)
             .execute(&self.pool)
             .await?;
-        Ok(())
-    }
-
-    pub async fn set_report_virustotal(&self, guild_id: i64, enabled: bool) -> anyhow::Result<()> {
-        self.ensure_guild_config(guild_id).await?;
-        self.update_config(guild_id, "report_virustotal", enabled)
-            .await
-    }
-
-    pub async fn set_report_behavior(&self, guild_id: i64, enabled: bool) -> anyhow::Result<()> {
-        self.ensure_guild_config(guild_id).await?;
-        self.update_config(guild_id, "report_behavior", enabled)
-            .await
-    }
-
-    pub async fn set_coverage_warning_threshold(
-        &self,
-        guild_id: i64,
-        threshold: u8,
-    ) -> anyhow::Result<()> {
-        self.ensure_guild_config(guild_id).await?;
-        sqlx::query(
-            "UPDATE discord_guild_config SET coverage_warning_threshold = $2 WHERE guild_id = $1",
-        )
-        .bind(guild_id)
-        .bind(i16::from(threshold))
-        .execute(&self.pool)
-        .await?;
         Ok(())
     }
 
@@ -258,12 +224,6 @@ impl DiscordStorage {
     async fn update_config(&self, guild_id: i64, field: &str, value: bool) -> anyhow::Result<()> {
         let query = match field {
             "enabled" => "UPDATE discord_guild_config SET enabled = $2 WHERE guild_id = $1",
-            "report_virustotal" => {
-                "UPDATE discord_guild_config SET report_virustotal = $2 WHERE guild_id = $1"
-            }
-            "report_behavior" => {
-                "UPDATE discord_guild_config SET report_behavior = $2 WHERE guild_id = $1"
-            }
             _ => return Err(anyhow::anyhow!("unsupported Discord configuration field")),
         };
         sqlx::query(query)
@@ -337,9 +297,6 @@ struct GuildConfigRow {
     log_channel_id: Option<i64>,
     error_channel_id: Option<i64>,
     danger_role_id: Option<i64>,
-    report_virustotal: bool,
-    report_behavior: bool,
-    coverage_warning_threshold: i16,
 }
 
 impl From<GuildConfigRow> for DiscordGuildConfig {
@@ -349,9 +306,6 @@ impl From<GuildConfigRow> for DiscordGuildConfig {
             log_channel_id: row.log_channel_id,
             error_channel_id: row.error_channel_id,
             danger_role_id: row.danger_role_id,
-            report_virustotal: row.report_virustotal,
-            report_behavior: row.report_behavior,
-            coverage_warning_threshold: row.coverage_warning_threshold.try_into().unwrap_or(80),
         }
     }
 }
@@ -361,10 +315,12 @@ mod tests {
     use super::DiscordGuildConfig;
 
     #[test]
-    fn default_config_preserves_legacy_visibility_defaults() {
+    fn default_config_contains_only_active_settings() {
         let config = DiscordGuildConfig::default();
-        assert!(config.enabled && config.report_virustotal && config.report_behavior);
-        assert_eq!(config.coverage_warning_threshold, 80);
+        assert!(config.enabled);
+        assert_eq!(config.log_channel_id, None);
+        assert_eq!(config.error_channel_id, None);
+        assert_eq!(config.danger_role_id, None);
     }
 
     #[test]

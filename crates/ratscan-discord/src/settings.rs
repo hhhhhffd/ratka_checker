@@ -22,11 +22,7 @@ pub fn is_settings_component(custom_id: &str) -> bool {
 pub fn panel(config: &DiscordGuildConfig, view: SettingsView) -> Vec<CreateActionRow> {
     match view {
         SettingsView::Main => vec![
-            CreateActionRow::Buttons(vec![
-                toggle_button("enabled", "Scanner", config.enabled),
-                toggle_button("virustotal", "VirusTotal", config.report_virustotal),
-                toggle_button("behavior", "Sandbox behavior", config.report_behavior),
-            ]),
+            CreateActionRow::Buttons(vec![toggle_button("enabled", "Scanner", config.enabled)]),
             CreateActionRow::Buttons(vec![
                 nav_button("view_channels", "Allowed sources"),
                 nav_button("view_logs", "Routing & health"),
@@ -84,19 +80,6 @@ pub fn panel(config: &DiscordGuildConfig, view: SettingsView) -> Vec<CreateActio
                     channel_types: Some(vec![ChannelType::Text, ChannelType::News]),
                     default_channels: None,
                 },
-            ),
-            CreateActionRow::SelectMenu(
-                CreateSelectMenu::new(
-                    id("coverage"),
-                    CreateSelectMenuKind::String {
-                        options: vec![
-                            serenity::builder::CreateSelectMenuOption::new("50%", "50"),
-                            serenity::builder::CreateSelectMenuOption::new("80%", "80"),
-                            serenity::builder::CreateSelectMenuOption::new("90%", "90"),
-                        ],
-                    },
-                )
-                .placeholder("Coverage warning threshold"),
             ),
             CreateActionRow::Buttons(vec![
                 nav_button("api_health", "API health"),
@@ -184,12 +167,12 @@ mod tests {
             "danger_role",
             "add_danger_user",
             "remove_danger_user",
-            "virustotal",
-            "behavior",
-            "coverage",
             "api_health",
         ] {
             assert!(encoded.contains(&format!("{SETTINGS_PREFIX}{action}")));
+        }
+        for removed_action in ["virustotal", "behavior", "coverage"] {
+            assert!(!encoded.contains(&format!("{SETTINGS_PREFIX}{removed_action}")));
         }
     }
 }

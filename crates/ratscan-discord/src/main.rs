@@ -517,8 +517,6 @@ impl Handler {
         }
         let result = match action {
             "enabled" => self.toggle_enabled(guild).await,
-            "virustotal" => self.toggle_virustotal(guild).await,
-            "behavior" => self.toggle_behavior(guild).await,
             "api_health" => self
                 .api
                 .health()
@@ -579,7 +577,6 @@ impl Handler {
                 })
                 .await
             }
-            "coverage" => self.coverage_value(&component, guild).await,
             _ => Err(anyhow::anyhow!("unknown settings component")),
         };
         let message = result.unwrap_or_else(|error| {
@@ -594,21 +591,6 @@ impl Handler {
         self.storage.set_enabled(guild, !config.enabled).await?;
         Ok("Настройка сохранена.".into())
     }
-    async fn toggle_virustotal(&self, guild: i64) -> anyhow::Result<String> {
-        let config = self.storage.guild_config(guild).await?;
-        self.storage
-            .set_report_virustotal(guild, !config.report_virustotal)
-            .await?;
-        Ok("Настройка сохранена.".into())
-    }
-    async fn toggle_behavior(&self, guild: i64) -> anyhow::Result<String> {
-        let config = self.storage.guild_config(guild).await?;
-        self.storage
-            .set_report_behavior(guild, !config.report_behavior)
-            .await?;
-        Ok("Настройка сохранена.".into())
-    }
-
     async fn channel_value<F, Fut>(
         &self,
         component: &ComponentInteraction,
@@ -649,23 +631,6 @@ impl Handler {
         apply(value).await?;
         Ok("Настройка сохранена.".into())
     }
-    async fn coverage_value(
-        &self,
-        component: &ComponentInteraction,
-        guild: i64,
-    ) -> anyhow::Result<String> {
-        let ComponentInteractionDataKind::StringSelect { values } = &component.data.kind else {
-            anyhow::bail!("coverage value is required");
-        };
-        let threshold = values
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("coverage value is required"))?
-            .parse()?;
-        self.storage
-            .set_coverage_warning_threshold(guild, threshold)
-            .await?;
-        Ok("Настройка сохранена.".into())
-    }
 }
 
 async fn send_report(
@@ -697,10 +662,7 @@ async fn route_success(
     filename: &str,
 ) -> anyhow::Result<()> {
     let log = scan_log(delivery, scan, filename);
-    let requires_attention = matches!(
-        scan.verdict,
-        Some(ratscan_models::scan::Verdict::Suspicious | ratscan_models::scan::Verdict::Malicious)
-    );
+    let requires_attention = requires_attention(scan.verdict.as_ref());
     let (content, allowed_mentions) = if requires_attention {
         let users = delivery
             .storage
@@ -743,6 +705,17 @@ async fn route_success(
             .await?;
     }
     Ok(())
+}
+
+fn requires_attention(verdict: Option<&ratscan_models::scan::Verdict>) -> bool {
+    matches!(
+        verdict,
+        Some(
+            ratscan_models::scan::Verdict::Unknown
+                | ratscan_models::scan::Verdict::Suspicious
+                | ratscan_models::scan::Verdict::Malicious
+        )
+    )
 }
 
 fn scan_log(
@@ -955,13 +928,7 @@ async fn ephemeral_component(
 }
 
 fn settings_summary(config: &DiscordGuildConfig) -> String {
-    format!(
-        "Настройки: scanner={}, VirusTotal={}, sandbox={}, coverage={}%.",
-        config.enabled,
-        config.report_virustotal,
-        config.report_behavior,
-        config.coverage_warning_threshold
-    )
+    format!("Настройки: scanner={}", config.enabled)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1125,5 +1092,21 @@ mod tests {
         assert_eq!(value["options"].as_array().unwrap().len(), 3);
         assert_eq!(value["options"][0]["options"][0]["name"], "enabled");
         assert_eq!(value["options"][2]["options"][0]["name"], "message");
+    }
+
+    #[test]
+    fn unknown_requires_danger_alert() {
+        assert!(requires_attention(Some(
+            &ratscan_models::scan::Verdict::Unknown
+        )));
+        assert!(requires_attention(Some(
+            &ratscan_models::scan::Verdict::Suspicious
+        )));
+        assert!(requires_attention(Some(
+            &ratscan_models::scan::Verdict::Malicious
+        )));
+        assert!(!requires_attention(Some(
+            &ratscan_models::scan::Verdict::Clean
+        )));
     }
 }
