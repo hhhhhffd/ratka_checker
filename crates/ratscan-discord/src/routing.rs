@@ -24,13 +24,11 @@ pub fn public_error(error: &ApiClientError) -> &'static str {
 pub fn alert_mentions(
     danger_role_id: Option<i64>,
     danger_users: &[i64],
-    owner_ids: impl IntoIterator<Item = u64>,
 ) -> (String, CreateAllowedMentions) {
     let users = danger_users
         .iter()
         .copied()
         .filter_map(|id| u64::try_from(id).ok())
-        .chain(owner_ids)
         .collect::<BTreeSet<_>>();
     let roles = danger_role_id
         .and_then(|id| u64::try_from(id).ok())
@@ -56,12 +54,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn danger_mentions_are_allowlisted_and_deduplicated() {
-        let (content, allowed) = alert_mentions(Some(7), &[2, 2, 3], [1, 2]);
-        assert_eq!(content, "<@1> <@2> <@3> <@&7>");
+    fn danger_mentions_include_only_configured_recipients() {
+        let (content, allowed) = alert_mentions(Some(7), &[2, 2, 3]);
+        assert_eq!(content, "<@2> <@3> <@&7>");
         let json = serde_json::to_value(allowed).unwrap();
         assert_eq!(json["parse"], serde_json::json!([]));
-        assert_eq!(json["users"], serde_json::json!(["1", "2", "3"]));
+        assert_eq!(json["users"], serde_json::json!(["2", "3"]));
         assert_eq!(json["roles"], serde_json::json!(["7"]));
     }
 }

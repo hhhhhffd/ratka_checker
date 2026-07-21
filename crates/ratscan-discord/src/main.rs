@@ -95,10 +95,10 @@ struct ScanDeliveryContext<'a> {
     thread_id: ChannelId,
     storage: &'a DiscordStorage,
     config: &'a DiscordGuildConfig,
-    owners: &'a HashSet<u64>,
     guild_id: u64,
     author_id: u64,
     channel_id: u64,
+    message_id: u64,
 }
 
 #[async_trait]
@@ -406,7 +406,6 @@ impl Handler {
         let report_http = http.clone();
         let jobs_queue = self.jobs.clone();
         let limiter = Arc::clone(&self.limiter);
-        let owners = self.owners.clone();
         let thread_id = thread.id;
         let author_id = message.author.id.get();
         let message_id = message.id.get();
@@ -416,7 +415,6 @@ impl Handler {
                 let storage = storage.clone();
                 let http = report_http.clone();
                 let config = config.clone();
-                let owners = owners.clone();
                 async move {
                     let filename = job.filename.clone();
                     let result: anyhow::Result<_> = async {
@@ -432,10 +430,10 @@ impl Handler {
                             thread_id,
                             storage: &storage,
                             config: &config,
-                            owners: &owners,
                             guild_id,
                             author_id,
                             channel_id,
+                            message_id,
                         };
                         send_report(&delivery, &scan, &filename).await?;
                         route_success(&delivery, &scan, &filename).await?;
@@ -677,16 +675,6 @@ async fn send_report(
 ) -> anyhow::Result<()> {
     let context = ReportContext {
         filename: filename.into(),
-        author_id: delivery.author_id,
-        channel_id: delivery.channel_id,
-        thread_url: format!(
-            "https://discord.com/channels/{guild_id}/{}",
-            delivery.thread_id.get(),
-            guild_id = delivery.guild_id,
-        ),
-        coverage_warning_threshold: delivery.config.coverage_warning_threshold,
-        report_virustotal: delivery.config.report_virustotal,
-        report_behavior: delivery.config.report_behavior,
     };
     for embed in format_report(scan, &context) {
         let mut rendered = CreateEmbed::new()
@@ -708,54 +696,83 @@ async fn route_success(
     scan: &ratscan_models::scan::ScanResponse,
     filename: &str,
 ) -> anyhow::Result<()> {
+    let log = scan_log(delivery, scan, filename);
+    let requires_attention = matches!(
+        scan.verdict,
+        Some(ratscan_models::scan::Verdict::Suspicious | ratscan_models::scan::Verdict::Malicious)
+    );
+    let (content, allowed_mentions) = if requires_attention {
+        let users = delivery
+            .storage
+            .list_danger_users(delivery.guild_id as i64)
+            .await?;
+        let (mentions, allowed_mentions) = alert_mentions(delivery.config.danger_role_id, &users);
+        (
+            format!("{mentions}\n⚠️ {log}").trim().to_owned(),
+            Some(allowed_mentions),
+        )
+    } else {
+        (log, None)
+    };
+    let mut message = CreateMessage::new().content(content);
+    if let Some(allowed_mentions) = allowed_mentions {
+        message = message.allowed_mentions(allowed_mentions);
+    }
+    if !send_configured(delivery.http, delivery.config.log_channel_id, message).await
+        && requires_attention
+    {
+        let users = delivery
+            .storage
+            .list_danger_users(delivery.guild_id as i64)
+            .await?;
+        let (mentions, allowed_mentions) = alert_mentions(delivery.config.danger_role_id, &users);
+        let fallback = format!(
+            "{mentions}\n⚠️ Scan requires review. Scan ID: `{}`.",
+            scan.scan_id
+        )
+        .trim()
+        .to_owned();
+        delivery
+            .thread_id
+            .send_message(
+                delivery.http,
+                CreateMessage::new()
+                    .content(fallback)
+                    .allowed_mentions(allowed_mentions),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+fn scan_log(
+    delivery: &ScanDeliveryContext<'_>,
+    scan: &ratscan_models::scan::ScanResponse,
+    filename: &str,
+) -> String {
     let verdict = scan
         .verdict
         .as_ref()
         .map_or("unknown", ratscan_models::scan::Verdict::as_str);
-    let summary = format!(
-        "RatScan: `{filename}` — verdict `{verdict}`, risk {}/100.",
-        scan.risk_score
+    let thread_url = format!(
+        "https://discord.com/channels/{}/{}",
+        delivery.guild_id,
+        delivery.thread_id.get()
     );
-    match scan.verdict {
-        Some(ratscan_models::scan::Verdict::Clean) => {
-            let _ = send_configured(
-                delivery.http,
-                delivery.config.log_channel_id,
-                CreateMessage::new().content(summary),
-            )
-            .await;
-        }
-        Some(
-            ratscan_models::scan::Verdict::Suspicious | ratscan_models::scan::Verdict::Malicious,
-        ) => {
-            let users = delivery
-                .storage
-                .list_danger_users(delivery.guild_id as i64)
-                .await?;
-            let (mentions, allowed_mentions) = alert_mentions(
-                delivery.config.danger_role_id,
-                &users,
-                delivery.owners.iter().copied(),
-            );
-            let message = CreateMessage::new()
-                .content(format!("{mentions}\n⚠️ {summary}"))
-                .allowed_mentions(allowed_mentions);
-            if !send_configured(
-                delivery.http,
-                delivery.config.log_channel_id,
-                message.clone(),
-            )
-            .await
-            {
-                delivery
-                    .thread_id
-                    .send_message(delivery.http, message)
-                    .await?;
-            }
-        }
-        Some(ratscan_models::scan::Verdict::Unknown) | None => {}
-    }
-    Ok(())
+    let message_url = format!(
+        "https://discord.com/channels/{}/{}/{}",
+        delivery.guild_id, delivery.channel_id, delivery.message_id
+    );
+    let safe_filename = filename.replace('`', "'");
+    format!(
+        "## Scan log\n\n**File:** `{filename}`\n**Author:** <@{author_id}>\n**Channel:** <#{channel_id}>\n**Thread:** {thread_url}\n**Message:** {message_url}\n**Verdict:** `{verdict}`\n**Risk:** `{risk_score}/100`\n**SHA-256:** `{sha256}`\n**Scan ID:** `{scan_id}`",
+        filename = safe_filename,
+        author_id = delivery.author_id,
+        channel_id = delivery.channel_id,
+        risk_score = scan.risk_score,
+        sha256 = scan.sha256,
+        scan_id = scan.scan_id,
+    )
 }
 
 async fn route_error(

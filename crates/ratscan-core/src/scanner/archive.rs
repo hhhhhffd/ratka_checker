@@ -58,6 +58,7 @@ const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
 const TIMESTAMP_DOMINANT_PERCENT: usize = 90;
 const SHORT_CLASS_NAME_MIN_CLASSES: usize = 8;
 const SHORT_CLASS_NAME_PERCENT: usize = 70;
+const MIN_COVERAGE_FOR_CLEAN_WITH_HIGH_OBFUSCATION: u8 = 70;
 const NETWORK_APIS: &[&str] = &[
     "java/net/Socket",
     "java/net/URL",
@@ -232,6 +233,7 @@ fn scan_bytes(
         confirmed_chains.push(safe_context);
     }
     let chain_capabilities = updater_capabilities(&confirmed_chains);
+    let analysis_coverage = analysis_coverage(&context.data, &data_flow);
     let mut limitations = data_flow
         .limitations
         .iter()
@@ -245,7 +247,6 @@ fn scan_bytes(
             evidence: Vec::new(),
         });
     }
-    let analysis_coverage = analysis_coverage(&context.data, &data_flow);
     if analysis_coverage.parsed_classes < analysis_coverage.total_classes {
         limitations.push(Limitation {
             code: "CLASS_PARSE_LIMITATION".to_owned(),
@@ -255,8 +256,12 @@ fn scan_bytes(
             evidence: Vec::new(),
         });
     }
-    let (verdict, risk_score, summary) =
-        finalize_report(&findings, &confirmed_chains, &obfuscation.obfuscation);
+    let (verdict, risk_score, summary) = finalize_report_with_analysis_limits(
+        &findings,
+        &confirmed_chains,
+        &obfuscation.obfuscation,
+        &analysis_coverage,
+    );
 
     let report = ScanReport {
         verdict: verdict.clone(),
@@ -372,6 +377,19 @@ pub fn finalize_report(
     if verdict == Verdict::Malicious {
         risk_score = risk_score.max(70);
     }
+    let summary = summarize(findings, verdict.clone());
+    (verdict, risk_score, summary)
+}
+
+/// Recomputes a verdict while preserving analysis-completeness safeguards.
+pub fn finalize_report_with_analysis_limits(
+    findings: &[Finding],
+    confirmed_chains: &[ConfirmedChain],
+    obfuscation: &Obfuscation,
+    analysis_coverage: &AnalysisCoverage,
+) -> (Verdict, u8, String) {
+    let (verdict, risk_score, _summary) = finalize_report(findings, confirmed_chains, obfuscation);
+    let verdict = apply_analysis_limits(verdict, obfuscation, analysis_coverage);
     let summary = summarize(findings, verdict.clone());
     (verdict, risk_score, summary)
 }
@@ -2731,6 +2749,22 @@ fn verdict_from_evidence(
     }
 }
 
+/// Prevents a clean verdict when obfuscation and low coverage make a negative result unreliable.
+fn apply_analysis_limits(
+    verdict: Verdict,
+    obfuscation: &Obfuscation,
+    analysis_coverage: &AnalysisCoverage,
+) -> Verdict {
+    if verdict == Verdict::Clean
+        && obfuscation.level == ObfuscationLevel::High
+        && analysis_coverage.overall_score < MIN_COVERAGE_FOR_CLEAN_WITH_HIGH_OBFUSCATION
+    {
+        Verdict::Unknown
+    } else {
+        verdict
+    }
+}
+
 fn finding_score_weight(finding: &Finding) -> u8 {
     match finding.rule_id.as_str() {
         "TIMESTAMP_OUTLIER" => Severity::Low.score_weight(),
@@ -2795,7 +2829,8 @@ mod tests {
     };
 
     use crate::models::scan::{
-        CodeScope, Confidence, Evidence, Finding, Obfuscation, Severity, Verdict,
+        AnalysisCoverage, CodeScope, Confidence, Evidence, Finding, Obfuscation, ObfuscationLevel,
+        Severity, Verdict,
     };
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
@@ -2835,6 +2870,28 @@ mod tests {
         ];
 
         assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
+    }
+
+    #[test]
+    fn high_obfuscation_and_low_coverage_downgrade_clean_to_unknown() {
+        let obfuscation = Obfuscation {
+            level: ObfuscationLevel::High,
+            score: 80,
+            signals: Vec::new(),
+        };
+        let low_coverage = AnalysisCoverage {
+            overall_score: 69,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &low_coverage),
+            Verdict::Unknown
+        );
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Malicious, &obfuscation, &low_coverage),
+            Verdict::Malicious
+        );
     }
 
     #[test]

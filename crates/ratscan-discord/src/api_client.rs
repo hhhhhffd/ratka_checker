@@ -367,12 +367,6 @@ mod tests {
             &scan,
             &crate::report::ReportContext {
                 filename: "mod.jar".into(),
-                author_id: 1,
-                channel_id: 2,
-                thread_url: "thread".into(),
-                coverage_warning_threshold: 80,
-                report_virustotal: false,
-                report_behavior: false,
             },
         );
         assert!(!report.is_empty());

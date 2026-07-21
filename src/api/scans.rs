@@ -114,10 +114,11 @@ fn merge_virustotal_findings(
     findings: impl IntoIterator<Item = Finding>,
 ) -> String {
     report.findings.extend(findings);
-    let (verdict, risk_score, summary) = archive::finalize_report(
+    let (verdict, risk_score, summary) = archive::finalize_report_with_analysis_limits(
         &report.findings,
         &report.confirmed_chains,
         &report.obfuscation,
+        &report.analysis_coverage,
     );
     report.verdict = verdict;
     report.risk_score = risk_score;
