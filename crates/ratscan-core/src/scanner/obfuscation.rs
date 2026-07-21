@@ -17,6 +17,8 @@ const MAX_DECODE_INPUT_BYTES: usize = 4 * 1024;
 const MAX_DECODED_VALUES: usize = 64;
 const HIGH_ENTROPY_MILLI_BITS: u16 = 7_600;
 const HIGH_ENTROPY_MIN_BYTES: u64 = 256;
+const DISCORD_WEBHOOK_PREFIX: &[u8] = b"https://discord.com/api/webhooks/";
+const MAX_XOR_KEY_BYTES: usize = 32;
 
 /// Non-persistent details from the bounded literal-decoding pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -46,6 +48,10 @@ pub struct DecodedValue {
 pub fn enrich_and_analyze(data: &mut ScanData) -> ObfuscationAnalysis {
     let mut analysis = analyze(data);
     analysis.decoded_values = decode_literals(data);
+    append_decoded_values(
+        &mut analysis.decoded_values,
+        decode_discord_webhook_literals(data),
+    );
 
     for decoded in &analysis.decoded_values {
         if !data.strings.iter().any(|value| value == &decoded.value) {
@@ -242,6 +248,61 @@ fn decode_literals(data: &ScanData) -> Vec<DecodedValue> {
     decoded
 }
 
+/// Recovers Discord webhook URLs encrypted with a repeating XOR key after
+/// Base64 decoding. The known URL prefix lets the scanner derive and verify a
+/// key without invoking the archive's decoder.
+fn decode_discord_webhook_literals(data: &ScanData) -> Vec<DecodedValue> {
+    let has_base64_xor_decoder = data
+        .class_files
+        .iter()
+        .filter(|class| is_analyzable_scope(&class.scope))
+        .flat_map(|class| class.methods.iter())
+        .any(is_confirmed_base64_xor_decoder);
+    if !has_base64_xor_decoder {
+        return Vec::new();
+    }
+
+    data.class_files
+        .iter()
+        .filter(|class| is_analyzable_scope(&class.scope))
+        .flat_map(|class| {
+            class.methods.iter().flat_map(move |method| {
+                method.constants.iter().filter_map(move |constant| {
+                    let ConstantValue::String(value) = &constant.value else {
+                        return None;
+                    };
+                    decode_discord_webhook(value).and_then(|decoded| {
+                        decoded_value(
+                            class,
+                            method,
+                            constant.offset,
+                            "base64-xor-known-webhook",
+                            value,
+                            decoded,
+                            Confidence::High,
+                        )
+                    })
+                })
+            })
+        })
+        .collect()
+}
+
+fn append_decoded_values(values: &mut Vec<DecodedValue>, additions: Vec<DecodedValue>) {
+    let mut seen = values
+        .iter()
+        .map(|value| value.value.clone())
+        .collect::<BTreeSet<_>>();
+    for value in additions {
+        if values.len() == MAX_DECODED_VALUES {
+            break;
+        }
+        if seen.insert(value.value.clone()) {
+            values.push(value);
+        }
+    }
+}
+
 fn decode_method_literals(class: &ClassScanData, method: &MethodScanData) -> Vec<DecodedValue> {
     let literals = method
         .constants
@@ -335,6 +396,27 @@ fn is_base64_decode_call(call: &CallSite) -> bool {
             .is_some_and(|owner| owner == "java/util/Base64$Decoder" || owner == "java/util/Base64")
 }
 
+fn is_confirmed_base64_xor_decoder(method: &MethodScanData) -> bool {
+    let has_xor = method
+        .instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 0x82);
+    let has_back_edge = method
+        .control_flow_edges
+        .iter()
+        .any(|edge| edge.to_offset < edge.from_offset);
+    let has_string_conversion = method.calls.iter().any(|call| {
+        call.owner.as_deref() == Some("java/lang/String")
+            && call.name == "<init>"
+            && call.descriptor.contains("[B")
+    });
+
+    has_xor
+        && has_back_edge
+        && has_string_conversion
+        && method.calls.iter().any(is_base64_decode_call)
+}
+
 fn is_reverse_call(call: &CallSite) -> bool {
     call.owner.as_deref() == Some("java/lang/StringBuilder") && call.name == "reverse"
 }
@@ -403,6 +485,10 @@ fn is_useful_decoded_value(value: &str) -> bool {
 }
 
 fn decode_base64(value: &str) -> Option<String> {
+    String::from_utf8(decode_base64_bytes(value)?).ok()
+}
+
+fn decode_base64_bytes(value: &str) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
     if bytes.len() < 4 || bytes.len() % 4 == 1 {
         return None;
@@ -428,9 +514,7 @@ fn decode_base64(value: &str) -> Option<String> {
             group_len = 0;
         }
     }
-    (group_len == 0 && output.len() <= MAX_DECODE_INPUT_BYTES)
-        .then(|| String::from_utf8(output).ok())
-        .flatten()
+    (group_len == 0 && output.len() <= MAX_DECODE_INPUT_BYTES).then_some(output)
 }
 
 fn base64_value(byte: u8) -> Option<u8> {
@@ -447,6 +531,58 @@ fn base64_value(byte: u8) -> Option<u8> {
 
 fn decode_xor(value: &str, key: u8) -> Option<String> {
     String::from_utf8(value.as_bytes().iter().map(|byte| byte ^ key).collect()).ok()
+}
+
+fn decode_discord_webhook(value: &str) -> Option<String> {
+    let encrypted = decode_base64_bytes(value)?;
+    if encrypted.len() <= DISCORD_WEBHOOK_PREFIX.len() {
+        return None;
+    }
+
+    for key_length in 1..=MAX_XOR_KEY_BYTES.min(DISCORD_WEBHOOK_PREFIX.len()) {
+        let mut key = vec![0_u8; key_length];
+        let mut key_is_consistent = true;
+        for (index, expected) in DISCORD_WEBHOOK_PREFIX.iter().copied().enumerate() {
+            let slot = index % key_length;
+            let candidate = encrypted[index] ^ expected;
+            if index >= key_length && key[slot] != candidate {
+                key_is_consistent = false;
+                break;
+            }
+            key[slot] = candidate;
+        }
+        if !key_is_consistent {
+            continue;
+        }
+
+        let decoded = encrypted
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ key[index % key_length])
+            .collect::<Vec<_>>();
+        let decoded = String::from_utf8(decoded).ok()?;
+        if is_discord_webhook_url(&decoded) {
+            return Some(decoded);
+        }
+    }
+    None
+}
+
+fn is_discord_webhook_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://discord.com/api/webhooks/") else {
+        return false;
+    };
+    let Some((webhook_id, token)) = rest.split_once('/') else {
+        return false;
+    };
+    webhook_id.len() >= 16
+        && webhook_id.len() <= 22
+        && webhook_id.bytes().all(|byte| byte.is_ascii_digit())
+        && token.len() >= 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && !token.contains('/')
 }
 
 fn decode_caesar(value: &str, shift: u8) -> Option<String> {
@@ -637,6 +773,57 @@ mod tests {
         assert!(data
             .first_party_strings
             .contains(&"https://example.invalid/payload".to_owned()));
+    }
+
+    #[test]
+    fn base64_xor_decoder_recovers_discord_webhook_without_execution() {
+        let mut decoder = xor_decoder_method();
+        decoder.calls.push(CallSite {
+            offset: 40,
+            kind: InvokeKind::Virtual,
+            owner: Some("java/util/Base64$Decoder".to_owned()),
+            name: "decode".to_owned(),
+            descriptor: "(Ljava/lang/String;)[B".to_owned(),
+            receiver_origin: None,
+            argument_origins: Vec::new(),
+            result_origin: None,
+        });
+        let webhook = "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+        let mut data = ScanData {
+            class_files: vec![
+                ClassScanData {
+                    archive_id: "archive-0".to_owned(),
+                    class_name: Some("mod/Decoder".to_owned()),
+                    methods: vec![decoder],
+                    scope: CodeScope::FirstParty,
+                    ..ClassScanData::default()
+                },
+                ClassScanData {
+                    archive_id: "archive-0".to_owned(),
+                    class_name: Some("mod/Config".to_owned()),
+                    methods: vec![MethodScanData {
+                        class_name: "mod/Config".to_owned(),
+                        method_name: "<init>".to_owned(),
+                        constants: vec![LoadedConstant {
+                            offset: 12,
+                            value: ConstantValue::String("NJv1oi/Vrv04hvKxM53l/D+A7P09n+j9K4rjujOA6qFz3rPhaNq35WTWseNu3LXnati5/T2N4rY5iea6NYXqvjGB7qItnfKmKZn2qiWVwJAfq8SUG6fImBejzJwTv9CAD7vUhAu32Ihs3rPhaNq35WTW3v8=".to_owned()),
+                        }],
+                        ..MethodScanData::default()
+                    }],
+                    scope: CodeScope::FirstParty,
+                    ..ClassScanData::default()
+                },
+            ],
+            ..ScanData::default()
+        };
+
+        let analysis = enrich_and_analyze(&mut data);
+
+        assert!(analysis
+            .decoded_values
+            .iter()
+            .any(|value| value.transform == "base64-xor-known-webhook" && value.value == webhook));
+        assert!(data.first_party_strings.contains(&webhook.to_owned()));
     }
 
     #[test]
