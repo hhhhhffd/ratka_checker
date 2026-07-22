@@ -125,10 +125,16 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, message: Message) {
-        if message.author.bot || message.guild_id.is_none() || jar_jobs(&message).is_empty() {
+        let Some(guild_id) = message.guild_id.map(|id| id.get()) else {
+            return;
+        };
+        if message.author.bot || jar_jobs(&message).is_empty() {
             return;
         }
-        if let Err(error) = self.start_scan(&ctx, message.clone(), false).await {
+        if let Err(error) = self
+            .start_scan(&ctx, message.clone(), guild_id, false)
+            .await
+        {
             match error {
                 StartScanError::NotEligible => {}
                 StartScanError::RateLimited => {
@@ -324,7 +330,7 @@ impl Handler {
                 .await;
             return;
         }
-        match self.start_scan(ctx, message, true).await {
+        match self.start_scan(ctx, message, guild_id, true).await {
             Ok(thread_url) => {
                 let _ = command
                     .edit_response(
@@ -360,9 +366,9 @@ impl Handler {
         &self,
         ctx: &Context,
         message: Message,
+        guild_id: u64,
         manual: bool,
     ) -> Result<String, StartScanError> {
-        let guild_id = message.guild_id.ok_or(StartScanError::NotEligible)?.get();
         let channel_id = message.channel_id.get();
         let jobs = jar_jobs(&message);
         let config = self.storage.guild_config(guild_id as i64).await?;
