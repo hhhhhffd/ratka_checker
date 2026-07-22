@@ -17,7 +17,10 @@ const MAX_DECODE_INPUT_BYTES: usize = 4 * 1024;
 const MAX_DECODED_VALUES: usize = 64;
 const HIGH_ENTROPY_MILLI_BITS: u16 = 7_600;
 const HIGH_ENTROPY_MIN_BYTES: u64 = 256;
-const DISCORD_WEBHOOK_PREFIX: &[u8] = b"https://discord.com/api/webhooks/";
+const WEBHOOK_PREFIXES: &[&[u8]] = &[
+    b"https://discord.com/api/webhooks/",
+    b"https://hooks.slack.com/services/",
+];
 const MAX_XOR_KEY_BYTES: usize = 32;
 
 /// Description of a statically verified `(String, int) -> String` decoder.
@@ -58,10 +61,7 @@ pub struct DecodedValue {
 pub fn enrich_and_analyze(data: &mut ScanData) -> ObfuscationAnalysis {
     let mut analysis = analyze(data);
     analysis.decoded_values = decode_literals(data);
-    append_decoded_values(
-        &mut analysis.decoded_values,
-        decode_discord_webhook_literals(data),
-    );
+    append_decoded_values(&mut analysis.decoded_values, decode_webhook_literals(data));
 
     for decoded in &analysis.decoded_values {
         if !data.strings.iter().any(|value| value == &decoded.value) {
@@ -379,10 +379,10 @@ fn decode_indexed_xor(value: &str, key: i32, base_key: i32) -> Option<String> {
     String::from_utf16(&decoded).ok()
 }
 
-/// Recovers Discord webhook URLs encrypted with a repeating XOR key after
+/// Recovers Discord and Slack webhook URLs encrypted with a repeating XOR key after
 /// Base64 decoding. The known URL prefix lets the scanner derive and verify a
 /// key without invoking the archive's decoder.
-fn decode_discord_webhook_literals(data: &ScanData) -> Vec<DecodedValue> {
+fn decode_webhook_literals(data: &ScanData) -> Vec<DecodedValue> {
     let has_base64_xor_decoder = data
         .class_files
         .iter()
@@ -402,7 +402,7 @@ fn decode_discord_webhook_literals(data: &ScanData) -> Vec<DecodedValue> {
                     let ConstantValue::String(value) = &constant.value else {
                         return None;
                     };
-                    decode_discord_webhook(value).and_then(|decoded| {
+                    decode_webhook(value).and_then(|decoded| {
                         decoded_value(
                             class,
                             method,
@@ -664,56 +664,68 @@ fn decode_xor(value: &str, key: u8) -> Option<String> {
     String::from_utf8(value.as_bytes().iter().map(|byte| byte ^ key).collect()).ok()
 }
 
-fn decode_discord_webhook(value: &str) -> Option<String> {
+fn decode_webhook(value: &str) -> Option<String> {
     let encrypted = decode_base64_bytes(value)?;
-    if encrypted.len() <= DISCORD_WEBHOOK_PREFIX.len() {
-        return None;
-    }
-
-    for key_length in 1..=MAX_XOR_KEY_BYTES.min(DISCORD_WEBHOOK_PREFIX.len()) {
-        let mut key = vec![0_u8; key_length];
-        let mut key_is_consistent = true;
-        for (index, expected) in DISCORD_WEBHOOK_PREFIX.iter().copied().enumerate() {
-            let slot = index % key_length;
-            let candidate = encrypted[index] ^ expected;
-            if index >= key_length && key[slot] != candidate {
-                key_is_consistent = false;
-                break;
-            }
-            key[slot] = candidate;
-        }
-        if !key_is_consistent {
+    for prefix in WEBHOOK_PREFIXES {
+        if encrypted.len() <= prefix.len() {
             continue;
         }
+        for key_length in 1..=MAX_XOR_KEY_BYTES.min(prefix.len()) {
+            let mut key = vec![0_u8; key_length];
+            let mut key_is_consistent = true;
+            for (index, expected) in prefix.iter().copied().enumerate() {
+                let slot = index % key_length;
+                let candidate = encrypted[index] ^ expected;
+                if index >= key_length && key[slot] != candidate {
+                    key_is_consistent = false;
+                    break;
+                }
+                key[slot] = candidate;
+            }
+            if !key_is_consistent {
+                continue;
+            }
 
-        let decoded = encrypted
-            .iter()
-            .enumerate()
-            .map(|(index, byte)| byte ^ key[index % key_length])
-            .collect::<Vec<_>>();
-        let decoded = String::from_utf8(decoded).ok()?;
-        if is_discord_webhook_url(&decoded) {
-            return Some(decoded);
+            let decoded = encrypted
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ key[index % key_length])
+                .collect::<Vec<_>>();
+            let decoded = String::from_utf8(decoded).ok()?;
+            if is_webhook_url(&decoded) {
+                return Some(decoded);
+            }
         }
     }
     None
 }
 
-fn is_discord_webhook_url(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("https://discord.com/api/webhooks/") else {
+pub(crate) fn is_webhook_url(value: &str) -> bool {
+    if let Some(rest) = value.strip_prefix("https://discord.com/api/webhooks/") {
+        let Some((webhook_id, token)) = rest.split_once('/') else {
+            return false;
+        };
+        return webhook_id.len() >= 16
+            && webhook_id.len() <= 22
+            && webhook_id.bytes().all(|byte| byte.is_ascii_digit())
+            && token.len() >= 32
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            && !token.contains('/');
+    }
+
+    let Some(rest) = value.strip_prefix("https://hooks.slack.com/services/") else {
         return false;
     };
-    let Some((webhook_id, token)) = rest.split_once('/') else {
-        return false;
-    };
-    webhook_id.len() >= 16
-        && webhook_id.len() <= 22
-        && webhook_id.bytes().all(|byte| byte.is_ascii_digit())
-        && token.len() >= 32
-        && token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        && !token.contains('/')
+    let parts = rest.split('/').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            part.len() >= 8
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
 }
 
 fn decode_caesar(value: &str, shift: u8) -> Option<String> {
@@ -732,6 +744,7 @@ fn is_security_relevant(value: &str) -> bool {
     lower.starts_with("http://")
         || lower.starts_with("https://")
         || lower.contains("discord.com/api/webhooks")
+        || lower.contains("hooks.slack.com/services")
         || lower.contains("discord/leveldb")
         || lower.contains("discord/local storage")
         || lower.contains("login data")
@@ -1069,6 +1082,16 @@ mod tests {
             .iter()
             .any(|value| value.transform == "base64-xor-known-webhook" && value.value == webhook));
         assert!(data.first_party_strings.contains(&webhook.to_owned()));
+    }
+
+    #[test]
+    fn recognizes_slack_webhook_url() {
+        assert!(is_webhook_url(
+            "https://hooks.slack.com/services/T01234567/B01234567/abcdefghijklmnopqrstuvwxyz012345"
+        ));
+        assert!(!is_webhook_url(
+            "https://hooks.slack.com/services/not-a-valid-webhook"
+        ));
     }
 
     #[test]

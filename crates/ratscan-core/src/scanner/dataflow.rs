@@ -65,6 +65,8 @@ pub enum SourceKind {
     FileRead,
     SocketInput,
     CredentialFile,
+    /// A Minecraft authentication command entered through `ClientChatEvent`.
+    ChatCredential,
     EnvironmentVariable,
     Clipboard,
     ProcessOutput,
@@ -555,7 +557,10 @@ impl<'a> Analyzer<'a> {
                 }
                 Operation::NetworkSend { body, evidence } => {
                     for taint in values(&locals, *body) {
-                        if taint.source_kind == SourceKind::CredentialFile || taint.secret_extracted
+                        if matches!(
+                            taint.source_kind,
+                            SourceKind::CredentialFile | SourceKind::ChatCredential
+                        ) || taint.secret_extracted
                         {
                             self.emit(
                                 ConfirmedChainKind::CredentialExfiltration,
@@ -1148,6 +1153,33 @@ mod tests {
         assert!(analyze_method_flows(&[flow], &DataFlowConfig::default())
             .confirmed_chains
             .is_empty());
+    }
+
+    #[test]
+    fn confirms_authentication_chat_data_sent_to_network() {
+        let id = method("onChatMessage", Vec::new()).id;
+        let flow = MethodFlow {
+            id: id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Source {
+                    output: 0,
+                    kind: SourceKind::ChatCredential,
+                    evidence: evidence(&id, 1, "ClientChatEvent.getMessage"),
+                },
+                Operation::NetworkSend {
+                    body: 0,
+                    evidence: evidence(&id, 2, "java/io/OutputStream.write"),
+                },
+            ],
+        };
+
+        assert!(analyze_method_flows(&[flow], &DataFlowConfig::default())
+            .confirmed_chains
+            .iter()
+            .any(|chain| chain.kind == ConfirmedChainKind::CredentialExfiltration));
     }
 
     #[test]

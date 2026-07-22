@@ -54,7 +54,7 @@ const EXTERNAL_URLCLASSLOADER_SIGNAL: &str = "urlclassloader_external_target";
 const PRIVACY_NETWORK_SYNC_RULE_ID: &str = "PRIVACY_NETWORK_SYNC";
 const CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID: &str = "CONFIRMED_REMOTE_MEMORY_LOAD";
 const CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID: &str = "CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER";
-const CONFIRMED_DISCORD_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_DISCORD_WEBHOOK_EXFIL";
+const CONFIRMED_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_WEBHOOK_EXFIL";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
@@ -241,8 +241,7 @@ fn scan_bytes(
     if let Some(chain) = confirmed_embedded_native_downloader(&context.data) {
         confirmed_chains.push(chain);
     }
-    if let Some(chain) = confirmed_discord_webhook_exfil(&context.data, &obfuscation.decoded_values)
-    {
+    if let Some(chain) = confirmed_webhook_exfil(&context.data, &obfuscation.decoded_values) {
         confirmed_chains.push(chain);
     }
     if let Some(safe_context) = confirmed_safe_updater_context(&confirmed_chains) {
@@ -250,6 +249,7 @@ fn scan_bytes(
     }
     let chain_capabilities = updater_capabilities(&confirmed_chains);
     let analysis_coverage = analysis_coverage(&context.data, &data_flow);
+    let has_first_party_network_calls = has_first_party_network_calls(&context.data);
     let mut limitations = data_flow
         .limitations
         .iter()
@@ -272,12 +272,24 @@ fn scan_bytes(
             evidence: Vec::new(),
         });
     }
+    if has_first_party_network_calls
+        && analysis_coverage.method_flow_coverage == 0
+        && !matches!(obfuscation.obfuscation.level, ObfuscationLevel::None)
+    {
+        limitations.push(Limitation {
+            code: "NETWORK_FLOW_ANALYSIS_INCOMPLETE".to_owned(),
+            message: "Сетевой код в обфусцированном моде не был покрыт анализом потока; вердикт clean недостоверен."
+                .to_owned(),
+            evidence: Vec::new(),
+        });
+    }
     let limitations = aggregate_limitations(limitations);
-    let (verdict, risk_score, summary) = finalize_report_with_analysis_limits(
+    let (verdict, risk_score, summary) = finalize_report_with_network_analysis_limits(
         &findings,
         &confirmed_chains,
         &obfuscation.obfuscation,
         &analysis_coverage,
+        has_first_party_network_calls,
     );
 
     let report = ScanReport {
@@ -445,8 +457,29 @@ pub fn finalize_report_with_analysis_limits(
     obfuscation: &Obfuscation,
     analysis_coverage: &AnalysisCoverage,
 ) -> (Verdict, u8, String) {
+    finalize_report_with_network_analysis_limits(
+        findings,
+        confirmed_chains,
+        obfuscation,
+        analysis_coverage,
+        false,
+    )
+}
+
+fn finalize_report_with_network_analysis_limits(
+    findings: &[Finding],
+    confirmed_chains: &[ConfirmedChain],
+    obfuscation: &Obfuscation,
+    analysis_coverage: &AnalysisCoverage,
+    has_first_party_network_calls: bool,
+) -> (Verdict, u8, String) {
     let (verdict, risk_score, _summary) = finalize_report(findings, confirmed_chains, obfuscation);
-    let verdict = apply_analysis_limits(verdict, obfuscation, analysis_coverage);
+    let verdict = apply_analysis_limits(
+        verdict,
+        obfuscation,
+        analysis_coverage,
+        has_first_party_network_calls,
+    );
     let summary = summarize(findings, verdict.clone());
     (verdict, risk_score, summary)
 }
@@ -1593,6 +1626,7 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
     let mut object_targets = HashMap::<String, FileTarget>::new();
     let mut process_builders = HashMap::<String, Vec<FileTarget>>::new();
     let mut list_commands = HashMap::<String, Vec<FileTarget>>::new();
+    let mut http_output_streams = HashSet::<String>::new();
 
     for record in &method.local_origins {
         if let Some(input) = local_for_origin(method, &record.origin) {
@@ -1730,6 +1764,23 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             continue;
         }
 
+        if is_authentication_chat_message(owner, &call.name)
+            && class_handles_authentication_commands(class_file)
+        {
+            if let Some(output) = output {
+                let mut evidence = evidence;
+                evidence.source_value = Some("Minecraft authentication chat command".to_owned());
+                events.push((
+                    call.offset,
+                    Operation::Source {
+                        output,
+                        kind: SourceKind::ChatCredential,
+                        evidence,
+                    },
+                ));
+            }
+            continue;
+        }
         if let Some(kind) = remote_response_kind(owner, &call.name) {
             if let Some(output) = output {
                 events.push((
@@ -1764,6 +1815,26 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
                         evidence,
                     },
                 ));
+            }
+            continue;
+        }
+        if is_http_output_stream(owner, &call.name) {
+            if let Some(result) = &call.result_origin {
+                http_output_streams.insert(object_key(result));
+                if let Some(local) = output {
+                    http_output_streams.insert(object_key(&ValueOrigin::Local(local)));
+                }
+            }
+            continue;
+        }
+        if is_http_output_write(
+            owner,
+            &call.name,
+            call.receiver_origin.as_ref(),
+            &http_output_streams,
+        ) {
+            if let Some(body) = arguments.first().copied() {
+                events.push((call.offset, Operation::NetworkSend { body, evidence }));
             }
             continue;
         }
@@ -2173,6 +2244,74 @@ fn remote_response_kind(owner: &str, name: &str) -> Option<SourceKind> {
     ((owner.contains("WebSocket") || owner.contains("Websocket"))
         && matches!(name, "receive" | "readMessage" | "sendAndWaitForResponse"))
     .then_some(SourceKind::SocketInput)
+}
+
+const AUTHENTICATION_COMMAND_PREFIXES: &[&str] = &[
+    "/l",
+    "/login",
+    "/log",
+    "/reg",
+    "/register",
+    "/registration",
+    "/changepass",
+    "/changepassword",
+    "/change-password",
+    "/pass",
+    "/password",
+    "/auth",
+    "/authorize",
+    "/signin",
+    "/sign-in",
+];
+
+fn is_authentication_chat_message(owner: &str, name: &str) -> bool {
+    owner == "net/minecraftforge/client/event/ClientChatEvent"
+        && matches!(name, "getMessage" | "getMessageString")
+}
+
+fn class_handles_authentication_commands(class_file: &ClassScanData) -> bool {
+    class_file
+        .strings
+        .iter()
+        .chain(class_file.methods.iter().flat_map(|method| {
+            method
+                .constants
+                .iter()
+                .filter_map(|constant| match &constant.value {
+                    ConstantValue::String(value) => Some(value),
+                    _ => None,
+                })
+        }))
+        .any(|value| is_authentication_command_prefix(value))
+}
+
+fn is_authentication_command_prefix(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    AUTHENTICATION_COMMAND_PREFIXES.iter().any(|prefix| {
+        normalized == *prefix
+            || normalized
+                .strip_prefix(prefix)
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(char::is_whitespace)
+    })
+}
+
+fn is_http_output_stream(owner: &str, name: &str) -> bool {
+    matches!(
+        owner,
+        "java/net/HttpURLConnection" | "javax/net/ssl/HttpsURLConnection"
+    ) && name == "getOutputStream"
+}
+
+fn is_http_output_write(
+    owner: &str,
+    name: &str,
+    receiver: Option<&ValueOrigin>,
+    http_output_streams: &HashSet<String>,
+) -> bool {
+    owner == "java/io/OutputStream"
+        && name == "write"
+        && receiver.is_some_and(|origin| http_output_streams.contains(&object_key(origin)))
 }
 
 fn is_file_read(owner: &str, name: &str) -> bool {
@@ -2729,25 +2868,22 @@ fn confirmed_embedded_native_downloader(data: &ScanData) -> Option<ConfirmedChai
 }
 
 /// Confirms hidden player telemetry only when a statically recovered, hard-coded
-/// Discord webhook is used by a method that posts Minecraft client data.
-fn confirmed_discord_webhook_exfil(
+/// webhook is used by a method that posts Minecraft client data.
+fn confirmed_webhook_exfil(
     data: &ScanData,
     decoded_values: &[obfuscation::DecodedValue],
 ) -> Option<ConfirmedChain> {
-    let webhook = decoded_values.iter().find(|value| {
-        value.transform == "base64-xor-known-webhook"
-            && value.value.starts_with("https://discord.com/api/webhooks/")
-    })?;
-    let (class_file, method) = data
-        .class_files
+    let webhook = decoded_values
         .iter()
-        .filter(|class_file| class_file.scope == CodeScope::FirstParty)
-        .find_map(|class_file| {
-            class_file.methods.iter().find_map(|method| {
-                (method_posts_to_webhook(method) && method_reads_minecraft_client_data(method))
-                    .then_some((class_file, method))
-            })
-        })?;
+        .find(|value| obfuscation::is_webhook_url(&value.value))?;
+    let class_file = data.class_files.iter().find(|class_file| {
+        class_file.scope == CodeScope::FirstParty
+            && class_file.archive_id == webhook.archive_id
+            && class_file.class_name.as_deref() == Some(webhook.class_name.as_str())
+    })?;
+    let method = class_file.methods.iter().find(|method| {
+        method_posts_to_webhook(method) && method_reads_minecraft_client_data(method)
+    })?;
     let post_call = method.calls.iter().find(|call| {
         call.owner.as_deref() == Some("java/net/HttpURLConnection") && call.name == "setDoOutput"
     })?;
@@ -2784,8 +2920,8 @@ fn confirmed_discord_webhook_exfil(
         method_descriptor: Some(webhook.method_descriptor.clone()),
         bytecode_offset: Some(webhook.bytecode_offset),
         resource_path: None,
-        operation: "decoded_discord_webhook".to_owned(),
-        value_preview: Some("Discord webhook URL (redacted)".to_owned()),
+        operation: "decoded_webhook".to_owned(),
+        value_preview: Some("Webhook URL (redacted)".to_owned()),
         source_value: None,
         target_value: None,
         confidence: Confidence::High,
@@ -2793,8 +2929,8 @@ fn confirmed_discord_webhook_exfil(
     };
 
     Some(ConfirmedChain {
-        chain_id: format!("discord-webhook-exfil-{}", class_file.archive_id),
-        rule_id: CONFIRMED_DISCORD_WEBHOOK_EXFIL_RULE_ID.to_owned(),
+        chain_id: format!("webhook-exfil-{}", class_file.archive_id),
+        rule_id: CONFIRMED_WEBHOOK_EXFIL_RULE_ID.to_owned(),
         severity: Severity::Critical,
         confidence: Confidence::High,
         score_contribution: 80,
@@ -2812,10 +2948,6 @@ fn confirmed_discord_webhook_exfil(
 }
 
 fn method_posts_to_webhook(method: &MethodScanData) -> bool {
-    let reads_webhook_field = method
-        .field_reads
-        .iter()
-        .any(|field| field.name.to_ascii_lowercase().contains("webhook"));
     let has_output = method.calls.iter().any(|call| {
         call.owner.as_deref() == Some("java/net/HttpURLConnection") && call.name == "setDoOutput"
     });
@@ -2828,7 +2960,7 @@ fn method_posts_to_webhook(method: &MethodScanData) -> bool {
         .iter()
         .any(|call| call.owner.as_deref() == Some("java/io/OutputStream") && call.name == "write");
 
-    reads_webhook_field && has_output && has_body_stream && has_body_write
+    has_output && has_body_stream && has_body_write
 }
 
 fn method_reads_minecraft_client_data(method: &MethodScanData) -> bool {
@@ -3188,7 +3320,7 @@ fn verdict_from_evidence(
                 | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
                 | CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID
                 | CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID
-                | CONFIRMED_DISCORD_WEBHOOK_EXFIL_RULE_ID
+                | CONFIRMED_WEBHOOK_EXFIL_RULE_ID
         ) || (chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC" && !has_safe_updater_context)
     });
     let trusted_vt_detection = findings
@@ -3209,15 +3341,44 @@ fn apply_analysis_limits(
     verdict: Verdict,
     obfuscation: &Obfuscation,
     analysis_coverage: &AnalysisCoverage,
+    has_first_party_network_calls: bool,
 ) -> Verdict {
+    let incomplete_obfuscated_network_flow = has_first_party_network_calls
+        && analysis_coverage.method_flow_coverage == 0
+        && !matches!(obfuscation.level, ObfuscationLevel::None);
     if verdict == Verdict::Clean
-        && obfuscation.level == ObfuscationLevel::High
-        && analysis_coverage.overall_score < MIN_COVERAGE_FOR_CLEAN_WITH_HIGH_OBFUSCATION
+        && ((obfuscation.level == ObfuscationLevel::High
+            && analysis_coverage.overall_score < MIN_COVERAGE_FOR_CLEAN_WITH_HIGH_OBFUSCATION)
+            || incomplete_obfuscated_network_flow)
     {
         Verdict::Unknown
     } else {
         verdict
     }
+}
+
+fn has_first_party_network_calls(data: &ScanData) -> bool {
+    data.class_files
+        .iter()
+        .filter(|class_file| {
+            matches!(
+                class_file.scope,
+                CodeScope::FirstParty | CodeScope::NestedMod | CodeScope::Unknown
+            )
+        })
+        .flat_map(|class_file| class_file.methods.iter())
+        .flat_map(|method| method.calls.iter())
+        .filter_map(|call| call.owner.as_deref())
+        .any(|owner| {
+            matches!(
+                owner,
+                "java/net/URL"
+                    | "java/net/HttpURLConnection"
+                    | "javax/net/ssl/HttpsURLConnection"
+                    | "java/net/http/HttpClient"
+                    | "java/net/Socket"
+            )
+        })
 }
 
 fn finding_score_weight(finding: &Finding) -> u8 {
@@ -3295,9 +3456,7 @@ mod tests {
     };
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
-        class_file::{
-            CallSite, ConstantValue, FieldAccess, InvokeKind, MethodScanData, ValueOrigin,
-        },
+        class_file::{CallSite, ConstantValue, InvokeKind, MethodScanData, ValueOrigin},
         dataflow::FileTarget,
         obfuscation::DecodedValue,
     };
@@ -3397,11 +3556,11 @@ mod tests {
         };
 
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &low_coverage),
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &low_coverage, false),
             Verdict::Unknown
         );
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Malicious, &obfuscation, &low_coverage),
+            super::apply_analysis_limits(Verdict::Malicious, &obfuscation, &low_coverage, false),
             Verdict::Malicious
         );
     }
@@ -3438,6 +3597,38 @@ mod tests {
         assert!(is_credential_target(&FileTarget::Known(
             "Google/Chrome/User Data/Default/Login Data".to_owned(),
         )));
+    }
+
+    #[test]
+    fn authentication_command_aliases_are_recognized_exactly() {
+        for command in ["/l", "/login password", "/reg password", "/registration p"] {
+            assert!(super::is_authentication_command_prefix(command));
+        }
+        assert!(!super::is_authentication_command_prefix("/locate village"));
+        assert!(!super::is_authentication_command_prefix("/registering"));
+    }
+
+    #[test]
+    fn incomplete_obfuscated_network_flow_downgrades_clean_to_unknown() {
+        let obfuscation = Obfuscation {
+            level: ObfuscationLevel::Medium,
+            score: 25,
+            signals: vec!["reflection_density".to_owned()],
+        };
+        let coverage = AnalysisCoverage {
+            overall_score: 83,
+            method_flow_coverage: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, true),
+            Verdict::Unknown
+        );
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, false),
+            Verdict::Clean
+        );
     }
 
     /// Verifies privacy/network sync is suspicious but not malicious by itself.
@@ -3477,7 +3668,7 @@ mod tests {
     }
 
     #[test]
-    fn confirms_hard_coded_discord_webhook_player_exfiltration() {
+    fn confirms_hard_coded_slack_webhook_player_exfiltration() {
         let method = MethodScanData {
             class_name: "mod/Webhook".to_owned(),
             method_name: "send".to_owned(),
@@ -3488,13 +3679,6 @@ mod tests {
                 test_call("java/io/OutputStream", "write"),
                 test_call("net/minecraft/client/MinecraftClient", "getInstance"),
             ],
-            field_reads: vec![FieldAccess {
-                offset: 4,
-                owner: "mod/Config".to_owned(),
-                name: "webhookUrl".to_owned(),
-                descriptor: "Ljava/lang/String;".to_owned(),
-                value_origin: None,
-            }],
             ..MethodScanData::default()
         };
         let data = ScanData {
@@ -3511,23 +3695,20 @@ mod tests {
         let decoded_values = vec![DecodedValue {
             archive_id: "archive-0".to_owned(),
             archive_path: "<root>".to_owned(),
-            class_name: "mod/Config".to_owned(),
+            class_name: "mod/Webhook".to_owned(),
             method_name: "<init>".to_owned(),
             method_descriptor: "()V".to_owned(),
             bytecode_offset: 12,
             transform: "base64-xor-known-webhook",
             original_value: "encrypted".to_owned(),
-            value: "https://discord.com/api/webhooks/123456789012345678/token".to_owned(),
+            value: "https://hooks.slack.com/services/T01234567/B01234567/abcdefghijklmnopqrstuvwxyz012345".to_owned(),
             confidence: Confidence::High,
         }];
 
-        let chain = super::confirmed_discord_webhook_exfil(&data, &decoded_values)
+        let chain = super::confirmed_webhook_exfil(&data, &decoded_values)
             .expect("confirmed webhook exfiltration");
 
-        assert_eq!(
-            chain.rule_id,
-            super::CONFIRMED_DISCORD_WEBHOOK_EXFIL_RULE_ID
-        );
+        assert_eq!(chain.rule_id, super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID);
         assert_eq!(
             verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 80),
             Verdict::Malicious
