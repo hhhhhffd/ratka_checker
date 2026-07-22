@@ -68,9 +68,12 @@ also retain `text_resources` (encoding and confidence) and `decoded_strings`
 data-flow are compared symbolically, so equivalent `%APPDATA%`, Windows, and
 Java-home forms do not break a confirmed chain.
 
-YAML rule matches are non-scoring `heuristic` observations. Only contextual
-findings with source-level evidence, confirmed data-flow chains, or trusted
-VirusTotal evidence can affect `risk_score` and `verdict`.
+YAML rule matches are normally non-scoring `heuristic` observations. Explicit
+anti-analysis checks (VMware, Sandboxie, or antivirus-process discovery) are
+an exception: they require manual review and produce `suspicious`, but never
+`malicious` on their own. Contextual findings with source-level evidence,
+confirmed data-flow chains, or trusted VirusTotal evidence can also affect
+`risk_score` and `verdict`.
 
 The flow adapter follows bounded calls inside an archive layer, including JVM
 parameter slots, instance-method `this`, return values, and concrete

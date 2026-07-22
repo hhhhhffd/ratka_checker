@@ -2965,10 +2965,21 @@ fn risk_score(
 }
 
 /// Facts from broad rules are intentionally non-scoring until an analyzer can
-/// attach contextual source-level evidence to them.
+/// attach contextual source-level evidence to them, except for explicit
+/// anti-analysis checks.
 fn finding_is_risk_bearing(finding: &Finding) -> bool {
-    finding.kind != crate::models::scan::FindingKind::Heuristic
-        && (!finding.evidence.is_empty() || finding.category == "virustotal")
+    is_anti_analysis_finding(finding)
+        || (finding.kind != crate::models::scan::FindingKind::Heuristic
+            && (!finding.evidence.is_empty() || finding.category == "virustotal"))
+}
+
+/// A configured anti-analysis marker requires review even when flow analysis
+/// cannot recover source-level evidence. It never proves malicious behaviour.
+fn is_anti_analysis_finding(finding: &Finding) -> bool {
+    matches!(
+        finding.rule_id.as_str(),
+        "VMWARE_CHECK" | "SANDBOXIE_CHECK" | "ANTIVIRUS_PROCESS_CHECK"
+    )
 }
 
 /// Reports how much archive content reached the bounded static analyzers.
@@ -3208,6 +3219,11 @@ fn finding_score_weight(finding: &Finding) -> u8 {
     match finding.rule_id.as_str() {
         "TIMESTAMP_OUTLIER" => Severity::Low.score_weight(),
         "RAW_GITHUB_URL" | "MODS_SELF_COPY" => 0,
+        // Anti-analysis checks have little legitimate value in a client mod and
+        // make a clean verdict misleading even when flow analysis is inconclusive.
+        // Keep the contribution below the malicious threshold: this prompts a
+        // manual review rather than asserting malicious behaviour.
+        "VMWARE_CHECK" | "SANDBOXIE_CHECK" | "ANTIVIRUS_PROCESS_CHECK" => 6,
         _ => finding.score_contribution,
     }
 }
@@ -3269,8 +3285,8 @@ mod tests {
     };
 
     use crate::models::scan::{
-        AnalysisCoverage, CodeScope, Confidence, Evidence, Finding, Limitation, Obfuscation,
-        ObfuscationLevel, Severity, Verdict,
+        AnalysisCoverage, CodeScope, Confidence, Evidence, Finding, FindingKind, Limitation,
+        Obfuscation, ObfuscationLevel, Severity, Verdict,
     };
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
@@ -3313,6 +3329,31 @@ mod tests {
         ];
 
         assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
+    }
+
+    /// Anti-analysis checks must never be presented as a clean result solely
+    /// because data-flow recovery could not connect them to a terminal action.
+    #[test]
+    fn anti_analysis_heuristic_requires_suspicious_verdict() {
+        let findings = vec![Finding {
+            rule_id: "VMWARE_CHECK".to_owned(),
+            category: "evasion".to_owned(),
+            kind: FindingKind::Heuristic,
+            severity: Severity::High,
+            confidence: Confidence::Low,
+            score_contribution: 0,
+            scope: CodeScope::Unknown,
+            message: "vmware".to_owned(),
+            evidence: Vec::new(),
+            related_chain_id: None,
+        }];
+
+        let score = risk_score(&findings, &[], &Obfuscation::default());
+        assert_eq!(score, 6);
+        assert_eq!(
+            verdict_from_evidence(&findings, &[], &Obfuscation::default(), score),
+            Verdict::Suspicious
+        );
     }
 
     #[test]
