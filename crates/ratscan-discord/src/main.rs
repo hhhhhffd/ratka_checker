@@ -17,7 +17,7 @@ use serenity::{
         ComponentInteraction, ComponentInteractionDataKind, Context, CreateCommand,
         CreateCommandOption, CreateEmbed, CreateInteractionResponse,
         CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EventHandler,
-        GatewayIntents, Interaction, Message, MessageId, Ready,
+        GatewayIntents, Interaction, Message, MessageId, MessageReference, MessageType, Ready,
     },
     async_trait, Client,
 };
@@ -88,6 +88,7 @@ struct Handler {
     api: ScanApiClient,
     limiter: Arc<Mutex<RateLimiter>>,
     jobs: JobQueue,
+    thread_notice_ids: Arc<Mutex<HashSet<u64>>>,
 }
 
 struct ScanDeliveryContext<'a> {
@@ -125,6 +126,9 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, message: Message) {
+        if self.delete_created_thread_notice(&ctx, &message).await {
+            return;
+        }
         let Some(guild_id) = message.guild_id.map(|id| id.get()) else {
             return;
         };
@@ -157,6 +161,21 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    async fn delete_created_thread_notice(&self, ctx: &Context, message: &Message) -> bool {
+        let Some(thread_id) =
+            created_thread_notice_thread_id(message.kind, message.message_reference.as_ref())
+        else {
+            return false;
+        };
+        if !self.thread_notice_ids.lock().await.remove(&thread_id) {
+            return false;
+        }
+        if let Err(error) = message.delete(&ctx.http).await {
+            warn!(%error, message_id = message.id.get(), thread_id, "failed to delete created-thread notice");
+        }
+        true
+    }
+
     async fn handle_command(&self, ctx: &Context, command: serenity::all::CommandInteraction) {
         if !self.owners.contains(&command.user.id.get()) {
             let _ = ephemeral_command(
@@ -399,6 +418,11 @@ impl Handler {
                 std::time::Instant::now(),
             )
             .map_err(|_| StartScanError::RateLimited)?;
+        let expected_thread_id = message.id.get();
+        self.thread_notice_ids
+            .lock()
+            .await
+            .insert(expected_thread_id);
         let thread = match message
             .channel_id
             .create_thread_from_message(
@@ -410,10 +434,25 @@ impl Handler {
         {
             Ok(thread) => thread,
             Err(error) => {
+                self.thread_notice_ids
+                    .lock()
+                    .await
+                    .remove(&expected_thread_id);
                 self.limiter.lock().await.complete_batch(jobs.len());
                 return Err(StartScanError::Discord(error));
             }
         };
+        let thread_id = thread.id.get();
+        if thread_id != expected_thread_id {
+            let mut thread_notice_ids = self.thread_notice_ids.lock().await;
+            thread_notice_ids.remove(&expected_thread_id);
+            thread_notice_ids.insert(thread_id);
+        }
+        let thread_notice_ids = Arc::clone(&self.thread_notice_ids);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            thread_notice_ids.lock().await.remove(&thread_id);
+        });
         if let Err(error) = thread
             .id
             .edit_thread(&ctx.http, serenity::all::EditThread::new().locked(true))
@@ -981,6 +1020,15 @@ async fn register_ratka_command(ctx: &Context) -> serenity::Result<()> {
     }
 }
 
+fn created_thread_notice_thread_id(
+    kind: MessageType,
+    message_reference: Option<&MessageReference>,
+) -> Option<u64> {
+    (kind == MessageType::ThreadCreated)
+        .then(|| message_reference.map(|reference| reference.channel_id.get()))
+        .flatten()
+}
+
 fn rata_command() -> CreateCommand {
     CreateCommand::new("ratka_checker")
         .description("Управление Ratka Checker")
@@ -1062,6 +1110,7 @@ async fn main() -> anyhow::Result<()> {
         api: ScanApiClient::new(config.api.clone())?,
         limiter: Arc::new(Mutex::new(limiter)),
         jobs: JobQueue::new(config.api.max_concurrent_scans),
+        thread_notice_ids: Arc::new(Mutex::new(HashSet::new())),
     };
     let intents =
         GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
@@ -1103,6 +1152,19 @@ mod tests {
         assert_eq!(
             (parsed.guild_id, parsed.channel_id, parsed.message_id),
             (Some(1), Some(2), 3)
+        );
+    }
+
+    #[test]
+    fn created_thread_notice_uses_referenced_thread_id() {
+        let reference = MessageReference::new(Default::default(), ChannelId::new(456));
+        assert_eq!(
+            created_thread_notice_thread_id(MessageType::ThreadCreated, Some(&reference)),
+            Some(456)
+        );
+        assert_eq!(
+            created_thread_notice_thread_id(MessageType::Regular, Some(&reference)),
+            None
         );
     }
 
