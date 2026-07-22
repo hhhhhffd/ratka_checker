@@ -1730,13 +1730,13 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             continue;
         }
 
-        if is_http_response(owner, &call.name) {
+        if let Some(kind) = remote_response_kind(owner, &call.name) {
             if let Some(output) = output {
                 events.push((
                     call.offset,
                     Operation::Source {
                         output,
-                        kind: SourceKind::HttpResponse,
+                        kind,
                         evidence,
                     },
                 ));
@@ -2166,8 +2166,13 @@ fn flow_evidence(
     }
 }
 
-fn is_http_response(owner: &str, name: &str) -> bool {
-    owner.contains("HttpClient") && matches!(name, "send" | "execute" | "get")
+fn remote_response_kind(owner: &str, name: &str) -> Option<SourceKind> {
+    if owner.contains("HttpClient") && matches!(name, "send" | "execute" | "get") {
+        return Some(SourceKind::HttpResponse);
+    }
+    ((owner.contains("WebSocket") || owner.contains("Websocket"))
+        && matches!(name, "receive" | "readMessage" | "sendAndWaitForResponse"))
+    .then_some(SourceKind::SocketInput)
 }
 
 fn is_file_read(owner: &str, name: &str) -> bool {

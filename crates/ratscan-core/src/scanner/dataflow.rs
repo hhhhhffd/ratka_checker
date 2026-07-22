@@ -238,7 +238,7 @@ pub struct DataFlowConfig {
 impl Default for DataFlowConfig {
     fn default() -> Self {
         Self {
-            max_interprocedural_depth: 2,
+            max_interprocedural_depth: 4,
         }
     }
 }
@@ -519,7 +519,7 @@ impl<'a> Analyzer<'a> {
                         self.result.resolved_value_targets.saturating_add(1);
                     if let Some(writes) = state.written_files.get(target).cloned() {
                         for write in writes {
-                            if write.taint.source_kind == SourceKind::HttpResponse {
+                            if is_remote_payload_source(write.taint.source_kind) {
                                 self.emit(
                                     ConfirmedChainKind::DownloadWriteExecute,
                                     &write.taint,
@@ -577,7 +577,7 @@ impl<'a> Analyzer<'a> {
                                 &taint,
                                 vec![evidence.clone()],
                             );
-                        } else if taint.source_kind == SourceKind::HttpResponse {
+                        } else if is_remote_payload_source(taint.source_kind) {
                             self.emit(
                                 ConfirmedChainKind::RemoteDynamicLoad,
                                 &taint,
@@ -588,7 +588,7 @@ impl<'a> Analyzer<'a> {
                 }
                 Operation::IntegrityVerify { input, evidence } => {
                     for taint in values(&locals, *input) {
-                        if taint.source_kind == SourceKind::HttpResponse {
+                        if is_remote_payload_source(taint.source_kind) {
                             state.verified_values.push(VerifiedValue {
                                 source: taint.source,
                                 evidence: evidence.clone(),
@@ -610,7 +610,7 @@ impl<'a> Analyzer<'a> {
                             });
                         continue;
                     }
-                    if !self.methods.contains_key(callee) {
+                    let Some(resolved_callee) = self.resolve_callee(callee) else {
                         self.result.unresolved_calls =
                             self.result.unresolved_calls.saturating_add(1);
                         self.result.limitations.push(FlowLimitation::MissingMethod {
@@ -618,14 +618,19 @@ impl<'a> Analyzer<'a> {
                             callee: callee.clone(),
                         });
                         continue;
-                    }
+                    };
                     self.result.resolved_calls = self.result.resolved_calls.saturating_add(1);
                     let call_arguments = arguments
                         .iter()
                         .map(|local| values(&locals, *local))
                         .collect();
-                    let call_result =
-                        self.execute(callee, call_arguments, depth + 1, call_stack, state);
+                    let call_result = self.execute(
+                        &resolved_callee,
+                        call_arguments,
+                        depth + 1,
+                        call_stack,
+                        state,
+                    );
                     if let Some(output) = return_to {
                         locals.insert(*output, call_result.return_values);
                     }
@@ -642,6 +647,29 @@ impl<'a> Analyzer<'a> {
         FrameResult {
             return_values: returned,
         }
+    }
+
+    /// Resolves an interface/virtual call only when there is one unambiguous
+    /// first-party implementation in the same archive layer. Falling back to a
+    /// name match with multiple candidates would create false taint chains.
+    fn resolve_callee(&self, callee: &MethodId) -> Option<MethodId> {
+        if self.methods.contains_key(callee) {
+            return Some(callee.clone());
+        }
+        let candidates = self
+            .methods
+            .iter()
+            .filter(|(candidate, method)| {
+                candidate.archive_id == callee.archive_id
+                    && candidate.method_name == callee.method_name
+                    && candidate.descriptor == callee.descriptor
+                    && method.scope != CodeScope::BundledDependency
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect::<Vec<_>>();
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
     }
 
     fn emit(&mut self, kind: ConfirmedChainKind, taint: &Taint, operations: Vec<FlowEvidence>) {
@@ -669,6 +697,10 @@ impl<'a> Analyzer<'a> {
             operations,
         });
     }
+}
+
+fn is_remote_payload_source(kind: SourceKind) -> bool {
+    matches!(kind, SourceKind::HttpResponse | SourceKind::SocketInput)
 }
 
 fn values(locals: &HashMap<LocalId, Vec<Taint>>, local: LocalId) -> Vec<Taint> {
@@ -725,6 +757,67 @@ mod tests {
         };
 
         let result = analyze_method_flows(&[flow], &DataFlowConfig::default());
+        assert_eq!(result.confirmed_chains.len(), 1);
+        assert_eq!(
+            result.confirmed_chains[0].kind,
+            ConfirmedChainKind::DownloadWriteExecute
+        );
+    }
+
+    #[test]
+    fn resolves_a_unique_first_party_interface_implementation() {
+        let root_id = method("run", Vec::new()).id;
+        let interface_method = MethodId {
+            class_name: "example/Transport".into(),
+            method_name: "receive".into(),
+            descriptor: "()[B".into(),
+            ..root_id.clone()
+        };
+        let implementation_id = MethodId {
+            class_name: "example/SocketTransport".into(),
+            ..interface_method.clone()
+        };
+        let root = MethodFlow {
+            id: root_id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Call {
+                    callee: interface_method,
+                    arguments: Vec::new(),
+                    return_to: Some(0),
+                    evidence: evidence(&root_id, 1, "transport.receive"),
+                },
+                Operation::WriteFile {
+                    input: 0,
+                    destination: FileTarget::Known("/tmp/payload.jar".into()),
+                    evidence: evidence(&root_id, 2, "file_write"),
+                },
+                Operation::ExecuteFile {
+                    target: FileTarget::Known("/tmp/payload.jar".into()),
+                    evidence: evidence(&root_id, 3, "java_launch"),
+                },
+            ],
+        };
+        let implementation = MethodFlow {
+            id: implementation_id.clone(),
+            parameter_count: 0,
+            parameter_slots: Vec::new(),
+            scope: CodeScope::FirstParty,
+            operations: vec![
+                Operation::Source {
+                    output: 0,
+                    kind: SourceKind::SocketInput,
+                    evidence: evidence(&implementation_id, 4, "socket_receive"),
+                },
+                Operation::Return { value: Some(0) },
+            ],
+        };
+
+        let result = analyze_method_flows(&[root, implementation], &DataFlowConfig::default());
+
+        assert_eq!(result.resolved_calls, 1);
         assert_eq!(result.confirmed_chains.len(), 1);
         assert_eq!(
             result.confirmed_chains[0].kind,
