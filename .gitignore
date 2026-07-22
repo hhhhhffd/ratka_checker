@@ -4,6 +4,7 @@
 /dist/
 /storage/*.jar
 /.env
+/deploy/releases/
 /.serena/
 *.bak-codegraph
 __pycache__/

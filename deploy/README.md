@@ -17,14 +17,16 @@ Run this from the repository root on your dev machine:
 bash deploy/scripts/build_ubuntu_bundle.sh
 ```
 
-The bundle script builds the Rust binary locally, copies `telegram_bot/`, and
-copies local `.env` to `deploy/app/.env` when it exists. `deploy/app/` is ignored
-by git because it can contain secrets.
+The bundle script creates an immutable release under
+`deploy/releases/ratscan-<UTC timestamp>-<git revision>/`, builds the Rust
+binaries locally, copies `telegram_bot/`, and copies local `.env` to
+`app/.env` with mode `0600` when it exists. The release directory is ignored by
+git because it can contain secrets.
 
-After that, copy the whole `deploy/` directory to the VPS:
+After that, copy one release directory to the VPS:
 
 ```sh
-scp -r deploy ubuntu@YOUR_SERVER_IP:/home/ubuntu/ratka-deploy
+scp -r deploy/releases/ratscan-<release> ubuntu@YOUR_SERVER_IP:/home/ubuntu/ratka-deploy
 ```
 
 ## 2. Install on Ubuntu
@@ -34,8 +36,16 @@ SSH into the VPS:
 ```sh
 ssh ubuntu@YOUR_SERVER_IP
 cd /home/ubuntu/ratka-deploy
+sudo bash scripts/clean_vds.sh
+sudo bash scripts/clean_vds.sh --apply
 sudo bash scripts/install_ubuntu.sh
 ```
+
+`clean_vds.sh` first prints its exact targets and changes nothing. With
+`--apply`, it removes only the legacy RatScan systemd units,
+`/etc/ratscan`, `/opt/ratscan`, `/var/www/ratscan`, and the `ratscan` and
+`ratka` PostgreSQL databases with their dedicated roles. PostgreSQL itself is
+retained because the new deployment uses it.
 
 The installer will:
 
@@ -95,7 +105,7 @@ Build the Linux release package locally again:
 
 ```sh
 bash deploy/scripts/build_ubuntu_bundle.sh
-scp -r deploy ubuntu@YOUR_SERVER_IP:/home/ubuntu/ratka-deploy
+scp -r deploy/releases/ratscan-<release> ubuntu@YOUR_SERVER_IP:/home/ubuntu/ratka-deploy
 ```
 
 Then on the VPS:
