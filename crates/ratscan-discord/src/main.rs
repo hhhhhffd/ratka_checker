@@ -13,7 +13,7 @@ use ratscan_discord::{
 use ratscan_storage::{DiscordGuildConfig, DiscordScanContext, DiscordStorage};
 use serenity::{
     all::{
-        ChannelId, ChannelType, Command, CommandDataOptionValue, CommandOptionType,
+        Channel, ChannelId, ChannelType, Command, CommandDataOptionValue, CommandOptionType,
         ComponentInteraction, ComponentInteractionDataKind, Context, CreateCommand,
         CreateCommandOption, CreateEmbed, CreateInteractionResponse,
         CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EventHandler,
@@ -271,11 +271,8 @@ impl Handler {
             return;
         }
         let channel_id = reference.channel_id.unwrap_or(command.channel_id.get());
-        let message = match ChannelId::new(channel_id)
-            .message(&ctx.http, MessageId::new(reference.message_id))
-            .await
-        {
-            Ok(message) if message.guild_id.is_some_and(|id| id.get() == guild_id) => message,
+        match ChannelId::new(channel_id).to_channel(&ctx.http).await {
+            Ok(Channel::Guild(channel)) if channel.guild_id.get() == guild_id => {}
             Ok(_) => {
                 let _ = command
                     .edit_response(
@@ -286,6 +283,24 @@ impl Handler {
                     .await;
                 return;
             }
+            Err(error) => {
+                warn!(%error, channel_id, "manual scan channel fetch failed");
+                let _ = command
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content(
+                            "Не удалось найти канал. Проверь ссылку и доступ бота к каналу.",
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let message = match ChannelId::new(channel_id)
+            .message(&ctx.http, MessageId::new(reference.message_id))
+            .await
+        {
+            Ok(message) => message,
             Err(error) => {
                 warn!(%error, "manual scan message fetch failed");
                 let _ = command
