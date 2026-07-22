@@ -99,10 +99,10 @@ async fn run_scan_worker(
         tokio::task::spawn_blocking(move || archive::scan_file(&scan_path, limits, &rules_engine))
             .await?;
     if let Some(report) = run_virustotal(scan_id, &storage_path, &filename, &state).await? {
-        outcome.summary = merge_virustotal_findings(
-            &mut outcome.report,
-            virustotal::findings_for_report(&report),
-        );
+        let findings = virustotal::findings_for_report(&report);
+        if !findings.is_empty() {
+            outcome.summary = merge_virustotal_findings(&mut outcome.report, findings);
+        }
     }
 
     db::complete_scan_report(&state.db, scan_id, &outcome.report, &outcome.summary).await
@@ -113,6 +113,7 @@ fn merge_virustotal_findings(
     report: &mut ScanReport,
     findings: impl IntoIterator<Item = Finding>,
 ) -> String {
+    let previous_verdict = report.verdict.clone();
     report.findings.extend(findings);
     let (verdict, risk_score, summary) = archive::finalize_report_with_analysis_limits(
         &report.findings,
@@ -120,9 +121,31 @@ fn merge_virustotal_findings(
         &report.obfuscation,
         &report.analysis_coverage,
     );
-    report.verdict = verdict;
+    report.verdict = stricter_verdict(previous_verdict, verdict);
     report.risk_score = risk_score;
     summary
+}
+
+/// A post-processing source such as VirusTotal may add evidence, but it must not
+/// erase a stricter verdict already established by static analysis.
+fn stricter_verdict(
+    previous: crate::models::scan::Verdict,
+    recalculated: crate::models::scan::Verdict,
+) -> crate::models::scan::Verdict {
+    if verdict_rank(&previous) >= verdict_rank(&recalculated) {
+        previous
+    } else {
+        recalculated
+    }
+}
+
+fn verdict_rank(verdict: &crate::models::scan::Verdict) -> u8 {
+    match verdict {
+        crate::models::scan::Verdict::Clean => 0,
+        crate::models::scan::Verdict::Unknown => 1,
+        crate::models::scan::Verdict::Suspicious => 2,
+        crate::models::scan::Verdict::Malicious => 3,
+    }
 }
 
 /// Runs the optional VirusTotal phase and persists its own report without failing static analysis.
@@ -257,5 +280,30 @@ mod tests {
         assert_eq!(report.risk_score, 70);
         assert_eq!(report.verdict, Verdict::Malicious);
         assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn virustotal_merge_does_not_downgrade_an_unknown_static_verdict() {
+        let mut report = ScanReport {
+            verdict: Verdict::Unknown,
+            risk_score: 0,
+            confidence: Confidence::Medium,
+            obfuscation_score: 25,
+            analysis_coverage: AnalysisCoverage {
+                method_flow_coverage: 0,
+                ..Default::default()
+            },
+            capabilities: Vec::new(),
+            decoded_strings: Vec::new(),
+            text_resources: Vec::new(),
+            findings: Vec::new(),
+            confirmed_chains: Vec::new(),
+            obfuscation: Obfuscation::default(),
+            limitations: Vec::new(),
+        };
+
+        merge_virustotal_findings(&mut report, Vec::new());
+
+        assert_eq!(report.verdict, Verdict::Unknown);
     }
 }
