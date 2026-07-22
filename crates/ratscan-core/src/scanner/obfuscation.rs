@@ -9,7 +9,7 @@ use crate::{
     models::scan::{CodeScope, Confidence, Obfuscation, ObfuscationLevel},
     scanner::{
         archive::{ClassScanData, ResourceScanData, ScanData},
-        class_file::{CallSite, ConstantValue, InvokeKind, MethodScanData},
+        class_file::{CallSite, ConstantValue, InvokeKind, MethodScanData, ValueOrigin},
     },
 };
 
@@ -19,6 +19,16 @@ const HIGH_ENTROPY_MILLI_BITS: u16 = 7_600;
 const HIGH_ENTROPY_MIN_BYTES: u64 = 256;
 const DISCORD_WEBHOOK_PREFIX: &[u8] = b"https://discord.com/api/webhooks/";
 const MAX_XOR_KEY_BYTES: usize = 32;
+
+/// Description of a statically verified `(String, int) -> String` decoder.
+/// Only literal call sites are decoded; archive code is never invoked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexedXorDecoder {
+    class_name: String,
+    method_name: String,
+    descriptor: String,
+    base_key: i32,
+}
 
 /// Non-persistent details from the bounded literal-decoding pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -227,8 +237,11 @@ fn is_confirmed_xor_decoder(method: &MethodScanData) -> bool {
 }
 
 fn decode_literals(data: &ScanData) -> Vec<DecodedValue> {
-    let mut decoded = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut decoded = decode_indexed_xor_calls(data);
+    let mut seen = decoded
+        .iter()
+        .map(|value| value.value.clone())
+        .collect::<BTreeSet<_>>();
     for class in data
         .class_files
         .iter()
@@ -246,6 +259,124 @@ fn decode_literals(data: &ScanData) -> Vec<DecodedValue> {
         }
     }
     decoded
+}
+
+/// Finds and evaluates a bounded indexed-XOR decoder at literal call sites.
+///
+/// The recognizer requires the complete bytecode shape used by this family:
+/// a char/byte array loop, XOR, per-index addition, byte masking, and String
+/// construction. This keeps arbitrary `(String, int)` helpers out of scope.
+fn decode_indexed_xor_calls(data: &ScanData) -> Vec<DecodedValue> {
+    let decoders = data
+        .class_files
+        .iter()
+        .filter(|class| is_analyzable_scope(&class.scope))
+        .flat_map(|class| class.methods.iter().filter_map(indexed_xor_decoder))
+        .collect::<Vec<_>>();
+    if decoders.is_empty() {
+        return Vec::new();
+    }
+
+    let mut values = Vec::new();
+    for class in data
+        .class_files
+        .iter()
+        .filter(|class| is_analyzable_scope(&class.scope))
+    {
+        for method in &class.methods {
+            for call in &method.calls {
+                let Some(decoder) = decoders.iter().find(|decoder| {
+                    call.owner.as_deref() == Some(decoder.class_name.as_str())
+                        && call.name == decoder.method_name
+                        && call.descriptor == decoder.descriptor
+                }) else {
+                    continue;
+                };
+                let Some((value, key)) = literal_string_and_integer_arguments(call) else {
+                    continue;
+                };
+                let Some(decoded) = decode_indexed_xor(value, key, decoder.base_key) else {
+                    continue;
+                };
+                if let Some(decoded) = decoded_value(
+                    class,
+                    method,
+                    call.offset,
+                    "indexed-xor-string",
+                    value,
+                    decoded,
+                    Confidence::High,
+                ) {
+                    values.push(decoded);
+                }
+            }
+        }
+    }
+
+    values.sort_by_key(|value| !is_security_relevant(&value.value));
+    let mut seen = BTreeSet::new();
+    values.retain(|value| seen.insert(value.value.clone()));
+    values.truncate(MAX_DECODED_VALUES);
+    values
+}
+
+fn indexed_xor_decoder(method: &MethodScanData) -> Option<IndexedXorDecoder> {
+    if method.descriptor != "(Ljava/lang/String;I)Ljava/lang/String;"
+        || !is_confirmed_xor_decoder(method)
+        || !method
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 0x60)
+        || !method
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode == 0x7e)
+    {
+        return None;
+    }
+    let base_keys = method
+        .constants
+        .iter()
+        .filter_map(|constant| match constant.value {
+            ConstantValue::Integer(value) if (256..=u16::MAX as i32).contains(&value) => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if base_keys.len() != 1 {
+        return None;
+    }
+    let base_key = *base_keys.first()?;
+
+    Some(IndexedXorDecoder {
+        class_name: method.class_name.clone(),
+        method_name: method.method_name.clone(),
+        descriptor: method.descriptor.clone(),
+        base_key,
+    })
+}
+
+fn literal_string_and_integer_arguments(call: &CallSite) -> Option<(&str, i32)> {
+    let [ValueOrigin::Constant(ConstantValue::String(value)), ValueOrigin::Constant(ConstantValue::Integer(key))] =
+        call.argument_origins.as_slice()
+    else {
+        return None;
+    };
+    Some((value, *key))
+}
+
+fn decode_indexed_xor(value: &str, key: i32, base_key: i32) -> Option<String> {
+    if value.len() > MAX_DECODE_INPUT_BYTES {
+        return None;
+    }
+    let key = (key as u32) ^ (base_key as u32);
+    let decoded = value
+        .encode_utf16()
+        .enumerate()
+        .map(|(index, unit)| unit ^ ((key.wrapping_add(index as u32) & u32::from(u8::MAX)) as u16))
+        .collect::<Vec<_>>();
+    String::from_utf16(&decoded).ok()
 }
 
 /// Recovers Discord webhook URLs encrypted with a repeating XOR key after
@@ -729,6 +860,120 @@ mod tests {
     #[test]
     fn confirms_xor_decoder_only_with_array_loop_and_string_conversion() {
         assert!(is_confirmed_xor_decoder(&xor_decoder_method()));
+    }
+
+    #[test]
+    fn indexed_xor_decoder_recovers_literal_call_arguments_without_execution() {
+        const BASE_KEY: i32 = 20_051;
+        const CALL_KEY: i32 = 1_234_567;
+        let plain_text = "https://example.invalid/payload";
+        let encrypted = plain_text
+            .encode_utf16()
+            .enumerate()
+            .map(|(index, unit)| {
+                unit ^ ((((CALL_KEY as u32) ^ (BASE_KEY as u32)).wrapping_add(index as u32)
+                    & u32::from(u8::MAX)) as u16)
+            })
+            .collect::<Vec<_>>();
+        let encrypted = String::from_utf16(&encrypted).expect("valid encrypted UTF-16");
+        let decoder = MethodScanData {
+            class_name: "mod/Decoder".to_owned(),
+            method_name: "decode".to_owned(),
+            descriptor: "(Ljava/lang/String;I)Ljava/lang/String;".to_owned(),
+            instructions: vec![
+                Instruction {
+                    offset: 0,
+                    opcode: 0xbc,
+                    operands: vec![5],
+                },
+                Instruction {
+                    offset: 1,
+                    opcode: 0x60,
+                    operands: Vec::new(),
+                },
+                Instruction {
+                    offset: 2,
+                    opcode: 0x7e,
+                    operands: Vec::new(),
+                },
+                Instruction {
+                    offset: 3,
+                    opcode: 0x82,
+                    operands: Vec::new(),
+                },
+            ],
+            constants: vec![
+                LoadedConstant {
+                    offset: 4,
+                    value: ConstantValue::Integer(BASE_KEY),
+                },
+                LoadedConstant {
+                    offset: 5,
+                    value: ConstantValue::Integer(255),
+                },
+            ],
+            calls: vec![CallSite {
+                offset: 6,
+                kind: InvokeKind::Special,
+                owner: Some("java/lang/String".to_owned()),
+                name: "<init>".to_owned(),
+                descriptor: "([C)V".to_owned(),
+                receiver_origin: None,
+                argument_origins: Vec::new(),
+                result_origin: None,
+            }],
+            control_flow_edges: vec![ControlFlowEdge {
+                from_offset: 7,
+                to_offset: 0,
+                kind: ControlFlowEdgeKind::Branch,
+            }],
+            ..MethodScanData::default()
+        };
+        let caller = MethodScanData {
+            class_name: "mod/Loader".to_owned(),
+            method_name: "load".to_owned(),
+            calls: vec![CallSite {
+                offset: 8,
+                kind: InvokeKind::Static,
+                owner: Some("mod/Decoder".to_owned()),
+                name: "decode".to_owned(),
+                descriptor: "(Ljava/lang/String;I)Ljava/lang/String;".to_owned(),
+                receiver_origin: None,
+                argument_origins: vec![
+                    ValueOrigin::Constant(ConstantValue::String(encrypted)),
+                    ValueOrigin::Constant(ConstantValue::Integer(CALL_KEY)),
+                ],
+                result_origin: None,
+            }],
+            ..MethodScanData::default()
+        };
+        let mut data = ScanData {
+            class_files: vec![
+                ClassScanData {
+                    archive_id: "archive-0".to_owned(),
+                    class_name: Some("mod/Decoder".to_owned()),
+                    methods: vec![decoder],
+                    scope: CodeScope::FirstParty,
+                    ..ClassScanData::default()
+                },
+                ClassScanData {
+                    archive_id: "archive-0".to_owned(),
+                    class_name: Some("mod/Loader".to_owned()),
+                    methods: vec![caller],
+                    scope: CodeScope::FirstParty,
+                    ..ClassScanData::default()
+                },
+            ],
+            ..ScanData::default()
+        };
+
+        let analysis = enrich_and_analyze(&mut data);
+
+        assert!(analysis
+            .decoded_values
+            .iter()
+            .any(|value| { value.transform == "indexed-xor-string" && value.value == plain_text }));
+        assert!(data.first_party_strings.contains(&plain_text.to_owned()));
     }
 
     #[test]
