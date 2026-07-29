@@ -110,7 +110,7 @@ results, uploaded files, rules, the Telegram worker lifecycle, and the RatScan
 PostgreSQL schema.
 
 The Discord client is a separate project at [`../modhub.bot`](../modhub.bot).
-It has its own deployment and PostgreSQL database for Discord settings, and
-uses RatScan solely through `POST /v1/scans` and `GET /v1/scans/{id}`. The JSON
+Its Compose stack has a separate PostgreSQL database for Discord settings and
+uses RatScan solely through the published HTTP port `8080` (`MODHUB_API_BASE_URL`), never through RatScan PostgreSQL. The JSON
 response provides its complete scan contract: `scan_id`, `status`, `sha256`,
 `verdict`, and `risk_score`.
