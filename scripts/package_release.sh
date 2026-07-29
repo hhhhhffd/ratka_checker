@@ -27,10 +27,11 @@ docker run --rm \
     "$RUST_IMAGE" \
     cargo build --release
 
-rm -rf "$OUT_DIR/config"
+rm -rf "$OUT_DIR/config" "$OUT_DIR/telegram_bot"
 mkdir -p "$OUT_DIR"
 cp "$CARGO_TARGET_DIR/release/ratscan" "$OUT_DIR/ratscan"
 cp -R config "$OUT_DIR/config"
+cp -R telegram_bot "$OUT_DIR/telegram_bot"
 cp .env.example "$OUT_DIR/.env.example"
 chmod +x "$OUT_DIR/ratscan"
 
@@ -41,6 +42,7 @@ This directory is enough to run the API on a Linux host:
 
 - `ratscan` — release binary
 - `config/rules.yaml` — scan rules loaded at startup
+- `telegram_bot/` — internal Telegram worker
 - `.env.example` — environment template
 
 Runtime still needs PostgreSQL reachable through `DATABASE_URL`.
@@ -48,6 +50,8 @@ Runtime still needs PostgreSQL reachable through `DATABASE_URL`.
 ```sh
 cp .env.example .env
 mkdir -p storage
+python3 -m venv telegram-venv
+telegram-venv/bin/pip install -r telegram_bot/requirements.txt
 set -a
 . ./.env
 set +a

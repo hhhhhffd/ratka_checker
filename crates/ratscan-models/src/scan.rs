@@ -743,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_response_omits_summary() {
+    fn scan_response_exposes_the_standalone_bot_contract() {
         let response = ScanResponse {
             scan_id: Uuid::nil(),
             status: ScanStatus::Done,
@@ -766,6 +766,11 @@ mod tests {
         let value = serde_json::to_value(response).expect("response serializes");
 
         assert!(value.get("summary").is_none());
+        assert_eq!(value["scan_id"], Uuid::nil().to_string());
+        assert_eq!(value["status"], "done");
+        assert_eq!(value["sha256"], "abc");
+        assert_eq!(value["verdict"], "clean");
+        assert_eq!(value["risk_score"], 0);
     }
 
     #[test]

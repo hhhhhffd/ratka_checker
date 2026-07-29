@@ -1,12 +1,8 @@
-# RatScan Telegram Bot
+# RatScan Telegram worker
 
-Independent Telegram client for the RatScan HTTP API. The Rust API does not import
-or depend on this bot; run it only when Telegram access is needed.
-
-## Configuration
-
-Add these values to `.env` or export them before starting the bot. The bot
-loads `.env` automatically from the current working directory.
+This is an internal component of the RatScan service, not a standalone service.
+The Rust `ratscan` process starts and supervises it whenever both credentials
+are present:
 
 ```sh
 TG_BOT_TOKEN=
@@ -14,39 +10,22 @@ ALLOWED_TG_ID=
 RATSCAN_API_BASE_URL=http://127.0.0.1:8080
 ```
 
-Optional settings:
+A Telegram crash is retried without stopping the HTTP API. Stopping RatScan
+stops the worker too; no `ratscan-telegram-bot.service` exists.
+
+For local `cargo run`, prepare the relative virtual environment expected by the
+API process:
 
 ```sh
-TG_BOT_REQUEST_TIMEOUT_SECONDS=30
-TG_BOT_POLL_ATTEMPTS=24
-TG_BOT_POLL_INTERVAL_SECONDS=5
+python3 -m venv telegram-venv
+telegram-venv/bin/pip install -r telegram_bot/requirements.txt
+cargo run
 ```
 
-## Run
-
-```sh
-python -m venv .venv-tg
-. .venv-tg/bin/activate
-python -m telegram_bot.bot
-```
-
-## Run In Docker
-
-The compose service is behind the `telegram` profile, so the API can run without
-the bot.
-
-```sh
-docker compose --profile telegram up -d telegram-bot
-```
-
-Build only the bot image:
-
-```sh
-docker build -f telegram_bot/Dockerfile -t ratscan-telegram-bot .
-```
+The Docker image and Ubuntu installer create this environment automatically.
 
 ## Usage
 
 - Send a `.jar` document to start a scan.
-- Use `/id <scan_id>` to fetch the full public API report.
+- Use `/id <scan_id>` to fetch the full report.
 - Messages from Telegram users other than `ALLOWED_TG_ID` are ignored.

@@ -6,6 +6,7 @@ pub mod error;
 pub mod models;
 pub mod response;
 pub mod storage;
+pub mod telegram;
 pub mod virustotal;
 
 pub use ratscan_core::{rules, scanner};
@@ -27,7 +28,7 @@ pub async fn connect_database(config: &AppConfig) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
-/// Starts the API; Discord Gateway remains a distinct process.
+/// Starts the RatScan API service.
 pub async fn serve() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     let pool = connect_database(&config).await?;
@@ -44,5 +45,10 @@ pub async fn serve() -> anyhow::Result<()> {
 /// Runs the API process after logging setup.
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
-    serve().await
+    let telegram_worker = telegram::spawn_if_configured();
+    let result = serve().await;
+    if let Some(worker) = telegram_worker {
+        worker.abort();
+    }
+    result
 }

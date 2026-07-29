@@ -17,13 +17,12 @@ fi
 
 targets=(
     "/etc/systemd/system/ratscan.service"
-    "/etc/systemd/system/ratscan-discord.service"
     "/etc/systemd/system/ratscan-telegram-bot.service"
     "/etc/ratscan"
     "/opt/ratscan"
     "/var/www/ratscan"
 )
-services=(ratscan ratscan-discord ratscan-telegram-bot)
+services=(ratscan ratscan-telegram-bot)
 databases=(ratscan ratka)
 roles=(ratscan ratka_bot)
 
@@ -43,7 +42,6 @@ for service in "${services[@]}"; do
 done
 
 rm -f /etc/systemd/system/ratscan.service
-rm -f /etc/systemd/system/ratscan-discord.service
 rm -f /etc/systemd/system/ratscan-telegram-bot.service
 systemctl daemon-reload
 systemctl reset-failed "${services[@]}" || true

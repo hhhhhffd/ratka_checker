@@ -9,9 +9,11 @@ User=ratscan
 Group=ratscan
 WorkingDirectory=/opt/ratscan
 EnvironmentFile=/etc/ratscan/ratscan.env
+Environment=RATSCAN_TELEGRAM_PYTHON=/opt/ratscan/telegram-venv/bin/python
 ExecStart=/opt/ratscan/bin/ratscan
 Restart=on-failure
 RestartSec=5
+KillMode=control-group
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

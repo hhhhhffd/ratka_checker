@@ -39,6 +39,14 @@ set +a
 
 The API is open by default. Put nginx, a tunnel, or firewall rules in front of it if public access needs to be restricted.
 
+## Integrated Telegram worker
+
+The same `ratscan` process starts the Telegram worker when both `TG_BOT_TOKEN`
+and `ALLOWED_TG_ID` are set. It is supervised independently: a Telegram failure
+is retried without stopping the API. There is no `ratscan-telegram-bot.service`.
+For a host package, install the Python requirements in `telegram-venv/`; the
+Ubuntu installer and Docker image do this automatically.
+
 ## Upload
 
 ```sh
@@ -95,47 +103,14 @@ responses. Reports are cached by sha256 in PostgreSQL using
 `VIRUSTOTAL_CACHE_TTL_HOURS` to avoid repeated quota usage for the same jar.
 The `virustotal.behavior` field contains condensed VirusTotal sandbox artifacts
 when the behaviours relationship is available for the file.
-# RatScan
+# Service boundaries
 
-RatScan is a single Cargo workspace with separate service binaries:
+RatScan API and `telegram_bot/` are one deployable service. The API owns scan
+results, uploaded files, rules, the Telegram worker lifecycle, and the RatScan
+PostgreSQL schema.
 
-```text
-crates/
-├── ratscan-models   # shared serializable scanner/API models
-├── ratscan-core     # rules and static scanner
-├── ratscan-storage  # PostgreSQL access shared by service clients
-├── ratscan-api      # dedicated API binary
-└── ratscan-discord  # Discord Gateway binary
-```
-
-`ratscan-discord` uses the same PostgreSQL database and SQLx migration history
-as the API. It does not create tables at startup and never stores duplicated
-verdict, SHA-256, or risk-score values; `discord_scan_context.scan_id` references
-the API-owned `scans` row.
-
-## Discord configuration
-
-Set the following in `.env` (keep this file out of version control):
-
-```text
-DISCORD_TOKEN=
-OWNER_USER_IDS=123,456
-DATABASE_URL=postgres://ratscan:ratscan@postgres:5432/ratscan
-RATSCAN_API_BASE_URL=http://api:8080
-DISCORD_MAX_JAR_BYTES=52428800
-DISCORD_MAX_CONCURRENT_SCANS=2
-DISCORD_MAX_QUEUED_SCANS=20
-DISCORD_PER_USER_SCANS_PER_MINUTE=10
-DISCORD_PER_GUILD_SCANS_PER_MINUTE=30
-```
-
-Start all local services with `docker compose up --build`. The Discord service
-uses `/health` and requires `{"status":"ok"}` before reporting API health.
-
-To import settings from a previous `ds-bot` installation after the SQL
-migrations have run, use `DATABASE_URL=... scripts/migrate_discord_settings.sh`.
-The script imports only guild settings and never imports legacy scan history,
-because those rows cannot be safely mapped to UUID scans.
-
-See [the Discord parity checklist](docs/discord-parity-checklist.md) for the
-automated and staging verification matrix.
+The Discord client is a separate project at [`../modhub.bot`](../modhub.bot).
+It has its own deployment and PostgreSQL database for Discord settings, and
+uses RatScan solely through `POST /v1/scans` and `GET /v1/scans/{id}`. The JSON
+response provides its complete scan contract: `scan_id`, `status`, `sha256`,
+`verdict`, and `risk_score`.

@@ -11,7 +11,7 @@ APP_DIR="$RELEASE_DIR/app"
 
 cd "$REPO_DIR"
 
-cargo build --release --package ratscan-api --package ratscan-discord
+cargo build --release --package ratscan-api
 
 if [ -e "$RELEASE_DIR" ]; then
     echo "Release directory already exists: $RELEASE_DIR" >&2
@@ -21,19 +21,14 @@ fi
 install -d -m 0755 "$APP_DIR"
 install -d -m 0755 "$RELEASE_DIR/scripts" "$RELEASE_DIR/systemd" "$RELEASE_DIR/env"
 install -m 0755 target/release/ratscan "$APP_DIR/ratscan"
-install -m 0755 target/release/ratscan-discord "$APP_DIR/ratscan-discord"
-install -m 0755 scripts/migrate_discord_settings.sh "$APP_DIR/migrate_discord_settings.sh"
 cp -R config "$APP_DIR/config"
 cp -R telegram_bot "$APP_DIR/telegram_bot"
-rm -f "$APP_DIR/telegram_bot/Dockerfile"
 find "$APP_DIR/telegram_bot" -type d -name __pycache__ -prune -exec rm -rf {} +
 cp .env.example "$APP_DIR/.env.example"
 install -m 0755 "$DEPLOY_DIR/scripts/install_ubuntu.sh" "$RELEASE_DIR/scripts/install_ubuntu.sh"
 install -m 0755 "$DEPLOY_DIR/scripts/update_ubuntu.sh" "$RELEASE_DIR/scripts/update_ubuntu.sh"
 install -m 0755 "$DEPLOY_DIR/scripts/clean_vds.sh" "$RELEASE_DIR/scripts/clean_vds.sh"
 install -m 0644 "$DEPLOY_DIR/systemd/ratscan.service" "$RELEASE_DIR/systemd/ratscan.service"
-install -m 0644 "$DEPLOY_DIR/systemd/ratscan-discord.service" "$RELEASE_DIR/systemd/ratscan-discord.service"
-install -m 0644 "$DEPLOY_DIR/systemd/ratscan-telegram-bot.service" "$RELEASE_DIR/systemd/ratscan-telegram-bot.service"
 install -m 0644 "$DEPLOY_DIR/env/ratscan.env.example" "$RELEASE_DIR/env/ratscan.env.example"
 
 if [ -f .env ]; then
@@ -63,10 +58,8 @@ sudo bash scripts/install_ubuntu.sh
 The installer uses `app/`:
 
 - `ratscan` - release API binary;
-- `ratscan-discord` - release Discord gateway binary;
-- `migrate_discord_settings.sh` - optional legacy Discord settings import;
 - `config/rules.yaml` - scanner rules;
-- `telegram_bot/` - independent aiogram Telegram client;
+- `telegram_bot/` - Telegram worker launched by the RatScan API process;
 - `.env` - optional local secrets copied by `build_ubuntu_bundle.sh`.
 
 The installer creates PostgreSQL locally and writes the final runtime environment

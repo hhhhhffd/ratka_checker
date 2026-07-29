@@ -5,8 +5,7 @@
 RatScan is a Cargo workspace. The root `src/` hosts the primary API binary and
 shared API concerns. Workspace crates live in `crates/`: `ratscan-core` contains
 the static JAR scanner and rules engine, `ratscan-models` defines shared response
-types, `ratscan-storage` owns PostgreSQL access, and `ratscan-api` and
-`ratscan-discord` provide service binaries. SQLx migrations are in `migrations/`;
+types, root `src/storage` owns PostgreSQL access, and `ratscan-api` provides the API service binary. SQLx migrations are in `migrations/`;
 scanner configuration is in `config/rules.yaml`. Keep Rust unit tests beside the
 code they cover and use `tests/fixtures/` or `tests/compiled-fixtures/` for scan
 regressions. The optional Python Telegram client is in `telegram_bot/`.
@@ -17,10 +16,10 @@ regressions. The optional Python Telegram client is in `telegram_bot/`.
 - `cargo test --workspace` runs Rust unit and integration tests.
 - `cargo fmt --check` verifies Rust formatting; run `cargo fmt` to apply it.
 - `cargo clippy --workspace --all-targets -- -D warnings` catches lint issues.
-- `docker compose up --build` starts PostgreSQL, API, Discord bot, and local UI;
+- `docker compose up --build` starts PostgreSQL, the API with its optional Telegram worker, and local UI;
   create a local `.env` first. Do not commit it.
-- `python -m venv .venv-tg && . .venv-tg/bin/activate && pip install -r telegram_bot/requirements.txt`
-  prepares the optional Telegram client; start it with `python -m telegram_bot.bot`.
+- `python3 -m venv telegram-venv && telegram-venv/bin/pip install -r telegram_bot/requirements.txt`
+  prepares the optional Telegram worker for `cargo run`.
 
 ## Coding Style & Naming Conventions
 
