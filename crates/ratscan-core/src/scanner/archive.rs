@@ -16,7 +16,7 @@ use crate::{
     rules::engine::RulesEngine,
     scanner::{
         asset,
-        class_file::{self, ConstantValue, MethodScanData, ValueOrigin},
+        class_file::{self, CallSite, ConstantValue, MethodScanData, ValueOrigin},
         context_recognizers,
         dataflow::{
             analyze_method_flows_from_roots, dangerous_flow_roots, ConfirmedChainCandidate,
@@ -2868,7 +2868,8 @@ fn confirmed_embedded_native_downloader(data: &ScanData) -> Option<ConfirmedChai
 }
 
 /// Confirms hidden player telemetry only when a statically recovered, hard-coded
-/// webhook is used by a method that posts Minecraft client data.
+/// webhook is used to send Minecraft client data. The collection and network
+/// transport may be split between two first-party classes.
 fn confirmed_webhook_exfil(
     data: &ScanData,
     decoded_values: &[obfuscation::DecodedValue],
@@ -2881,36 +2882,62 @@ fn confirmed_webhook_exfil(
             && class_file.archive_id == webhook.archive_id
             && class_file.class_name.as_deref() == Some(webhook.class_name.as_str())
     })?;
-    let method = class_file.methods.iter().find(|method| {
-        method_posts_to_webhook(method) && method_reads_minecraft_client_data(method)
-    })?;
-    let post_call = method.calls.iter().find(|call| {
-        call.owner.as_deref() == Some("java/net/HttpURLConnection") && call.name == "setDoOutput"
-    })?;
-    let player_call = method.calls.iter().find(|call| {
-        call.owner
-            .as_deref()
-            .is_some_and(|owner| owner.starts_with("net/minecraft/"))
-    })?;
-    let method_id = MethodId {
+    let (transport_method, post_call) = class_file
+        .methods
+        .iter()
+        .find_map(|method| webhook_post_call(method).map(|call| (method, call)))?;
+    let (collector_class, collector_method, player_call, forwarding_call) = data
+        .class_files
+        .iter()
+        .filter(|candidate| {
+            candidate.scope == CodeScope::FirstParty && candidate.archive_id == webhook.archive_id
+        })
+        .find_map(|candidate| {
+            candidate.methods.iter().find_map(|method| {
+                let player_call = minecraft_client_call(method)?;
+                let forwarding_call = method
+                    .calls
+                    .iter()
+                    .find(|call| call.owner.as_deref() == Some(webhook.class_name.as_str()))?;
+                Some((candidate, method, player_call, forwarding_call))
+            })
+        })
+        .or_else(|| {
+            minecraft_client_call(transport_method)
+                .map(|player_call| (class_file, transport_method, player_call, post_call))
+        })?;
+    let transport_method_id = MethodId {
         archive_id: class_file.archive_id.clone(),
-        class_name: method.class_name.clone(),
-        method_name: method.method_name.clone(),
-        descriptor: method.descriptor.clone(),
+        class_name: transport_method.class_name.clone(),
+        method_name: transport_method.method_name.clone(),
+        descriptor: transport_method.descriptor.clone(),
     };
     let post_evidence = flow_evidence(
         class_file,
-        &method_id,
+        &transport_method_id,
         post_call.offset,
-        "java/net/HttpURLConnection",
-        "setDoOutput",
+        post_call.owner.as_deref()?,
+        &post_call.name,
     );
+    let collector_method_id = MethodId {
+        archive_id: collector_class.archive_id.clone(),
+        class_name: collector_method.class_name.clone(),
+        method_name: collector_method.method_name.clone(),
+        descriptor: collector_method.descriptor.clone(),
+    };
     let player_evidence = flow_evidence(
-        class_file,
-        &method_id,
+        collector_class,
+        &collector_method_id,
         player_call.offset,
         player_call.owner.as_deref()?,
         &player_call.name,
+    );
+    let forwarding_evidence = flow_evidence(
+        collector_class,
+        &collector_method_id,
+        forwarding_call.offset,
+        forwarding_call.owner.as_deref()?,
+        &forwarding_call.name,
     );
     let webhook_evidence = Evidence {
         archive_id: webhook.archive_id.clone(),
@@ -2938,17 +2965,19 @@ fn confirmed_webhook_exfil(
             webhook_evidence.operation.clone(),
             post_evidence.operation.clone(),
             player_evidence.operation.clone(),
+            forwarding_evidence.operation.clone(),
         ],
         evidence: vec![
             webhook_evidence,
             flow_evidence_to_evidence(post_evidence),
             flow_evidence_to_evidence(player_evidence),
+            flow_evidence_to_evidence(forwarding_evidence),
         ],
     })
 }
 
-fn method_posts_to_webhook(method: &MethodScanData) -> bool {
-    let has_output = method.calls.iter().any(|call| {
+fn webhook_post_call(method: &MethodScanData) -> Option<&CallSite> {
+    let legacy_post_call = method.calls.iter().find(|call| {
         call.owner.as_deref() == Some("java/net/HttpURLConnection") && call.name == "setDoOutput"
     });
     let has_body_stream = method.calls.iter().any(|call| {
@@ -2960,11 +2989,18 @@ fn method_posts_to_webhook(method: &MethodScanData) -> bool {
         .iter()
         .any(|call| call.owner.as_deref() == Some("java/io/OutputStream") && call.name == "write");
 
-    has_output && has_body_stream && has_body_write
+    if legacy_post_call.is_some() && has_body_stream && has_body_write {
+        return legacy_post_call;
+    }
+
+    method.calls.iter().find(|call| {
+        call.owner.as_deref() == Some("java/net/http/HttpClient")
+            && matches!(call.name.as_str(), "send" | "sendAsync")
+    })
 }
 
-fn method_reads_minecraft_client_data(method: &MethodScanData) -> bool {
-    method.calls.iter().any(|call| {
+fn minecraft_client_call(method: &MethodScanData) -> Option<&CallSite> {
+    method.calls.iter().find(|call| {
         call.owner
             .as_deref()
             .is_some_and(|owner| owner.starts_with("net/minecraft/"))
@@ -3709,6 +3745,56 @@ mod tests {
             .expect("confirmed webhook exfiltration");
 
         assert_eq!(chain.rule_id, super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID);
+        assert_eq!(
+            verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 80),
+            Verdict::Malicious
+        );
+    }
+
+    #[test]
+    fn confirms_http_client_webhook_exfiltration_across_first_party_classes() {
+        let transport = MethodScanData {
+            class_name: "mod/DiscordWebhook".to_owned(),
+            method_name: "sendScreenshot".to_owned(),
+            descriptor: "([B)V".to_owned(),
+            calls: vec![test_call("java/net/http/HttpClient", "sendAsync")],
+            ..MethodScanData::default()
+        };
+        let collector = MethodScanData {
+            class_name: "mod/ChatLogger".to_owned(),
+            method_name: "takeScreenshot".to_owned(),
+            descriptor: "()V".to_owned(),
+            calls: vec![
+                test_call("net/minecraft/client/MinecraftClient", "getInstance"),
+                test_call("mod/DiscordWebhook", "sendScreenshot"),
+            ],
+            ..MethodScanData::default()
+        };
+        let data = ScanData {
+            class_files: vec![
+                class_scan_data("mod/DiscordWebhook", vec![], vec![transport]),
+                class_scan_data("mod/ChatLogger", vec![], vec![collector]),
+            ],
+            ..Default::default()
+        };
+        let decoded_values = vec![DecodedValue {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
+            class_name: "mod/DiscordWebhook".to_owned(),
+            method_name: "<clinit>".to_owned(),
+            method_descriptor: "()V".to_owned(),
+            bytecode_offset: 12,
+            transform: "literal",
+            original_value: "webhook".to_owned(),
+            value: "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-".to_owned(),
+            confidence: Confidence::High,
+        }];
+
+        let chain = super::confirmed_webhook_exfil(&data, &decoded_values)
+            .expect("confirmed HttpClient webhook exfiltration");
+
+        assert_eq!(chain.rule_id, super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID);
+        assert_eq!(chain.evidence.len(), 4);
         assert_eq!(
             verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 80),
             Verdict::Malicious
