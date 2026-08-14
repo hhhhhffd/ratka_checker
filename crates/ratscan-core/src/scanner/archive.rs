@@ -2874,9 +2874,7 @@ fn confirmed_webhook_exfil(
     data: &ScanData,
     decoded_values: &[obfuscation::DecodedValue],
 ) -> Option<ConfirmedChain> {
-    let webhook = decoded_values
-        .iter()
-        .find(|value| obfuscation::is_webhook_url(&value.value))?;
+    let webhook = webhook_origin(data, decoded_values)?;
     let class_file = data.class_files.iter().find(|class_file| {
         class_file.scope == CodeScope::FirstParty
             && class_file.archive_id == webhook.archive_id
@@ -2947,7 +2945,7 @@ fn confirmed_webhook_exfil(
         method_descriptor: Some(webhook.method_descriptor.clone()),
         bytecode_offset: Some(webhook.bytecode_offset),
         resource_path: None,
-        operation: "decoded_webhook".to_owned(),
+        operation: webhook.operation.to_owned(),
         value_preview: Some("Webhook URL (redacted)".to_owned()),
         source_value: None,
         target_value: None,
@@ -2974,6 +2972,57 @@ fn confirmed_webhook_exfil(
             flow_evidence_to_evidence(forwarding_evidence),
         ],
     })
+}
+
+struct WebhookOrigin {
+    archive_id: String,
+    archive_path: String,
+    class_name: String,
+    method_name: String,
+    method_descriptor: String,
+    bytecode_offset: u32,
+    operation: &'static str,
+}
+
+fn webhook_origin(
+    data: &ScanData,
+    decoded_values: &[obfuscation::DecodedValue],
+) -> Option<WebhookOrigin> {
+    decoded_values
+        .iter()
+        .find(|value| obfuscation::is_webhook_url(&value.value))
+        .map(|value| WebhookOrigin {
+            archive_id: value.archive_id.clone(),
+            archive_path: value.archive_path.clone(),
+            class_name: value.class_name.clone(),
+            method_name: value.method_name.clone(),
+            method_descriptor: value.method_descriptor.clone(),
+            bytecode_offset: value.bytecode_offset,
+            operation: "decoded_webhook",
+        })
+        .or_else(|| {
+            data.class_files
+                .iter()
+                .filter(|class_file| class_file.scope == CodeScope::FirstParty)
+                .find_map(|class_file| {
+                    class_file.methods.iter().find_map(|method| {
+                        method.constants.iter().find_map(|constant| {
+                            let ConstantValue::String(value) = &constant.value else {
+                                return None;
+                            };
+                            obfuscation::is_webhook_url(value).then(|| WebhookOrigin {
+                                archive_id: class_file.archive_id.clone(),
+                                archive_path: class_file.archive_path.clone(),
+                                class_name: method.class_name.clone(),
+                                method_name: method.method_name.clone(),
+                                method_descriptor: method.descriptor.clone(),
+                                bytecode_offset: constant.offset,
+                                operation: "hard_coded_webhook",
+                            })
+                        })
+                    })
+                })
+        })
 }
 
 fn webhook_post_call(method: &MethodScanData) -> Option<&CallSite> {
@@ -3492,7 +3541,9 @@ mod tests {
     };
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
-        class_file::{CallSite, ConstantValue, InvokeKind, MethodScanData, ValueOrigin},
+        class_file::{
+            CallSite, ConstantValue, InvokeKind, LoadedConstant, MethodScanData, ValueOrigin,
+        },
         dataflow::FileTarget,
         obfuscation::DecodedValue,
     };
@@ -3753,6 +3804,18 @@ mod tests {
 
     #[test]
     fn confirms_http_client_webhook_exfiltration_across_first_party_classes() {
+        let webhook_literal = MethodScanData {
+            class_name: "mod/DiscordWebhook".to_owned(),
+            method_name: "<clinit>".to_owned(),
+            descriptor: "()V".to_owned(),
+            constants: vec![LoadedConstant {
+                offset: 12,
+                value: ConstantValue::String(
+                    "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-".to_owned(),
+                ),
+            }],
+            ..MethodScanData::default()
+        };
         let transport = MethodScanData {
             class_name: "mod/DiscordWebhook".to_owned(),
             method_name: "sendScreenshot".to_owned(),
@@ -3772,25 +3835,17 @@ mod tests {
         };
         let data = ScanData {
             class_files: vec![
-                class_scan_data("mod/DiscordWebhook", vec![], vec![transport]),
+                class_scan_data(
+                    "mod/DiscordWebhook",
+                    vec![],
+                    vec![webhook_literal, transport],
+                ),
                 class_scan_data("mod/ChatLogger", vec![], vec![collector]),
             ],
             ..Default::default()
         };
-        let decoded_values = vec![DecodedValue {
-            archive_id: "archive-0".to_owned(),
-            archive_path: "<root>".to_owned(),
-            class_name: "mod/DiscordWebhook".to_owned(),
-            method_name: "<clinit>".to_owned(),
-            method_descriptor: "()V".to_owned(),
-            bytecode_offset: 12,
-            transform: "literal",
-            original_value: "webhook".to_owned(),
-            value: "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-".to_owned(),
-            confidence: Confidence::High,
-        }];
 
-        let chain = super::confirmed_webhook_exfil(&data, &decoded_values)
+        let chain = super::confirmed_webhook_exfil(&data, &[])
             .expect("confirmed HttpClient webhook exfiltration");
 
         assert_eq!(chain.rule_id, super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID);
