@@ -268,6 +268,32 @@ mod tests {
             .any(|finding| finding.rule_id == "ANTIVIRUS_PROCESS_CHECK"));
     }
 
+    #[test]
+    fn vmware_rule_ignores_bundled_dependency_strings() {
+        let engine = RulesEngine::load_from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules.yaml"),
+        )
+        .expect("production rules load");
+
+        let dependency_data = ScanData {
+            strings: vec!["VMware ESX 3".into()],
+            ..Default::default()
+        };
+        assert!(!engine
+            .evaluate(&dependency_data)
+            .iter()
+            .any(|finding| finding.rule_id == "VMWARE_CHECK"));
+
+        let first_party_data = ScanData {
+            first_party_strings: vec!["checks vmware before startup".into()],
+            ..Default::default()
+        };
+        assert!(engine
+            .evaluate(&first_party_data)
+            .iter()
+            .any(|finding| finding.rule_id == "VMWARE_CHECK"));
+    }
+
     /// Verifies that the default production rules file remains loadable.
     #[test]
     fn default_rules_file_loads() {

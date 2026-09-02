@@ -391,8 +391,8 @@
 - rule_id: VMWARE_CHECK
   category: evasion
   severity: high
-  match_type: string_contains
-  pattern: "vmware"
+  match_type: regex
+  pattern: "\\bvmware\\b"
   message: "Обнаружена проверка VMware"
 - rule_id: SANDBOXIE_CHECK
   category: evasion

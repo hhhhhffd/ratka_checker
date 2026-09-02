@@ -2893,23 +2893,34 @@ fn confirmed_embedded_native_downloader(data: &ScanData) -> Option<ConfirmedChai
     })
 }
 
-/// Confirms hidden player telemetry only when a statically recovered, hard-coded
-/// webhook is used to send Minecraft client data. The collection and network
-/// transport may be split between two first-party classes.
+/// Confirms hidden player telemetry only when a statically recovered webhook is
+/// used to send Minecraft client data. The config, collection, and network
+/// transport may be split between first-party classes.
 fn confirmed_webhook_exfil(
     data: &ScanData,
     decoded_values: &[obfuscation::DecodedValue],
 ) -> Option<ConfirmedChain> {
     let webhook = webhook_origin(data, decoded_values)?;
-    let class_file = data.class_files.iter().find(|class_file| {
-        class_file.scope == CodeScope::FirstParty
-            && class_file.archive_id == webhook.archive_id
-            && class_file.class_name.as_deref() == Some(webhook.class_name.as_str())
-    })?;
-    let (transport_method, post_call) = class_file
-        .methods
+    let (transport_class, transport_method, post_call) = data
+        .class_files
         .iter()
-        .find_map(|method| webhook_post_call(method).map(|call| (method, call)))?;
+        .filter(|class_file| {
+            class_file.scope == CodeScope::FirstParty && class_file.archive_id == webhook.archive_id
+        })
+        .find_map(|class_file| {
+            class_file.methods.iter().find_map(|method| {
+                let uses_webhook_config = class_file.class_name.as_deref()
+                    == Some(webhook.class_name.as_str())
+                    || method
+                        .field_reads
+                        .iter()
+                        .any(|field| field.owner == webhook.class_name);
+                uses_webhook_config
+                    .then(|| webhook_post_call(method).map(|call| (class_file, method, call)))
+                    .flatten()
+            })
+        })?;
+    let transport_class_name = transport_class.class_name.as_deref()?;
     let (collector_class, collector_method, player_call, forwarding_call) = data
         .class_files
         .iter()
@@ -2922,22 +2933,22 @@ fn confirmed_webhook_exfil(
                 let forwarding_call = method
                     .calls
                     .iter()
-                    .find(|call| call.owner.as_deref() == Some(webhook.class_name.as_str()))?;
+                    .find(|call| call.owner.as_deref() == Some(transport_class_name))?;
                 Some((candidate, method, player_call, forwarding_call))
             })
         })
         .or_else(|| {
             minecraft_client_call(transport_method)
-                .map(|player_call| (class_file, transport_method, player_call, post_call))
+                .map(|player_call| (transport_class, transport_method, player_call, post_call))
         })?;
     let transport_method_id = MethodId {
-        archive_id: class_file.archive_id.clone(),
+        archive_id: transport_class.archive_id.clone(),
         class_name: transport_method.class_name.clone(),
         method_name: transport_method.method_name.clone(),
         descriptor: transport_method.descriptor.clone(),
     };
     let post_evidence = flow_evidence(
-        class_file,
+        transport_class,
         &transport_method_id,
         post_call.offset,
         post_call.owner.as_deref()?,
@@ -2980,7 +2991,7 @@ fn confirmed_webhook_exfil(
     };
 
     Some(ConfirmedChain {
-        chain_id: format!("webhook-exfil-{}", class_file.archive_id),
+        chain_id: format!("webhook-exfil-{}", transport_class.archive_id),
         rule_id: CONFIRMED_WEBHOOK_EXFIL_RULE_ID.to_owned(),
         severity: Severity::Critical,
         confidence: Confidence::High,
@@ -3858,6 +3869,68 @@ mod tests {
 
         let chain = super::confirmed_webhook_exfil(&data, &[])
             .expect("confirmed HttpClient webhook exfiltration");
+
+        assert_eq!(chain.rule_id, super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID);
+        assert_eq!(chain.evidence.len(), 4);
+        assert_eq!(
+            verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 80),
+            Verdict::Malicious
+        );
+    }
+
+    #[test]
+    fn confirms_webhook_config_separate_from_transport_class() {
+        let transport = MethodScanData {
+            class_name: "mod/DiscordWebhook".to_owned(),
+            method_name: "send".to_owned(),
+            descriptor: "(Ljava/lang/String;)V".to_owned(),
+            calls: vec![
+                test_call("java/net/HttpURLConnection", "setDoOutput"),
+                test_call("java/net/HttpURLConnection", "getOutputStream"),
+                test_call("java/io/OutputStream", "write"),
+            ],
+            field_reads: vec![crate::scanner::class_file::FieldAccess {
+                offset: 2,
+                owner: "mod/Config".to_owned(),
+                name: "webhookUrl".to_owned(),
+                descriptor: "Ljava/lang/String;".to_owned(),
+                value_origin: None,
+            }],
+            ..MethodScanData::default()
+        };
+        let collector = MethodScanData {
+            class_name: "mod/ChatLogger".to_owned(),
+            method_name: "logMessage".to_owned(),
+            descriptor: "(Ljava/lang/String;)V".to_owned(),
+            calls: vec![
+                test_call("net/minecraft/client/MinecraftClient", "getInstance"),
+                test_call("mod/DiscordWebhook", "send"),
+            ],
+            ..MethodScanData::default()
+        };
+        let data = ScanData {
+            class_files: vec![
+                class_scan_data("mod/Config", vec![], vec![]),
+                class_scan_data("mod/DiscordWebhook", vec![], vec![transport]),
+                class_scan_data("mod/ChatLogger", vec![], vec![collector]),
+            ],
+            ..ScanData::default()
+        };
+        let decoded_values = vec![DecodedValue {
+            archive_id: "archive-0".to_owned(),
+            archive_path: "<root>".to_owned(),
+            class_name: "mod/Config".to_owned(),
+            method_name: "<init>".to_owned(),
+            method_descriptor: "()V".to_owned(),
+            bytecode_offset: 40,
+            transform: "base64-xor-known-webhook",
+            original_value: "encrypted".to_owned(),
+            value: "https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyz0123456789_-".to_owned(),
+            confidence: Confidence::High,
+        }];
+
+        let chain = super::confirmed_webhook_exfil(&data, &decoded_values)
+            .expect("confirmed webhook exfiltration with separate config");
 
         assert_eq!(chain.rule_id, super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID);
         assert_eq!(chain.evidence.len(), 4);
