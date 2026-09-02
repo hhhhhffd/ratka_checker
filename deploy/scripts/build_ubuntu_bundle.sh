@@ -32,8 +32,12 @@ install -m 0644 "$DEPLOY_DIR/systemd/ratscan.service" "$RELEASE_DIR/systemd/rats
 install -m 0644 "$DEPLOY_DIR/env/ratscan.env.example" "$RELEASE_DIR/env/ratscan.env.example"
 
 if [ -f .env ]; then
-    install -m 0600 .env "$APP_DIR/.env"
-    echo "Copied local .env to $APP_DIR/.env"
+    # Keep unrelated local integrations (for example Discord) out of the VDS bundle.
+    awk -F= '
+        $1 ~ /^[[:space:]]*(RUST_LOG|DATABASE_URL|RATSCAN_BIND_ADDR|RATSCAN_RULES_PATH|RATSCAN_STORAGE_DIR|MAX_TOTAL_UNCOMPRESSED_MB|MAX_FILES_IN_ARCHIVE|MAX_NESTING_DEPTH|MAX_SINGLE_FILE_MB|FILE_RETENTION_DAYS|FILE_CLEANUP_INTERVAL_MINUTES|VIRUSTOTAL_ENABLED|VIRUSTOTAL_API_KEY|VIRUSTOTAL_TIMEOUT_SECONDS|VIRUSTOTAL_CACHE_TTL_HOURS|VIRUSTOTAL_POLL_ATTEMPTS|VIRUSTOTAL_POLL_INTERVAL_SECONDS|TG_BOT_TOKEN|ALLOWED_TG_ID|TG_BOT_REQUEST_TIMEOUT_SECONDS|TG_BOT_POLL_ATTEMPTS|TG_BOT_POLL_INTERVAL_SECONDS|RATSCAN_API_BASE_URL)[[:space:]]*$/ { print }
+    ' .env > "$APP_DIR/.env"
+    chmod 0600 "$APP_DIR/.env"
+    echo "Copied RatScan runtime settings from local .env to $APP_DIR/.env"
 else
     echo "Local .env was not found; $APP_DIR/.env was not created." >&2
 fi
@@ -60,7 +64,7 @@ The installer uses `app/`:
 - `ratscan` - release API binary;
 - `config/rules.yaml` - scanner rules;
 - `telegram_bot/` - Telegram worker launched by the RatScan API process;
-- `.env` - optional local secrets copied by `build_ubuntu_bundle.sh`.
+- `.env` - optional RatScan runtime settings copied from the local `.env` by `build_ubuntu_bundle.sh`.
 
 The installer creates PostgreSQL locally and writes the final runtime environment
 to `/etc/ratscan/ratscan.env`.
