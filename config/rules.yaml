@@ -346,12 +346,6 @@
   match_type: string_contains
   pattern: "schtasks"
   message: "Обнаружено создание задачи планировщика"
-- rule_id: MODS_SELF_COPY
-  category: persistence
-  severity: low
-  match_type: string_contains
-  pattern: "mods/"
-  message: "Найдена строка mods/; само по себе не доказывает self-copy"
 - rule_id: XMRIG
   category: mining
   severity: critical
@@ -410,7 +404,7 @@
   category: evasion
   severity: medium
   match_type: regex
-  pattern: "(avast|avg|kaspersky|defender|msmpeng|wireshark|processhacker)"
+  pattern: "\\b(?:avast|kaspersky|defender|msmpeng|wireshark|processhacker)(?:\\.exe)?\\b|\\bavg(?:nt|svc|ui|wdsvc|idsagent)(?:\\.exe)?\\b"
   message: "Обнаружен поиск процессов анализа или антивирусов"
 - rule_id: LONG_SLEEP
   category: evasion

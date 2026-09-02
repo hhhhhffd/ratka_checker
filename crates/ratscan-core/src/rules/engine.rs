@@ -227,6 +227,47 @@ mod tests {
         assert_eq!(engine.evaluate(&data).len(), 1);
     }
 
+    #[test]
+    fn common_namespace_and_metric_strings_do_not_trigger_security_rules() {
+        let engine = RulesEngine::load_from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules.yaml"),
+        )
+        .expect("production rules load");
+        let data = ScanData {
+            first_party_strings: vec![
+                "visit(Lnet/caffeinemc/mods/sodium/client/render/chunk/RenderSection;)V".into(),
+                "VeloTune metrics: avg={} ms, pressure={}, {}".into(),
+            ],
+            ..Default::default()
+        };
+
+        let findings = engine.evaluate(&data);
+
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == "MODS_SELF_COPY"));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.rule_id == "ANTIVIRUS_PROCESS_CHECK"));
+    }
+
+    #[test]
+    fn antivirus_process_names_remain_detectable_without_bare_avg() {
+        let engine = RulesEngine::load_from_file(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/rules.yaml"),
+        )
+        .expect("production rules load");
+        let data = ScanData {
+            first_party_strings: vec!["msmpeng.exe".into(), "avgnt.exe".into()],
+            ..Default::default()
+        };
+
+        assert!(engine
+            .evaluate(&data)
+            .iter()
+            .any(|finding| finding.rule_id == "ANTIVIRUS_PROCESS_CHECK"));
+    }
+
     /// Verifies that the default production rules file remains loadable.
     #[test]
     fn default_rules_file_loads() {

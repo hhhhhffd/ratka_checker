@@ -10,3 +10,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+/project-context.md
+/.cgcignore
+/ERRORS.md
+/fake-log/
+/tests/realmods/

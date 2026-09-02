@@ -205,13 +205,12 @@ fn reflection_density(data: &ScanData) -> Option<usize> {
     Some(reflective * 100 / calls)
 }
 
-fn is_reflection_call(owner: Option<&str>, kind: InvokeKind) -> bool {
-    matches!(kind, InvokeKind::Dynamic)
-        || owner.is_some_and(|owner| {
-            owner.starts_with("java/lang/reflect/")
-                || owner.starts_with("java/lang/invoke/")
-                || owner == "java/lang/Class"
-        })
+fn is_reflection_call(owner: Option<&str>, _kind: InvokeKind) -> bool {
+    owner.is_some_and(|owner| {
+        owner.starts_with("java/lang/reflect/")
+            || owner.starts_with("java/lang/invoke/")
+            || owner == "java/lang/Class"
+    })
 }
 
 /// A decoder requires a loop, XOR, a byte/char array, and conversion of that
@@ -1117,5 +1116,14 @@ mod tests {
             ..ScanData::default()
         };
         assert_eq!(analyze(&data).obfuscation.score, 0);
+    }
+
+    #[test]
+    fn invokedynamic_is_not_counted_as_reflection() {
+        assert!(!is_reflection_call(None, InvokeKind::Dynamic));
+        assert!(is_reflection_call(
+            Some("java/lang/reflect/Method"),
+            InvokeKind::Virtual
+        ));
     }
 }

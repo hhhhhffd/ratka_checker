@@ -1781,6 +1781,28 @@ fn method_flow_from_scan_data(class_file: &ClassScanData, method: &MethodScanDat
             }
             continue;
         }
+        if is_java_http_client_send(owner, &call.name) {
+            if let Some(body) = arguments.first().copied() {
+                events.push((
+                    call.offset,
+                    Operation::NetworkSend {
+                        body,
+                        evidence: evidence.clone(),
+                    },
+                ));
+            }
+            if let Some(output) = output {
+                events.push((
+                    call.offset,
+                    Operation::Source {
+                        output,
+                        kind: SourceKind::HttpResponse,
+                        evidence,
+                    },
+                ));
+            }
+            continue;
+        }
         if let Some(kind) = remote_response_kind(owner, &call.name) {
             if let Some(output) = output {
                 events.push((
@@ -2394,7 +2416,11 @@ fn is_process_execution(owner: &str, name: &str) -> bool {
 }
 
 fn is_http_send(owner: &str, name: &str) -> bool {
-    owner.contains("HttpClient") && matches!(name, "post" | "send" | "execute")
+    owner.contains("HttpClient") && matches!(name, "post" | "send" | "sendAsync" | "execute")
+}
+
+fn is_java_http_client_send(owner: &str, name: &str) -> bool {
+    owner == "java/net/http/HttpClient" && matches!(name, "send" | "sendAsync")
 }
 
 fn is_dynamic_load(owner: &str, name: &str) -> bool {
@@ -3187,21 +3213,10 @@ fn risk_score(
 }
 
 /// Facts from broad rules are intentionally non-scoring until an analyzer can
-/// attach contextual source-level evidence to them, except for explicit
-/// anti-analysis checks.
+/// attach contextual source-level evidence to them.
 fn finding_is_risk_bearing(finding: &Finding) -> bool {
-    is_anti_analysis_finding(finding)
-        || (finding.kind != crate::models::scan::FindingKind::Heuristic
-            && (!finding.evidence.is_empty() || finding.category == "virustotal"))
-}
-
-/// A configured anti-analysis marker requires review even when flow analysis
-/// cannot recover source-level evidence. It never proves malicious behaviour.
-fn is_anti_analysis_finding(finding: &Finding) -> bool {
-    matches!(
-        finding.rule_id.as_str(),
-        "VMWARE_CHECK" | "SANDBOXIE_CHECK" | "ANTIVIRUS_PROCESS_CHECK"
-    )
+    finding.kind != crate::models::scan::FindingKind::Heuristic
+        && (!finding.evidence.is_empty() || finding.category == "virustotal")
 }
 
 /// Reports how much archive content reached the bounded static analyzers.
@@ -3239,7 +3254,8 @@ fn analysis_coverage(
         .flat_map(|class| &class.methods)
         .count() as u32;
     let method_flow_coverage =
-        percent(data_flow.analyzed_methods.min(flow_eligible), flow_eligible);
+        percent(data_flow.analyzed_methods.min(flow_eligible), flow_eligible)
+            .max(u8::from(data_flow.analyzed_methods > 0));
     let instruction_total = data
         .class_files
         .iter()
@@ -3469,12 +3485,7 @@ fn has_first_party_network_calls(data: &ScanData) -> bool {
 fn finding_score_weight(finding: &Finding) -> u8 {
     match finding.rule_id.as_str() {
         "TIMESTAMP_OUTLIER" => Severity::Low.score_weight(),
-        "RAW_GITHUB_URL" | "MODS_SELF_COPY" => 0,
-        // Anti-analysis checks have little legitimate value in a client mod and
-        // make a clean verdict misleading even when flow analysis is inconclusive.
-        // Keep the contribution below the malicious threshold: this prompts a
-        // manual review rather than asserting malicious behaviour.
-        "VMWARE_CHECK" | "SANDBOXIE_CHECK" | "ANTIVIRUS_PROCESS_CHECK" => 6,
+        "RAW_GITHUB_URL" => 0,
         _ => finding.score_contribution,
     }
 }
@@ -3582,10 +3593,10 @@ mod tests {
         assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
     }
 
-    /// Anti-analysis checks must never be presented as a clean result solely
-    /// because data-flow recovery could not connect them to a terminal action.
+    /// An anti-analysis marker is an observation and must not change the verdict
+    /// without source-level evidence or a confirmed chain.
     #[test]
-    fn anti_analysis_heuristic_requires_suspicious_verdict() {
+    fn anti_analysis_heuristic_does_not_change_verdict() {
         let findings = vec![Finding {
             rule_id: "VMWARE_CHECK".to_owned(),
             category: "evasion".to_owned(),
@@ -3600,10 +3611,10 @@ mod tests {
         }];
 
         let score = risk_score(&findings, &[], &Obfuscation::default());
-        assert_eq!(score, 6);
+        assert_eq!(score, 0);
         assert_eq!(
             verdict_from_evidence(&findings, &[], &Obfuscation::default(), score),
-            Verdict::Suspicious
+            Verdict::Clean
         );
     }
 
@@ -3854,6 +3865,48 @@ mod tests {
             verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 80),
             Verdict::Malicious
         );
+    }
+
+    #[test]
+    fn java_http_client_send_async_is_a_network_flow_terminal() {
+        let method = MethodScanData {
+            class_name: "mod/Telemetry".to_owned(),
+            method_name: "sendHeartbeat".to_owned(),
+            descriptor: "()V".to_owned(),
+            calls: vec![CallSite {
+                offset: 12,
+                kind: InvokeKind::Virtual,
+                owner: Some("java/net/http/HttpClient".to_owned()),
+                name: "sendAsync".to_owned(),
+                descriptor: "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/util/concurrent/CompletableFuture;".to_owned(),
+                receiver_origin: Some(ValueOrigin::Local(2)),
+                argument_origins: vec![ValueOrigin::Local(0), ValueOrigin::Local(1)],
+                result_origin: Some(ValueOrigin::Instruction(12)),
+            }],
+            ..MethodScanData::default()
+        };
+        let class = class_scan_data(
+            "mod/Telemetry",
+            vec!["java/net/http/HttpClient", "java/net/http/HttpRequest"],
+            vec![method],
+        );
+        let data = ScanData {
+            class_files: vec![class],
+            ..Default::default()
+        };
+
+        let flow = super::method_flow_from_scan_data(
+            &data.class_files[0],
+            &data.class_files[0].methods[0],
+        );
+        assert!(flow
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, super::Operation::NetworkSend { body: 0, .. })));
+
+        let result = super::analyze_scan_data_flow(&data);
+        assert_eq!(result.analyzed_methods, 1);
+        assert_eq!(result.unresolved_calls, 0);
     }
 
     /// Verifies related reversed/rotated identifiers do not produce namespace mismatch noise.
@@ -4157,7 +4210,7 @@ mod tests {
     #[test]
     fn real_mods_are_clean_without_confirmed_dangerous_chains() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let corpus = root.join("tests/realmods");
+        let corpus = root.join("tests/realmods/clean");
         if !corpus.is_dir() {
             // The real-mod corpus is intentionally local and is not required to
             // build the scanner from a source distribution.
