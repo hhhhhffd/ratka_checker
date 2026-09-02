@@ -8,10 +8,33 @@ DB_NAME="${RATSCAN_DB_NAME:-ratscan}"
 DB_USER="${RATSCAN_DB_USER:-ratscan}"
 DB_PASSWORD="${RATSCAN_DB_PASSWORD:-}"
 SWAP_SIZE="${RATSCAN_SWAP_SIZE:-4G}"
+TELEGRAM_ENABLED=false
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Run as root: sudo bash deploy/scripts/install_ubuntu.sh" >&2
     exit 1
+fi
+
+has_app_env_value() {
+    if [ ! -f "$APP_ENV_FILE" ]; then
+        return 1
+    fi
+
+    awk -v key="$1" '
+        $0 !~ /^[[:space:]]*#/ && index($0, key "=") == 1 {
+            value = substr($0, length(key) + 2)
+            if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) {
+                value = substr(value, 2, length(value) - 2)
+            }
+            found = value != ""
+            exit
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$APP_ENV_FILE"
+}
+
+if has_app_env_value TG_BOT_TOKEN && has_app_env_value ALLOWED_TG_ID; then
+    TELEGRAM_ENABLED=true
 fi
 
 if [ ! -x "$APP_DIR/ratscan" ]; then
@@ -25,13 +48,13 @@ if [ ! -f "$APP_DIR/config/rules.yaml" ]; then
     exit 1
 fi
 
-if [ ! -f "$APP_DIR/telegram_bot/bot.py" ]; then
+if [ "$TELEGRAM_ENABLED" = true ] && [ ! -f "$APP_DIR/telegram_bot/bot.py" ]; then
     echo "Missing Telegram bot package: $APP_DIR/telegram_bot" >&2
     echo "Build it first from the repository root: bash deploy/scripts/build_ubuntu_bundle.sh" >&2
     exit 1
 fi
 
-if [ ! -f "$APP_DIR/telegram_bot/requirements.txt" ]; then
+if [ "$TELEGRAM_ENABLED" = true ] && [ ! -f "$APP_DIR/telegram_bot/requirements.txt" ]; then
     echo "Missing Telegram bot requirements: $APP_DIR/telegram_bot/requirements.txt" >&2
     exit 1
 fi
@@ -84,7 +107,11 @@ env_value() {
 }
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl postgresql postgresql-client python3-venv
+apt_packages=(ca-certificates curl openssl postgresql postgresql-client)
+if [ "$TELEGRAM_ENABLED" = true ]; then
+    apt_packages+=(python3-venv)
+fi
+DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_packages[@]}"
 
 if [ -z "$DB_PASSWORD" ]; then
     DB_PASSWORD="$(openssl rand -hex 24)"
@@ -108,10 +135,15 @@ install -m 0755 "$APP_DIR/ratscan" /opt/ratscan/bin/ratscan
 cp -R "$APP_DIR/config/." /opt/ratscan/config/
 cp -R "$APP_DIR/telegram_bot/." /opt/ratscan/telegram_bot/
 
-python3 -m venv /opt/ratscan/telegram-venv
-/opt/ratscan/telegram-venv/bin/pip install --no-cache-dir -r /opt/ratscan/telegram_bot/requirements.txt
+if [ "$TELEGRAM_ENABLED" = true ]; then
+    python3 -m venv /opt/ratscan/telegram-venv
+    /opt/ratscan/telegram-venv/bin/pip install --no-cache-dir -r /opt/ratscan/telegram_bot/requirements.txt
+fi
 
-chown -R root:root /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/telegram_bot /opt/ratscan/telegram-venv
+chown -R root:root /opt/ratscan/bin /opt/ratscan/config /opt/ratscan/telegram_bot
+if [ "$TELEGRAM_ENABLED" = true ]; then
+    chown -R root:root /opt/ratscan/telegram-venv
+fi
 chown -R ratscan:ratscan /opt/ratscan/storage
 
 systemctl enable --now postgresql
