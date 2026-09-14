@@ -16,7 +16,9 @@ use crate::{
     rules::engine::RulesEngine,
     scanner::{
         asset,
-        class_file::{self, CallSite, ConstantValue, MethodScanData, ValueOrigin},
+        class_file::{
+            self, CallSite, ConstantValue, ControlFlowEdgeKind, MethodScanData, ValueOrigin,
+        },
         context_recognizers,
         dataflow::{
             analyze_method_flows_from_roots, dangerous_flow_roots, ConfirmedChainCandidate,
@@ -54,6 +56,7 @@ const EXTERNAL_URLCLASSLOADER_SIGNAL: &str = "urlclassloader_external_target";
 const PRIVACY_NETWORK_SYNC_RULE_ID: &str = "PRIVACY_NETWORK_SYNC";
 const CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID: &str = "CONFIRMED_REMOTE_MEMORY_LOAD";
 const CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID: &str = "CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER";
+const CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID: &str = "CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD";
 const CONFIRMED_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_WEBHOOK_EXFIL";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
@@ -239,6 +242,9 @@ fn scan_bytes(
         confirmed_chains.push(chain);
     }
     if let Some(chain) = confirmed_embedded_native_downloader(&context.data) {
+        confirmed_chains.push(chain);
+    }
+    if let Some(chain) = confirmed_encoded_native_payload_load(&context.data) {
         confirmed_chains.push(chain);
     }
     if let Some(chain) = confirmed_webhook_exfil(&context.data, &obfuscation.decoded_values) {
@@ -2893,6 +2899,211 @@ fn confirmed_embedded_native_downloader(data: &ScanData) -> Option<ConfirmedChai
     })
 }
 
+const MIN_ENCODED_NATIVE_PAYLOAD_STRING_LENGTH: usize = 256;
+
+/// Confirms an embedded native payload loader when the same first-party class
+/// decodes a sizeable XOR-obfuscated string, writes its bytes to a temporary
+/// file, and passes that file to `System.load`.
+fn confirmed_encoded_native_payload_load(data: &ScanData) -> Option<ConfirmedChain> {
+    for class_file in data.class_files.iter().filter(|class_file| {
+        matches!(
+            class_file.scope,
+            CodeScope::FirstParty | CodeScope::NestedMod
+        )
+    }) {
+        let Some(class_name) = class_file.class_name.as_deref() else {
+            continue;
+        };
+        let Some((loader_method, payload_bytes_call, temp_file_call, write_call, load_call)) =
+            class_file.methods.iter().find_map(|method| {
+                let payload_bytes_call = method.calls.iter().find(|call| {
+                    call.owner.as_deref() == Some("java/lang/String")
+                        && call.name == "getBytes"
+                        && matches!(
+                            call.receiver_origin.as_ref(),
+                            Some(ValueOrigin::Field { owner, descriptor, .. })
+                                if owner == class_name && descriptor == "Ljava/lang/String;"
+                        )
+                })?;
+                let temp_file_call = method.calls.iter().find(|call| {
+                    call.owner.as_deref() == Some("java/nio/file/Files")
+                        && call.name == "createTempFile"
+                })?;
+                let write_call = method.calls.iter().find(|call| {
+                    call.owner.as_deref() == Some("java/nio/file/Files") && call.name == "write"
+                })?;
+                let load_call = method.calls.iter().find(|call| {
+                    call.owner.as_deref() == Some("java/lang/System") && call.name == "load"
+                })?;
+                let temp_file_origin = temp_file_call.result_origin.as_ref()?;
+                let payload_bytes_origin = payload_bytes_call.result_origin.as_ref()?;
+                let write_path = write_call.argument_origins.first()?;
+                let write_bytes = write_call.argument_origins.get(1)?;
+                if !origin_depends_on(method, write_path, temp_file_origin)
+                    || !origin_depends_on(method, write_bytes, payload_bytes_origin)
+                {
+                    return None;
+                }
+                let path_to_string_call = method.calls.iter().find(|call| {
+                    call.owner.as_deref() == Some("java/nio/file/Path")
+                        && call.name == "toString"
+                        && call.receiver_origin.as_ref().is_some_and(|origin| {
+                            origin_depends_on(method, origin, temp_file_origin)
+                        })
+                })?;
+                let path_string_origin = path_to_string_call.result_origin.as_ref()?;
+                let load_path = load_call.argument_origins.first()?;
+                if !origin_depends_on(method, load_path, path_string_origin) {
+                    return None;
+                }
+                Some((
+                    method,
+                    payload_bytes_call,
+                    temp_file_call,
+                    write_call,
+                    load_call,
+                ))
+            })
+        else {
+            continue;
+        };
+
+        let payload_field = match payload_bytes_call.receiver_origin.as_ref()? {
+            ValueOrigin::Field { owner, name, .. } if owner == class_name => name,
+            _ => continue,
+        };
+        let Some((decode_method, encoded_length, decode_call)) =
+            class_file.methods.iter().find_map(|method| {
+                if !is_encoded_native_payload_decoder(method) {
+                    return None;
+                }
+                let field_written = method.field_writes.iter().any(|field| {
+                    field.owner == class_name
+                        && field.name.as_str() == payload_field
+                        && field.descriptor == "Ljava/lang/String;"
+                });
+                if !field_written {
+                    return None;
+                }
+                let encoded_length = method
+                    .constants
+                    .iter()
+                    .filter_map(|constant| match &constant.value {
+                        ConstantValue::String(value) => Some(value.len()),
+                        _ => None,
+                    })
+                    .max()?;
+                let decode_call = method.calls.iter().find(|call| {
+                    call.owner.as_deref() == Some("java/lang/String")
+                        && call.name == "<init>"
+                        && call.descriptor.starts_with("([")
+                })?;
+                Some((method, encoded_length, decode_call))
+            })
+        else {
+            continue;
+        };
+
+        let loader_id = MethodId {
+            archive_id: class_file.archive_id.clone(),
+            class_name: loader_method.class_name.clone(),
+            method_name: loader_method.method_name.clone(),
+            descriptor: loader_method.descriptor.clone(),
+        };
+        let decode_id = MethodId {
+            archive_id: class_file.archive_id.clone(),
+            class_name: decode_method.class_name.clone(),
+            method_name: decode_method.method_name.clone(),
+            descriptor: decode_method.descriptor.clone(),
+        };
+        let mut decode_evidence = flow_evidence(
+            class_file,
+            &decode_id,
+            decode_call.offset,
+            "java/lang/String",
+            "<init>",
+        );
+        decode_evidence.operation = "encoded_native_payload".to_owned();
+        decode_evidence.value_preview = Some(format!(
+            "XOR-obfuscated String constant ({encoded_length} characters)"
+        ));
+        let evidence = vec![
+            flow_evidence_to_evidence(decode_evidence),
+            flow_evidence_to_evidence(flow_evidence(
+                class_file,
+                &loader_id,
+                payload_bytes_call.offset,
+                "java/lang/String",
+                "getBytes",
+            )),
+            flow_evidence_to_evidence(flow_evidence(
+                class_file,
+                &loader_id,
+                temp_file_call.offset,
+                "java/nio/file/Files",
+                "createTempFile",
+            )),
+            flow_evidence_to_evidence(flow_evidence(
+                class_file,
+                &loader_id,
+                write_call.offset,
+                "java/nio/file/Files",
+                "write",
+            )),
+            flow_evidence_to_evidence(flow_evidence(
+                class_file,
+                &loader_id,
+                load_call.offset,
+                "java/lang/System",
+                "load",
+            )),
+        ];
+        return Some(ConfirmedChain {
+            chain_id: format!("encoded-native-payload-load-{}", class_file.archive_id),
+            rule_id: CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID.to_owned(),
+            severity: Severity::Critical,
+            confidence: Confidence::High,
+            score_contribution: 85,
+            operations: vec![
+                "encoded_native_payload".to_owned(),
+                "java/lang/String.getBytes".to_owned(),
+                "java/nio/file/Files.createTempFile".to_owned(),
+                "java/nio/file/Files.write".to_owned(),
+                "java/lang/System.load".to_owned(),
+            ],
+            evidence,
+        });
+    }
+    None
+}
+
+fn is_encoded_native_payload_decoder(method: &MethodScanData) -> bool {
+    let has_encoded_constant = method.constants.iter().any(|constant| {
+        matches!(
+            &constant.value,
+            ConstantValue::String(value)
+                if value.len() >= MIN_ENCODED_NATIVE_PAYLOAD_STRING_LENGTH
+        )
+    });
+    let has_xor_loop = method
+        .instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 0x82)
+        && method.control_flow_edges.iter().any(|edge| {
+            edge.kind == ControlFlowEdgeKind::Branch && edge.to_offset < edge.from_offset
+        });
+    let has_char_array_input = method.calls.iter().any(|call| {
+        call.owner.as_deref() == Some("java/lang/String") && call.name == "toCharArray"
+    });
+    let has_string_constructor = method.calls.iter().any(|call| {
+        call.owner.as_deref() == Some("java/lang/String")
+            && call.name == "<init>"
+            && call.descriptor.starts_with("([")
+    });
+
+    has_encoded_constant && has_xor_loop && has_char_array_input && has_string_constructor
+}
+
 /// Confirms hidden player telemetry only when a statically recovered webhook is
 /// used to send Minecraft client data. The config, collection, and network
 /// transport may be split between first-party classes.
@@ -3108,6 +3319,7 @@ fn confirmed_safe_updater_context(chains: &[ConfirmedChain]) -> Option<Confirmed
                 | "CONFIRMED_DECODED_DYNAMIC_LOAD"
                 | CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID
                 | CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID
+                | CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID
         )
     });
     if has_credential_or_dynamic_risk {
@@ -3432,6 +3644,7 @@ fn verdict_from_evidence(
                 | "CONFIRMED_REMOTE_DYNAMIC_LOAD"
                 | CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID
                 | CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID
+                | CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID
                 | CONFIRMED_WEBHOOK_EXFIL_RULE_ID
         ) || (chain.rule_id == "CONFIRMED_DOWNLOAD_WRITE_EXEC" && !has_safe_updater_context)
     });
@@ -3506,6 +3719,16 @@ fn summarize(findings: &[Finding], verdict: Verdict) -> String {
     if findings.is_empty() && verdict == Verdict::Clean {
         return "Явных угроз не найдено, но это не гарантия полной безопасности.".to_owned();
     }
+    if findings.is_empty() {
+        return match verdict {
+            Verdict::Malicious => "Обнаружена подтверждённая опасная цепочка поведения.".to_owned(),
+            Verdict::Suspicious => {
+                "Обнаружена подтверждённая подозрительная цепочка поведения.".to_owned()
+            }
+            Verdict::Unknown => "Результат сканирования неизвестен: анализ неполный.".to_owned(),
+            Verdict::Clean => unreachable!("clean with empty findings handled above"),
+        };
+    }
 
     let mut categories = findings
         .iter()
@@ -3564,7 +3787,8 @@ mod tests {
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
         class_file::{
-            CallSite, ConstantValue, InvokeKind, LoadedConstant, MethodScanData, ValueOrigin,
+            CallSite, ConstantValue, ControlFlowEdge, ControlFlowEdgeKind, FieldAccess,
+            Instruction, InvokeKind, LoadedConstant, MethodScanData, ValueOrigin,
         },
         dataflow::FileTarget,
         obfuscation::DecodedValue,
@@ -3774,6 +3998,129 @@ mod tests {
             .iter()
             .any(|finding| finding.rule_id == PRIVACY_NETWORK_SYNC_RULE_ID));
         assert_eq!(risk_score(&findings, &[], &Obfuscation::default()), 0);
+    }
+
+    #[test]
+    fn confirms_encoded_native_payload_temp_write_and_system_load() {
+        const CLASS_NAME: &str = "mod/NativeLoader";
+        let payload_field = FieldAccess {
+            offset: 38,
+            owner: CLASS_NAME.to_owned(),
+            name: "payload".to_owned(),
+            descriptor: "Ljava/lang/String;".to_owned(),
+            value_origin: Some(ValueOrigin::Instruction(30)),
+        };
+        let decoder = MethodScanData {
+            class_name: CLASS_NAME.to_owned(),
+            method_name: "<clinit>".to_owned(),
+            descriptor: "()V".to_owned(),
+            instructions: vec![Instruction {
+                offset: 14,
+                opcode: 0x82,
+                operands: Vec::new(),
+            }],
+            constants: vec![LoadedConstant {
+                offset: 0,
+                value: ConstantValue::String(
+                    "X".repeat(super::MIN_ENCODED_NATIVE_PAYLOAD_STRING_LENGTH),
+                ),
+            }],
+            calls: vec![
+                call_with_origins(
+                    7,
+                    "java/lang/String",
+                    "toCharArray",
+                    Some(ValueOrigin::Constant(ConstantValue::String(
+                        "payload".to_owned(),
+                    ))),
+                    Vec::new(),
+                    Some(ValueOrigin::Instruction(8)),
+                ),
+                call_with_origins(
+                    30,
+                    "java/lang/String",
+                    "<init>",
+                    Some(ValueOrigin::Instruction(29)),
+                    vec![ValueOrigin::Instruction(8)],
+                    None,
+                ),
+            ],
+            field_writes: vec![payload_field],
+            control_flow_edges: vec![ControlFlowEdge {
+                from_offset: 20,
+                to_offset: 10,
+                kind: ControlFlowEdgeKind::Branch,
+            }],
+            ..MethodScanData::default()
+        };
+        let temp_path = ValueOrigin::Instruction(1);
+        let payload_bytes = ValueOrigin::Instruction(2);
+        let path_string = ValueOrigin::Instruction(4);
+        let loader = MethodScanData {
+            class_name: CLASS_NAME.to_owned(),
+            method_name: "load".to_owned(),
+            descriptor: "()V".to_owned(),
+            calls: vec![
+                call_with_origins(
+                    1,
+                    "java/nio/file/Files",
+                    "createTempFile",
+                    None,
+                    Vec::new(),
+                    Some(temp_path.clone()),
+                ),
+                call_with_origins(
+                    2,
+                    "java/lang/String",
+                    "getBytes",
+                    Some(ValueOrigin::Field {
+                        owner: CLASS_NAME.to_owned(),
+                        name: "payload".to_owned(),
+                        descriptor: "Ljava/lang/String;".to_owned(),
+                    }),
+                    Vec::new(),
+                    Some(payload_bytes.clone()),
+                ),
+                call_with_origins(
+                    3,
+                    "java/nio/file/Files",
+                    "write",
+                    None,
+                    vec![temp_path, payload_bytes, ValueOrigin::Unknown],
+                    Some(ValueOrigin::Instruction(3)),
+                ),
+                call_with_origins(
+                    4,
+                    "java/nio/file/Path",
+                    "toString",
+                    Some(ValueOrigin::Instruction(1)),
+                    Vec::new(),
+                    Some(path_string.clone()),
+                ),
+                call_with_origins(5, "java/lang/System", "load", None, vec![path_string], None),
+            ],
+            ..MethodScanData::default()
+        };
+        let data = ScanData {
+            class_files: vec![class_scan_data(CLASS_NAME, vec![], vec![decoder, loader])],
+            ..Default::default()
+        };
+
+        let chain = super::confirmed_encoded_native_payload_load(&data)
+            .expect("encoded native payload chain");
+        assert_eq!(
+            chain.rule_id,
+            super::CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID
+        );
+        assert_eq!(chain.evidence.len(), 5);
+        assert_eq!(
+            verdict_from_evidence(&[], &[chain], &Obfuscation::default(), 85),
+            Verdict::Malicious
+        );
+
+        let mut dependency_data = data;
+        dependency_data.class_files[0].scope = CodeScope::BundledDependency;
+        assert!(super::confirmed_encoded_native_payload_load(&dependency_data).is_none());
     }
 
     #[test]
@@ -3993,6 +4340,8 @@ mod tests {
     fn clean_summary_is_not_absolute() {
         let summary = summarize(&[], Verdict::Clean);
         assert!(summary.contains("не гарантия"));
+        let malicious_summary = summarize(&[], Verdict::Malicious);
+        assert!(malicious_summary.contains("подтверждённая опасная цепочка"));
     }
 
     /// Verifies remote class loading requires network and loader APIs in one class file.
@@ -4351,6 +4700,31 @@ mod tests {
             receiver_origin: None,
             argument_origins: Vec::new(),
             result_origin: None,
+        }
+    }
+
+    fn call_with_origins(
+        offset: u32,
+        owner: &str,
+        name: &str,
+        receiver_origin: Option<ValueOrigin>,
+        argument_origins: Vec<ValueOrigin>,
+        result_origin: Option<ValueOrigin>,
+    ) -> CallSite {
+        CallSite {
+            offset,
+            kind: InvokeKind::Virtual,
+            owner: Some(owner.to_owned()),
+            name: name.to_owned(),
+            descriptor: match (owner, name) {
+                ("java/lang/String", "toCharArray") => "()[C",
+                ("java/lang/String", "<init>") => "([C)V",
+                _ => "()V",
+            }
+            .to_owned(),
+            receiver_origin,
+            argument_origins,
+            result_origin,
         }
     }
 
