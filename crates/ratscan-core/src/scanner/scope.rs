@@ -127,6 +127,27 @@ fn classify_class(
         .iter()
         .map(|entrypoint| normalize_entrypoint(entrypoint))
         .collect::<HashSet<_>>();
+    if let Some(dependency) = &archive.declared_dependency {
+        let dependency_roots = normalized_roots(&dependency.package_roots);
+        if dependency_roots.is_empty() || matches_any_root(&class_name, &dependency_roots) {
+            return classification(
+                class,
+                CodeScope::BundledDependency,
+                Some(dependency.clone()),
+                false,
+                Confidence::High,
+                ClassificationReason::DeclaredDependency,
+            );
+        }
+        return classification(
+            class,
+            CodeScope::BundledDependency,
+            Some(dependency.clone()),
+            false,
+            Confidence::Medium,
+            ClassificationReason::DependencyPackage,
+        );
+    }
     if archive.depth > 0 && archive.has_mod_metadata {
         return classification(
             class,
@@ -203,28 +224,6 @@ fn classify_class(
             false,
             Confidence::High,
             ClassificationReason::MavenPackage,
-        );
-    }
-
-    if let Some(dependency) = &archive.declared_dependency {
-        let dependency_roots = normalized_roots(&dependency.package_roots);
-        if dependency_roots.is_empty() || matches_any_root(&class_name, &dependency_roots) {
-            return classification(
-                class,
-                CodeScope::BundledDependency,
-                Some(dependency.clone()),
-                false,
-                Confidence::High,
-                ClassificationReason::DeclaredDependency,
-            );
-        }
-        return classification(
-            class,
-            CodeScope::BundledDependency,
-            Some(dependency.clone()),
-            false,
-            Confidence::Medium,
-            ClassificationReason::DependencyPackage,
         );
     }
 
@@ -498,6 +497,34 @@ mod tests {
 
         assert_eq!(result.scope, CodeScope::NestedMod);
         assert_eq!(result.reason, ClassificationReason::NestedModMetadata);
+    }
+
+    #[test]
+    fn declared_dependency_wins_over_nested_mod_metadata() {
+        let dependency = DependencyMetadata {
+            name: "modmenu".to_owned(),
+            version: Some("17.0.0".to_owned()),
+            package_roots: Vec::new(),
+        };
+        let result = classify(ScopeClassificationInput {
+            archives: vec![archive(
+                "modmenu",
+                1,
+                Some(dependency.clone()),
+                true,
+                &["com.terraformersmc.modmenu.ModMenu"],
+            )],
+            classes: vec![ClassScopeInput {
+                archive_id: "modmenu".to_owned(),
+                class_name: "com/terraformersmc/modmenu/ModMenu".to_owned(),
+            }],
+            dominant_package_roots: Vec::new(),
+        });
+
+        assert_eq!(result.scope, CodeScope::BundledDependency);
+        assert_eq!(result.dependency, Some(dependency));
+        assert_eq!(result.reason, ClassificationReason::DeclaredDependency);
+        assert!(!result.reachable_from_entrypoint);
     }
 
     #[test]
