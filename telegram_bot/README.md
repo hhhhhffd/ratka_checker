@@ -28,4 +28,5 @@ The Docker image and Ubuntu installer create this environment automatically.
 
 - Send a `.jar` document to start a scan.
 - Use `/id <scan_id>` to fetch the full report.
+- Use `/sha256 <hash>` (or `/hash <hash>`) to fetch the latest report by SHA-256.
 - Messages from Telegram users other than `ALLOWED_TG_ID` are ignored.

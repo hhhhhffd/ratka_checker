@@ -119,6 +119,10 @@ class RatScanClient:
         async with self._session.get(f"{self._base_url}/v1/scans/{scan_id}") as response:
             return await self._read_json_response(response)
 
+    async def get_hash(self, sha256: str) -> dict[str, Any]:
+        async with self._session.get(f"{self._base_url}/v1/hashes/{sha256}") as response:
+            return await self._read_json_response(response)
+
     async def _read_json_response(self, response: aiohttp.ClientResponse) -> dict[str, Any]:
         text = await response.text()
         if response.status >= 400:
@@ -147,7 +151,8 @@ def build_router(config: BotConfig, client: RatScanClient) -> Router:
             return
 
         await message.answer(
-            "Скинь .jar файлом для проверки или используй /id <scan_id> для полного отчета."
+            "Скинь .jar файлом для проверки, используй /id <scan_id> "
+            "или /sha256 <hash> для поиска отчета."
         )
 
     @router.message(Command("id"))
@@ -168,6 +173,28 @@ def build_router(config: BotConfig, client: RatScanClient) -> Router:
             return
 
         await send_report(message, report, title="Полный отчет")
+
+    @router.message(Command("sha256", "hash"))
+    async def handle_sha256(message: Message) -> None:
+        if not is_allowed(message, config.allowed_tg_id):
+            return
+
+        sha256 = command_argument(message).lower()
+        if not sha256:
+            await message.answer("Формат: /sha256 <64 hex-символа>")
+            return
+        if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+            await message.answer("SHA-256 должен содержать ровно 64 hex-символа.")
+            return
+
+        try:
+            report = await client.get_hash(sha256)
+        except ApiError as error:
+            LOGGER.warning("failed to fetch hash report: %s", error)
+            await message.answer(f"Не удалось получить отчет: {html.escape(str(error))}")
+            return
+
+        await send_report(message, report, title="Отчет по SHA-256")
 
     @router.message(F.document)
     async def handle_document(message: Message, bot: Bot) -> None:
@@ -209,7 +236,10 @@ def build_router(config: BotConfig, client: RatScanClient) -> Router:
         if not is_allowed(message, config.allowed_tg_id):
             return
 
-        await message.answer("Скинь .jar файлом или используй /id <scan_id>.")
+        await message.answer(
+            "Скинь .jar файлом, используй /id <scan_id> "
+            "или /sha256 <hash>."
+        )
 
     return router
 
