@@ -1,6 +1,13 @@
 # RatScan API
 
+[![Rust CI](https://github.com/hhhhhffd/ratka_checker/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/hhhhhffd/ratka_checker/actions/workflows/rust-ci.yml)
+
 Rust API service for static scanning Minecraft `.jar` mods.
+
+GitHub Actions checks Rust 1.88 and stable on pushes and pull requests: workspace
+tests, Telegram worker startup, scanner regression fixtures, and release builds.
+Formatting and Clippy are checked on stable Rust. CI uses mock Telegram endpoints
+and does not need production credentials or PostgreSQL.
 
 ## Build Binary Package In Docker
 
