@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ["1.88.0", stable]
+        toolchain: ["1.99.0", stable]
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
       CARGO_TERM_COLOR: always
@@ -50,11 +50,9 @@ jobs:
             ${{ runner.os }}-rust-${{ steps.rust.outputs.version }}-
 
       - name: Check formatting
-        if: matrix.toolchain == 'stable'
         run: cargo fmt --all --check
 
       - name: Clippy
-        if: matrix.toolchain == 'stable'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Workspace tests

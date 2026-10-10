@@ -119,10 +119,8 @@ fn decode_text(bytes: &[u8]) -> Result<DecodedTextResource, TextDecodingError> {
 fn decode_utf16_bom(bytes: &[u8]) -> Option<DecodedTextResource> {
     let (encoding, bytes) = if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
         (TextEncoding::Utf16Le, bytes)
-    } else if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        (TextEncoding::Utf16Be, bytes)
     } else {
-        return None;
+        (TextEncoding::Utf16Be, bytes.strip_prefix(&[0xfe, 0xff])?)
     };
     decode_utf16(bytes, encoding).map(|text| decoded(&text, encoding, Confidence::High))
 }
@@ -151,7 +149,9 @@ fn decode_utf16_without_bom(bytes: &[u8]) -> Option<DecodedTextResource> {
 
 fn decode_utf16(bytes: &[u8], encoding: TextEncoding) -> Option<String> {
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| match encoding {
             TextEncoding::Utf16Le => u16::from_le_bytes([pair[0], pair[1]]),
             TextEncoding::Utf16Be => u16::from_be_bytes([pair[0], pair[1]]),
@@ -261,6 +261,46 @@ mod tests {
             decode_text_resource("config/mod.json", &[0xff, 0, 0x81, 0, 0x8d]),
             Err(TextDecodingError::InvalidEncoding)
         );
+    }
+
+    #[test]
+    fn utf16_bom_preserves_multilingual_text_and_surrogate_pairs() {
+        let text = "{\"name\":\"тест🦀\"}";
+        for (bom, encoding) in [
+            ([0xff, 0xfe], TextEncoding::Utf16Le),
+            ([0xfe, 0xff], TextEncoding::Utf16Be),
+        ] {
+            let mut bytes = bom.to_vec();
+            for unit in text.encode_utf16() {
+                let pair = if encoding == TextEncoding::Utf16Le {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&pair);
+            }
+            let resource = decode_text_resource("config/mod.json", &bytes)
+                .expect("valid UTF-16")
+                .expect("text resource");
+            assert_eq!(resource.text, text);
+            assert_eq!(resource.encoding, encoding);
+            assert_eq!(resource.confidence, Confidence::High);
+        }
+    }
+
+    #[test]
+    fn utf16_bom_rejects_unpaired_surrogates_without_encoding_fallback() {
+        for bytes in [
+            [0xff, 0xfe, 0x00, 0xd8],
+            [0xff, 0xfe, 0x00, 0xdc],
+            [0xfe, 0xff, 0xd8, 0x00],
+            [0xfe, 0xff, 0xdc, 0x00],
+        ] {
+            assert_eq!(
+                decode_text_resource("config/mod.json", &bytes),
+                Err(TextDecodingError::InvalidEncoding)
+            );
+        }
     }
 
     #[test]

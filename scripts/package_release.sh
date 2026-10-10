@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-RUST_IMAGE="${RUST_IMAGE:-rust:1.88-bookworm}"
+RUST_IMAGE="${RUST_IMAGE:-rust:1.99.0-bookworm}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 OUT_DIR="${1:-dist/ratscan}"
 CARGO_CACHE_DIR="${CARGO_CACHE_DIR:-.cargo-cache}"
@@ -24,6 +24,7 @@ docker run --rm \
     -w /app \
     -e CARGO_HOME=/app/"$CARGO_CACHE_DIR" \
     -e CARGO_TARGET_DIR=/app/"$CARGO_TARGET_DIR" \
+    -e RUSTUP_TOOLCHAIN=1.99.0 \
     "$RUST_IMAGE" \
     cargo build --release
 

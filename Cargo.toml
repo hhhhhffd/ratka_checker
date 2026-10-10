@@ -2,6 +2,7 @@
 name = "ratscan-api"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [[bin]]
 name = "ratscan"
@@ -15,6 +16,9 @@ members = [
     "crates/ratscan-api",
 ]
 resolver = "2"
+
+[workspace.package]
+rust-version = "1.99"
 
 [dependencies]
 anyhow = "1.0"

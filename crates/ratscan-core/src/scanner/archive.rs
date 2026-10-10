@@ -2181,11 +2181,8 @@ fn command_from_origins(
 ) -> Option<Vec<FileTarget>> {
     let mut command = Vec::new();
     for origin in origins {
-        if let Some(parts) = command_from_origin(origin, method, object_targets, list_commands) {
-            command.extend(parts);
-        } else {
-            return None;
-        }
+        let parts = command_from_origin(origin, method, object_targets, list_commands)?;
+        command.extend(parts);
     }
     (!command.is_empty()).then_some(command)
 }
