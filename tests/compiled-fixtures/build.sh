@@ -20,10 +20,12 @@ nested="$root/nested_malicious"
 nested_classes="$build_dir/nested/classes"
 mkdir -p "$nested_classes"
 javac --release 21 -d "$nested_classes" $(find "$nested/src" -name '*.java' -print)
+printf '%s' '{"schemaVersion":1,"id":"nestedpayload","entrypoints":{"main":["example.NestedPayload"]}}' \
+    > "$nested_classes/fabric.mod.json"
 jar --create --file "$build_dir/nested-payload.jar" -C "$nested_classes" .
 mkdir -p "$build_dir/nested-root"
 printf '%s' '{"schemaVersion":1,"id":"nestedfixture","entrypoints":{"main":["example.Fixture"]}}' \
     > "$build_dir/nested-root/fabric.mod.json"
-mkdir -p "$build_dir/nested-root/META-INF/jars"
-cp "$build_dir/nested-payload.jar" "$build_dir/nested-root/META-INF/jars/nested-payload.jar"
+mkdir -p "$build_dir/nested-root/nested-mods"
+cp "$build_dir/nested-payload.jar" "$build_dir/nested-root/nested-mods/nested-payload.jar"
 jar --create --file "$nested/fixture.jar" -C "$build_dir/nested-root" .

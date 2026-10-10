@@ -463,7 +463,7 @@ fn materialize_fixture(destination: &Path, scenario: Scenario) -> anyhow::Result
     if scenario == Scenario::NestedMalicious {
         write_entry(
             &mut archive,
-            "META-INF/jars/nested-malicious.jar",
+            "nested-mods/nested-malicious.jar",
             &nested_malicious_jar()?,
             options,
         )?;
