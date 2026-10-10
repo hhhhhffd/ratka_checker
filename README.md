@@ -44,8 +44,8 @@ The API is open by default. Put nginx, a tunnel, or firewall rules in front of i
 The same `ratscan` process starts the Telegram worker when both `TG_BOT_TOKEN`
 and `ALLOWED_TG_ID` are set. It is supervised independently: a Telegram failure
 is retried without stopping the API. There is no `ratscan-telegram-bot.service`.
-For a host package, install the Python requirements in `telegram-venv/`; the
-Ubuntu installer and Docker image do this automatically.
+The worker is compiled into the Rust binary; Python and a virtual environment
+are no longer required.
 
 ## Upload
 
@@ -104,7 +104,7 @@ The `virustotal.behavior` field contains condensed VirusTotal sandbox artifacts
 when the behaviours relationship is available for the file.
 # Service boundaries
 
-RatScan API and `telegram_bot/` are one deployable service. The API owns scan
+RatScan API and the Rust Telegram worker are one deployable service. The API owns scan
 results, uploaded files, rules, the Telegram worker lifecycle, and the RatScan
 PostgreSQL schema.
 

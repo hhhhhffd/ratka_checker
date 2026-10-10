@@ -21,8 +21,8 @@ sudo bash scripts/clean_vds.sh --apply
 sudo bash scripts/install_ubuntu.sh
 ```
 
-The installer creates the API database and the internal Telegram virtual
-environment. Check the combined service with:
+The installer creates the API database. The internal Telegram worker is compiled
+into the Rust binary. Check the combined service with:
 
 ```sh
 systemctl status ratscan --no-pager

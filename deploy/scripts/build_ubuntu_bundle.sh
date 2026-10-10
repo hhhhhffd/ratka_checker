@@ -22,8 +22,6 @@ install -d -m 0755 "$APP_DIR"
 install -d -m 0755 "$RELEASE_DIR/scripts" "$RELEASE_DIR/systemd" "$RELEASE_DIR/env"
 install -m 0755 target/release/ratscan "$APP_DIR/ratscan"
 cp -R config "$APP_DIR/config"
-cp -R telegram_bot "$APP_DIR/telegram_bot"
-find "$APP_DIR/telegram_bot" -type d -name __pycache__ -prune -exec rm -rf {} +
 cp .env.example "$APP_DIR/.env.example"
 install -m 0755 "$DEPLOY_DIR/scripts/install_ubuntu.sh" "$RELEASE_DIR/scripts/install_ubuntu.sh"
 install -m 0755 "$DEPLOY_DIR/scripts/update_ubuntu.sh" "$RELEASE_DIR/scripts/update_ubuntu.sh"
@@ -61,9 +59,8 @@ sudo bash scripts/install_ubuntu.sh
 
 The installer uses `app/`:
 
-- `ratscan` - release API binary;
+- `ratscan` - release API binary with the internal Rust Telegram worker;
 - `config/rules.yaml` - scanner rules;
-- `telegram_bot/` - Telegram worker launched by the RatScan API process;
 - `.env` - optional RatScan runtime settings copied from the local `.env` by `build_ubuntu_bundle.sh`.
 
 The installer creates PostgreSQL locally and writes the final runtime environment

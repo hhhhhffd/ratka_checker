@@ -13,16 +13,19 @@ RATSCAN_API_BASE_URL=http://127.0.0.1:8080
 A Telegram crash is retried without stopping the HTTP API. Stopping RatScan
 stops the worker too; no `ratscan-telegram-bot.service` exists.
 
-For local `cargo run`, prepare the relative virtual environment expected by the
-API process:
+The worker is implemented in `src/telegram/bot.rs` and compiled into the same
+Rust executable. The API launches it with `--telegram-worker`; it continues to
+access RatScan through HTTP. For local development, export the settings above
+and run:
 
 ```sh
-python3 -m venv telegram-venv
-telegram-venv/bin/pip install -r telegram_bot/requirements.txt
 cargo run
 ```
 
-The Docker image and Ubuntu installer create this environment automatically.
+Python and a virtual environment are not required in Docker or Ubuntu installs.
+
+Optional settings remain `TG_BOT_REQUEST_TIMEOUT_SECONDS` (30),
+`TG_BOT_POLL_ATTEMPTS` (24), and `TG_BOT_POLL_INTERVAL_SECONDS` (5).
 
 ## Usage
 

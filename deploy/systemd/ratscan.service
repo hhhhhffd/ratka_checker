@@ -10,7 +10,6 @@ Group=ratscan
 WorkingDirectory=/opt/ratscan
 EnvironmentFile=/etc/ratscan/ratscan.env
 EnvironmentFile=-/etc/ratscan/runtime-secrets.env
-Environment=RATSCAN_TELEGRAM_PYTHON=/opt/ratscan/telegram-venv/bin/python
 ExecStart=/opt/ratscan/bin/ratscan
 Restart=on-failure
 RestartSec=5

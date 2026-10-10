@@ -45,6 +45,9 @@ pub async fn serve() -> anyhow::Result<()> {
 /// Runs the API process after logging setup.
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
+    if std::env::args().nth(1).as_deref() == Some(telegram::WORKER_ARGUMENT) {
+        return telegram::run_worker().await;
+    }
     let telegram_worker = telegram::spawn_if_configured();
     let result = serve().await;
     if let Some(worker) = telegram_worker {

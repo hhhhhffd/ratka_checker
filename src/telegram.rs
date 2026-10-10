@@ -1,6 +1,6 @@
 //! Optional Telegram worker supervised by the RatScan API process.
 //!
-//! The Telegram implementation remains a Python module, but it is a child of
+//! The Telegram implementation runs in Rust, but it is a child of
 //! the API binary: systemd and Docker run one RatScan service only. A failed
 //! Telegram worker is restarted without taking down the HTTP API.
 
@@ -9,12 +9,15 @@ use std::{env, time::Duration};
 use tokio::{process::Command, task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
-const RESTART_DELAY: Duration = Duration::from_secs(5);
+mod bot;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct TelegramProcessConfig {
-    python: String,
+pub(crate) const WORKER_ARGUMENT: &str = "--telegram-worker";
+
+pub(crate) async fn run_worker() -> anyhow::Result<()> {
+    bot::run().await
 }
+
+const RESTART_DELAY: Duration = Duration::from_secs(5);
 
 pub fn spawn_if_configured() -> Option<JoinHandle<()>> {
     if !is_configured(
@@ -25,11 +28,7 @@ pub fn spawn_if_configured() -> Option<JoinHandle<()>> {
         return None;
     }
 
-    let config = TelegramProcessConfig {
-        python: env::var("RATSCAN_TELEGRAM_PYTHON")
-            .unwrap_or_else(|_| "telegram-venv/bin/python".to_owned()),
-    };
-    Some(tokio::spawn(supervise(config)))
+    Some(tokio::spawn(supervise()))
 }
 
 fn is_configured(token: Option<&str>, allowed_user_id: Option<&str>) -> bool {
@@ -37,16 +36,24 @@ fn is_configured(token: Option<&str>, allowed_user_id: Option<&str>) -> bool {
         && allowed_user_id.is_some_and(|value| !value.trim().is_empty())
 }
 
-async fn supervise(config: TelegramProcessConfig) {
+async fn supervise() {
     loop {
-        let mut child = match Command::new(&config.python)
-            .args(["-m", "telegram_bot.bot"])
-            .env("PYTHONDONTWRITEBYTECODE", "1")
+        let executable = match env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                warn!(%error, "failed to locate Telegram worker executable");
+                sleep(RESTART_DELAY).await;
+                continue;
+            }
+        };
+        let mut child = match Command::new(executable)
+            .arg(WORKER_ARGUMENT)
+            .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
             Err(error) => {
-                warn!(%error, python = %config.python, "failed to start Telegram worker");
+                warn!(%error, "failed to start Telegram worker");
                 sleep(RESTART_DELAY).await;
                 continue;
             }
