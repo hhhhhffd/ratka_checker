@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail, Context};
 use reqwest::{multipart, Client, Response};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::{task::JoinSet, time::sleep};
+use tokio::{io::AsyncWriteExt, task::JoinSet, time::sleep};
 use tracing::warn;
 
 const MAX_MESSAGE_LENGTH: usize = 3900;
@@ -66,6 +66,8 @@ struct Message {
     text: Option<String>,
     caption: Option<String>,
     document: Option<Document>,
+    message_thread_id: Option<i64>,
+    is_topic_message: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -106,12 +108,14 @@ impl Bot {
         telegram_response(response).await
     }
 
-    async fn answer(&self, chat_id: i64, text: &str) -> anyhow::Result<i64> {
-        self.call(
-            "sendMessage",
-            json!({"chat_id": chat_id, "text": text, "parse_mode": "HTML"}),
-        )
-        .await?["message_id"]
+    async fn answer(&self, message: &Message, text: &str) -> anyhow::Result<i64> {
+        let mut payload = json!({"chat_id": message.chat.id, "text": text, "parse_mode": "HTML"});
+        if message.is_topic_message == Some(true) {
+            if let Some(thread_id) = message.message_thread_id {
+                payload["message_thread_id"] = json!(thread_id);
+            }
+        }
+        self.call("sendMessage", payload).await?["message_id"]
             .as_i64()
             .context("Telegram returned no message_id")
     }
@@ -148,13 +152,23 @@ impl Bot {
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
-        let bytes = response
+        let mut response = response
             .error_for_status()
-            .map_err(reqwest::Error::without_url)?
-            .bytes()
-            .await
             .map_err(reqwest::Error::without_url)?;
-        let part = multipart::Part::bytes(bytes.to_vec())
+        let tmp_dir = tempfile::Builder::new().prefix("ratscan_tg_").tempdir()?;
+        let file_path = tmp_dir.path().join("upload.jar");
+        let mut destination = tokio::fs::File::create(&file_path).await?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(reqwest::Error::without_url)?
+        {
+            destination.write_all(&chunk).await?;
+        }
+        destination.flush().await?;
+        drop(destination);
+        let part = multipart::Part::file(&file_path)
+            .await?
             .file_name(filename.to_owned())
             .mime_str("application/java-archive")?;
         let response = self
@@ -182,25 +196,34 @@ impl Bot {
         }
     }
 
-    async fn send_report(&self, chat_id: i64, report: &Value, title: &str) -> anyhow::Result<()> {
+    async fn send_report(
+        &self,
+        message: &Message,
+        report: &Value,
+        title: &str,
+    ) -> anyhow::Result<()> {
         let mut summary = format_summary(report, title, true);
         if summary.chars().count() > MAX_MESSAGE_LENGTH {
             summary = format_summary(report, title, false);
         }
-        self.answer(chat_id, &summary).await?;
+        self.answer(message, &summary).await?;
         let part = multipart::Part::bytes(serde_json::to_vec_pretty(report)?).file_name(format!(
             "ratscan-{}.json",
             field(report, "scan_id", "report")
         ));
+        let mut form = multipart::Form::new()
+            .text("chat_id", message.chat.id.to_string())
+            .text("caption", "Полный JSON отчет.")
+            .part("document", part);
+        if message.is_topic_message == Some(true) {
+            if let Some(thread_id) = message.message_thread_id {
+                form = form.text("message_thread_id", thread_id.to_string());
+            }
+        }
         let response = self
             .telegram
             .post(format!("{}/sendDocument", self.telegram_base_url))
-            .multipart(
-                multipart::Form::new()
-                    .text("chat_id", chat_id.to_string())
-                    .text("caption", "Полный JSON отчет.")
-                    .part("document", part),
-            )
+            .multipart(form)
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
@@ -223,13 +246,13 @@ impl Bot {
         );
         match command {
             "start" => {
-                self.answer(chat_id, "Скинь .jar файлом для проверки, используй /id &lt;scan_id&gt; или /sha256 &lt;hash&gt; для поиска отчета.").await?;
+                self.answer(&message, "Скинь .jar файлом для проверки, используй /id &lt;scan_id&gt; или /sha256 &lt;hash&gt; для поиска отчета.").await?;
             }
             "id" | "sha256" | "hash" => {
                 let is_hash = command != "id";
                 if argument.is_empty() {
                     self.answer(
-                        chat_id,
+                        &message,
                         if is_hash {
                             "Формат: /sha256 &lt;64 hex-символа&gt;"
                         } else {
@@ -245,7 +268,7 @@ impl Bot {
                     argument.to_owned()
                 };
                 if is_hash && (id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit())) {
-                    self.answer(chat_id, "SHA-256 должен содержать ровно 64 hex-символа.")
+                    self.answer(&message, "SHA-256 должен содержать ровно 64 hex-символа.")
                         .await?;
                     return Ok(());
                 }
@@ -255,7 +278,7 @@ impl Bot {
                 {
                     Ok(report) => {
                         self.send_report(
-                            chat_id,
+                            &message,
                             &report,
                             if is_hash {
                                 "Отчет по SHA-256"
@@ -268,7 +291,7 @@ impl Bot {
                     Err(error) => {
                         warn!(%error, "failed to fetch report");
                         self.answer(
-                            chat_id,
+                            &message,
                             &format!("Не удалось получить отчет: {}", escape(&error.to_string())),
                         )
                         .await?;
@@ -276,20 +299,20 @@ impl Bot {
                 }
             }
             _ => {
-                if let Some(document) = message.document {
+                if let Some(document) = message.document.as_ref() {
                     let filename = Path::new(document.file_name.as_deref().unwrap_or("upload.jar"))
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("upload.jar");
                     if !filename.to_lowercase().ends_with(".jar") {
-                        self.answer(chat_id, "API принимает только .jar файлы.")
+                        self.answer(&message, "API принимает только .jar файлы.")
                             .await?;
                         return Ok(());
                     }
                     let status_id = self
-                        .answer(chat_id, "Файл получен, запускаю проверку.")
+                        .answer(&message, "Файл получен, запускаю проверку.")
                         .await?;
-                    let report = match self.submit(&document, filename).await {
+                    let report = match self.submit(document, filename).await {
                         Ok(report) => report,
                         Err(error) => {
                             warn!(%error, "failed to submit document");
@@ -317,11 +340,11 @@ impl Bot {
                     )
                     .await?;
                     let final_report = self.wait_for_final_report(scan_id).await?;
-                    self.send_report(chat_id, &final_report, "Отчет по файлу")
+                    self.send_report(&message, &final_report, "Отчет по файлу")
                         .await?;
                 } else {
                     self.answer(
-                        chat_id,
+                        &message,
                         "Скинь .jar файлом, используй /id &lt;scan_id&gt; или /sha256 &lt;hash&gt;.",
                     )
                     .await?;
@@ -552,7 +575,7 @@ pub(super) async fn run() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use axum::{
-        extract::{Multipart, Path as RoutePath, State},
+        extract::{DefaultBodyLimit, Multipart, Path as RoutePath, State},
         http::StatusCode,
         response::{IntoResponse, Response as ServerResponse},
         routing::{get, post},
@@ -568,6 +591,8 @@ mod tests {
         calls: Mutex<Vec<(String, Value)>>,
         uploads: Mutex<Vec<(String, Vec<u8>)>>,
         documents: Mutex<Vec<(String, Value)>>,
+        document_threads: Mutex<Vec<Option<i64>>>,
+        download_body: Mutex<Vec<u8>>,
         scan_requests: AtomicUsize,
     }
 
@@ -601,10 +626,14 @@ mod tests {
         mut form: Multipart,
     ) -> Json<Value> {
         let mut found_document = false;
+        let mut thread_id = None;
         while let Some(field) = form.next_field().await.unwrap() {
             match field.name().unwrap() {
                 "chat_id" => assert_eq!(field.text().await.unwrap(), "42"),
                 "caption" => assert_eq!(field.text().await.unwrap(), "Полный JSON отчет."),
+                "message_thread_id" => {
+                    thread_id = Some(field.text().await.unwrap().parse::<i64>().unwrap())
+                }
                 "document" => {
                     let filename = field.file_name().unwrap().to_owned();
                     let report = serde_json::from_slice(&field.bytes().await.unwrap()).unwrap();
@@ -615,6 +644,7 @@ mod tests {
             }
         }
         assert!(found_document);
+        state.document_threads.lock().unwrap().push(thread_id);
         Json(json!({"ok": true, "result": {"message_id": 11}}))
     }
 
@@ -653,16 +683,20 @@ mod tests {
 
     async fn fixture() -> Fixture {
         let state = Arc::new(MockState::default());
+        *state.download_body.lock().unwrap() = b"jar contents".to_vec();
         let router = Router::new()
             .route("/telegram/sendDocument", post(send_document))
             .route("/telegram/{method}", post(telegram_method))
             .route(
                 "/files/archive.jar",
-                get(|| async { b"jar contents".to_vec() }),
+                get(|State(state): State<Arc<MockState>>| async move {
+                    state.download_body.lock().unwrap().clone()
+                }),
             )
             .route("/v1/scans", post(upload))
             .route("/v1/scans/{id}", get(scan))
             .route("/v1/hashes/{hash}", get(hash_report))
+            .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
             .with_state(Arc::clone(&state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -697,6 +731,8 @@ mod tests {
             text: Some(text.into()),
             caption: None,
             document: None,
+            message_thread_id: None,
+            is_topic_message: None,
         }
     }
 
@@ -771,6 +807,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_status_summary_and_json_stay_in_forum_topic() {
+        let fixture = fixture().await;
+        let incoming: Message = serde_json::from_value(json!({
+            "chat": {"id": 42}, "from": {"id": 7},
+            "document": {"file_id": "file-1", "file_name": "mod.jar"},
+            "message_thread_id": 77, "is_topic_message": true,
+        }))
+        .unwrap();
+        fixture.bot.handle(incoming).await.unwrap();
+        let calls = fixture.state.calls.lock().unwrap();
+        let messages: Vec<_> = calls
+            .iter()
+            .filter(|(method, _)| method == "sendMessage")
+            .collect();
+        assert_eq!(messages.len(), 2);
+        for (_, payload) in messages {
+            assert_eq!(payload["message_thread_id"], 77);
+        }
+        assert_eq!(
+            *fixture.state.document_threads.lock().unwrap(),
+            vec![Some(77)]
+        );
+    }
+
+    #[tokio::test]
+    async fn large_document_is_streamed_without_corrupting_bytes() {
+        let fixture = fixture().await;
+        let expected: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        *fixture.state.download_body.lock().unwrap() = expected.clone();
+        let document = Document {
+            file_id: "file-1".into(),
+            file_name: Some("large.jar".into()),
+        };
+        fixture.bot.submit(&document, "large.jar").await.unwrap();
+        assert_eq!(
+            *fixture.state.uploads.lock().unwrap(),
+            vec![("large.jar".into(), expected)]
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_non_jar_without_downloading() {
         let fixture = fixture().await;
         let mut message = message("");
@@ -833,7 +912,7 @@ mod tests {
         let report = json!({"scan_id": "long", "findings": [{"rule_id": "test", "severity": "high", "message": "x".repeat(4000)}]});
         fixture
             .bot
-            .send_report(42, &report, "Полный отчет")
+            .send_report(&message(""), &report, "Полный отчет")
             .await
             .unwrap();
         let calls = fixture.state.calls.lock().unwrap();
