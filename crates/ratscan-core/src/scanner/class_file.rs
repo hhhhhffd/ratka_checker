@@ -9,6 +9,17 @@ pub struct ClassFileData {
     /// Method-level data used by later correlation passes. Parsing this data is
     /// deliberately static: no class, resource, or native code is executed.
     pub methods: Vec<MethodScanData>,
+    /// Distinct bootstrap methods referenced by `invokedynamic` and dynamic
+    /// constants, excluding JDK and known language-runtime factories.
+    pub custom_bootstrap_methods: Vec<BootstrapMethodRef>,
+}
+
+/// A bootstrap method that links an `invokedynamic` call site or a dynamic constant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BootstrapMethodRef {
+    pub owner: String,
+    pub name: String,
+    pub descriptor: String,
 }
 
 /// Static representation of one JVM method body.
@@ -189,7 +200,11 @@ enum ConstantPoolEntry {
         name_and_type_index: u16,
     },
     Dynamic {
+        bootstrap_method_attr_index: u16,
         name_and_type_index: u16,
+    },
+    MethodHandle {
+        reference_index: u16,
     },
     Other,
 }
@@ -227,7 +242,8 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
         class_name.as_deref().unwrap_or_default(),
         &mut methods,
     )?;
-    skip_attributes(&mut cursor)?;
+    let bootstrap_method_handles = parse_bootstrap_method_handles(&mut cursor, &entries)?;
+    let custom_bootstrap_methods = custom_bootstrap_methods(&entries, &bootstrap_method_handles);
 
     let mut strings = constant_pool_strings(&entries);
     strings.extend(integer_ip_strings(&entries));
@@ -258,6 +274,7 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
         class_name,
         major_version,
         methods,
+        custom_bootstrap_methods,
     })
 }
 
@@ -302,8 +319,8 @@ fn parse_constant_pool(cursor: &mut ClassCursor<'_>) -> anyhow::Result<Vec<Const
                 };
             }
             17 | 18 => {
-                cursor.skip(2)?;
                 entries[index] = ConstantPoolEntry::Dynamic {
+                    bootstrap_method_attr_index: cursor.read_u16()?,
                     name_and_type_index: cursor.read_u16()?,
                 };
             }
@@ -315,7 +332,10 @@ fn parse_constant_pool(cursor: &mut ClassCursor<'_>) -> anyhow::Result<Vec<Const
                 index += 1;
             }
             15 => {
-                cursor.skip(3)?;
+                let _reference_kind = cursor.read_u8()?;
+                entries[index] = ConstantPoolEntry::MethodHandle {
+                    reference_index: cursor.read_u16()?,
+                };
             }
             16 | 19 | 20 => {
                 cursor.skip(2)?;
@@ -422,6 +442,87 @@ fn parse_methods(
         }
     }
     Ok(())
+}
+
+/// Reads the class-level attributes and returns the method-handle index of each
+/// `BootstrapMethods` entry; bootstrap arguments are not needed for scoring.
+fn parse_bootstrap_method_handles(
+    cursor: &mut ClassCursor<'_>,
+    entries: &[ConstantPoolEntry],
+) -> anyhow::Result<Vec<u16>> {
+    let mut handles = Vec::new();
+    let attribute_count = cursor.read_u16()? as usize;
+    for _ in 0..attribute_count {
+        let attribute_name_index = cursor.read_u16()?;
+        let attribute_length = cursor.read_u32()? as usize;
+        let attribute_bytes = cursor.read_bytes(attribute_length)?;
+        if utf8(entries, attribute_name_index) != Some("BootstrapMethods") {
+            continue;
+        }
+        let mut attribute = ClassCursor::new(attribute_bytes);
+        let bootstrap_count = attribute.read_u16()? as usize;
+        for _ in 0..bootstrap_count {
+            handles.push(attribute.read_u16()?);
+            let argument_count = attribute.read_u16()? as usize;
+            attribute.skip(argument_count * 2)?;
+        }
+    }
+    Ok(handles)
+}
+
+/// Resolves bootstrap methods actually referenced from the constant pool and
+/// keeps those outside the factories emitted by javac and common JVM languages.
+fn custom_bootstrap_methods(
+    entries: &[ConstantPoolEntry],
+    bootstrap_method_handles: &[u16],
+) -> Vec<BootstrapMethodRef> {
+    let mut methods = Vec::new();
+    for entry in entries {
+        let ConstantPoolEntry::Dynamic {
+            bootstrap_method_attr_index,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let Some(method) = bootstrap_method_handles
+            .get(*bootstrap_method_attr_index as usize)
+            .and_then(|handle| resolve_method_handle(entries, *handle))
+        else {
+            continue;
+        };
+        if !is_standard_bootstrap_owner(&method.owner) && !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+    methods
+}
+
+fn resolve_method_handle(entries: &[ConstantPoolEntry], index: u16) -> Option<BootstrapMethodRef> {
+    let ConstantPoolEntry::MethodHandle { reference_index } = entries.get(index as usize)? else {
+        return None;
+    };
+    let ConstantPoolEntry::Ref {
+        class_index,
+        name_and_type_index,
+        ..
+    } = entries.get(*reference_index as usize)?
+    else {
+        return None;
+    };
+    let (name, descriptor) = resolve_name_and_type(entries, *name_and_type_index)?;
+    Some(BootstrapMethodRef {
+        owner: resolve_class_name(entries, *class_index)?,
+        name,
+        descriptor,
+    })
+}
+
+fn is_standard_bootstrap_owner(owner: &str) -> bool {
+    owner.starts_with("java/lang/invoke/")
+        || owner.starts_with("java/lang/runtime/")
+        || owner.starts_with("scala/runtime/")
+        || owner.starts_with("org/codehaus/groovy/vmplugin/")
 }
 
 fn skip_attributes(cursor: &mut ClassCursor<'_>) -> anyhow::Result<()> {
@@ -1044,6 +1145,7 @@ fn resolve_dynamic_ref(
 ) -> Option<(String, String, String)> {
     let ConstantPoolEntry::Dynamic {
         name_and_type_index,
+        ..
     } = entries.get(index as usize)?
     else {
         return None;
@@ -1341,6 +1443,58 @@ mod tests {
         assert!(
             error.to_string().contains("invalid class magic")
                 || error.to_string().contains("truncated")
+        );
+    }
+
+    /// Obfuscators link hidden calls through mod-defined bootstraps; javac
+    /// lambdas use JDK factories and must not be reported.
+    #[test]
+    fn reports_only_non_standard_bootstrap_methods() {
+        use super::ConstantPoolEntry::*;
+        let bootstrap_ref = |class_index, name_and_type_index| Ref {
+            tag: 10,
+            class_index,
+            name_and_type_index,
+        };
+        let entries = vec![
+            Other,
+            Class { name_index: 2 },
+            Utf8("example/Hidden".to_owned()),
+            NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            Utf8("bootstrap".to_owned()),
+            Utf8("(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;".to_owned()),
+            bootstrap_ref(1, 3),
+            MethodHandle { reference_index: 6 },
+            Class { name_index: 9 },
+            Utf8("java/lang/invoke/LambdaMetafactory".to_owned()),
+            bootstrap_ref(8, 3),
+            MethodHandle { reference_index: 10 },
+            Dynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 3,
+            },
+            Dynamic {
+                bootstrap_method_attr_index: 1,
+                name_and_type_index: 3,
+            },
+            Dynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 3,
+            },
+        ];
+
+        let methods = super::custom_bootstrap_methods(&entries, &[7, 11]);
+
+        assert_eq!(
+            methods,
+            vec![super::BootstrapMethodRef {
+                owner: "example/Hidden".to_owned(),
+                name: "bootstrap".to_owned(),
+                descriptor: "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;".to_owned(),
+            }]
         );
     }
 

@@ -645,6 +645,7 @@ mod tests {
             dependency_version: None,
             reachable_from_entrypoint: true,
             classification_confidence: Confidence::High,
+            custom_bootstrap_methods: Vec::new(),
         }
     }
 

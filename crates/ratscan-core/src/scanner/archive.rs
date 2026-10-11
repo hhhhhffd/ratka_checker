@@ -17,7 +17,8 @@ use crate::{
     scanner::{
         asset,
         class_file::{
-            self, CallSite, ConstantValue, ControlFlowEdgeKind, MethodScanData, ValueOrigin,
+            self, BootstrapMethodRef, CallSite, ConstantValue, ControlFlowEdgeKind, MethodScanData,
+            ValueOrigin,
         },
         context_recognizers,
         dataflow::{
@@ -54,6 +55,8 @@ const NATIVE_LIB_REMOTE_LOAD_SIGNAL: &str = "native_lib_remote_load";
 const SCRIPT_DOWNLOAD_EXEC_SIGNAL: &str = "script_download_exec";
 const EXTERNAL_URLCLASSLOADER_SIGNAL: &str = "urlclassloader_external_target";
 const PRIVACY_NETWORK_SYNC_RULE_ID: &str = "PRIVACY_NETWORK_SYNC";
+const CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID: &str = "CUSTOM_INVOKEDYNAMIC_BOOTSTRAP";
+const MAX_CUSTOM_BOOTSTRAP_EVIDENCE: usize = 5;
 const CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID: &str = "CONFIRMED_REMOTE_MEMORY_LOAD";
 const CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID: &str = "CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER";
 const CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID: &str = "CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD";
@@ -175,6 +178,7 @@ pub struct ClassScanData {
     pub dependency_version: Option<String>,
     pub reachable_from_entrypoint: bool,
     pub classification_confidence: Confidence,
+    pub custom_bootstrap_methods: Vec<BootstrapMethodRef>,
 }
 
 /// Complete scanner result ready to persist after risk scoring.
@@ -233,6 +237,7 @@ fn scan_bytes(
     findings.retain(|finding| finding.category != "obfuscation");
     findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
+    findings.extend(custom_invokedynamic_bootstrap_finding(&context.data));
     let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
@@ -819,6 +824,7 @@ impl ArchiveContext {
                         dependency_version: None,
                         reachable_from_entrypoint: false,
                         classification_confidence: Confidence::Low,
+                        custom_bootstrap_methods: class_data.custom_bootstrap_methods,
                     });
                     self.data.strings.extend(class_data.strings);
                     self.data.bytecode_refs.extend(class_data.bytecode_refs);
@@ -1532,6 +1538,57 @@ fn add_contextual_findings(findings: &mut Vec<Finding>, data: &ScanData) {
             related_chain_id: None,
         });
     }
+}
+
+/// javac, Kotlin, Scala, and Groovy link `invokedynamic` only through their
+/// runtime factories. A bootstrap defined by the mod resolves call targets at
+/// runtime, so network, session, and loader calls disappear from static call
+/// sites; that alone makes a clean verdict unreliable.
+fn custom_invokedynamic_bootstrap_finding(data: &ScanData) -> Option<Finding> {
+    let evidence = data
+        .class_files
+        .iter()
+        .filter(|class_file| {
+            matches!(
+                class_file.scope,
+                CodeScope::FirstParty | CodeScope::NestedMod | CodeScope::Unknown
+            )
+        })
+        .flat_map(|class_file| {
+            class_file
+                .custom_bootstrap_methods
+                .iter()
+                .map(move |bootstrap| Evidence {
+                    archive_id: class_file.archive_id.clone(),
+                    archive_path: class_file.archive_path.clone(),
+                    class_name: class_file.class_name.clone(),
+                    method_name: Some(bootstrap.name.clone()),
+                    method_descriptor: Some(bootstrap.descriptor.clone()),
+                    bytecode_offset: None,
+                    resource_path: Some(class_file.path.clone()),
+                    operation: "custom_invokedynamic_bootstrap".to_owned(),
+                    value_preview: Some(format!("{}.{}", bootstrap.owner, bootstrap.name)),
+                    source_value: None,
+                    target_value: None,
+                    confidence: Confidence::High,
+                    scope: class_file.scope.clone(),
+                })
+        })
+        .take(MAX_CUSTOM_BOOTSTRAP_EVIDENCE)
+        .collect::<Vec<_>>();
+    let scope = evidence.first()?.scope.clone();
+    Some(Finding {
+        rule_id: CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID.to_owned(),
+        category: "evasion".to_owned(),
+        kind: crate::models::scan::FindingKind::Finding,
+        severity: Severity::High,
+        confidence: Confidence::High,
+        score_contribution: 40,
+        scope,
+        message: "Код мода связывает invokedynamic через собственный bootstrap-метод: реальные вызовы определяются только во время выполнения и скрыты от статического анализа. Так работают обфускаторы, маскирующие сетевые и загрузочные вызовы.".to_owned(),
+        evidence,
+        related_chain_id: None,
+    })
 }
 
 fn has_privacy_network_sync(data: &ScanData) -> bool {
@@ -3770,11 +3827,12 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 #[cfg(test)]
 mod tests {
     use super::{
-        add_contextual_findings, confirmed_remote_memory_load, file_target_from_origin,
+        add_contextual_findings, confirmed_remote_memory_load,
+        custom_invokedynamic_bootstrap_finding, file_target_from_origin, finalize_report,
         has_significant_identifier_overlap, is_credential_target, parse_zip_bytes, risk_score,
         scan_file, summarize, verdict_from_evidence, ArchiveContext, ClassScanData, ScanData,
-        ScanLimits, EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID,
-        REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
+        ScanLimits, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
+        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
     use crate::models::scan::{
@@ -3784,8 +3842,8 @@ mod tests {
     use crate::rules::engine::RulesEngine;
     use crate::scanner::{
         class_file::{
-            CallSite, ConstantValue, ControlFlowEdge, ControlFlowEdgeKind, FieldAccess,
-            Instruction, InvokeKind, LoadedConstant, MethodScanData, ValueOrigin,
+            BootstrapMethodRef, CallSite, ConstantValue, ControlFlowEdge, ControlFlowEdgeKind,
+            FieldAccess, Instruction, InvokeKind, LoadedConstant, MethodScanData, ValueOrigin,
         },
         dataflow::FileTarget,
         obfuscation::DecodedValue,
@@ -4361,6 +4419,7 @@ mod tests {
             dependency_version: None,
             reachable_from_entrypoint: false,
             classification_confidence: Confidence::High,
+            custom_bootstrap_methods: Vec::new(),
         }]);
 
         context.add_correlation_signals();
@@ -4389,6 +4448,7 @@ mod tests {
                 dependency_version: None,
                 reachable_from_entrypoint: false,
                 classification_confidence: Confidence::High,
+                custom_bootstrap_methods: Vec::new(),
             },
             ClassScanData {
                 archive_id: "archive-0".to_owned(),
@@ -4404,6 +4464,7 @@ mod tests {
                 dependency_version: None,
                 reachable_from_entrypoint: false,
                 classification_confidence: Confidence::High,
+                custom_bootstrap_methods: Vec::new(),
             },
         ]);
 
@@ -4435,6 +4496,7 @@ mod tests {
             dependency_version: None,
             reachable_from_entrypoint: false,
             classification_confidence: Confidence::High,
+            custom_bootstrap_methods: Vec::new(),
         }]);
 
         context.add_class_correlation_signals();
@@ -4466,6 +4528,7 @@ mod tests {
             dependency_version: None,
             reachable_from_entrypoint: false,
             classification_confidence: Confidence::High,
+            custom_bootstrap_methods: Vec::new(),
         }]);
 
         context.add_class_correlation_signals();
@@ -4625,6 +4688,72 @@ mod tests {
         );
     }
 
+    /// Mod-defined invokedynamic bootstraps hide call targets, so the result cannot be clean.
+    #[test]
+    fn custom_invokedynamic_bootstrap_is_suspicious_outside_dependencies() {
+        let bootstrap = BootstrapMethodRef {
+            owner: "example/Hidden".to_owned(),
+            name: "bootstrap".to_owned(),
+            descriptor: "()V".to_owned(),
+        };
+        let class_with_bootstrap = |scope| ClassScanData {
+            class_name: Some("example/Hidden".to_owned()),
+            scope,
+            custom_bootstrap_methods: vec![bootstrap.clone()],
+            ..Default::default()
+        };
+        let dependency_only = ScanData {
+            class_files: vec![class_with_bootstrap(CodeScope::BundledDependency)],
+            ..Default::default()
+        };
+        assert!(custom_invokedynamic_bootstrap_finding(&dependency_only).is_none());
+
+        let first_party = ScanData {
+            class_files: vec![class_with_bootstrap(CodeScope::FirstParty)],
+            ..Default::default()
+        };
+        let finding = custom_invokedynamic_bootstrap_finding(&first_party)
+            .expect("first-party custom bootstrap is reported");
+        assert_eq!(finding.rule_id, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID);
+        assert_eq!(
+            finding.evidence[0].value_preview.as_deref(),
+            Some("example/Hidden.bootstrap")
+        );
+        let (verdict, risk_score, _) = finalize_report(&[finding], &[], &Obfuscation::default());
+        assert_eq!(verdict, Verdict::Suspicious);
+        assert!(risk_score > 5);
+    }
+
+    /// A stealer that hides its webhook POST behind indy/condy bootstraps was
+    /// previously reported as clean.
+    #[test]
+    fn real_custom_bootstrap_stealer_is_not_clean() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sample = root.join("tests/realmods/jei-7.8.0.1011.jar");
+        if !sample.is_file() {
+            // The real-mod corpus is intentionally local.
+            return;
+        }
+        let rules = RulesEngine::load_from_file(&root.join("config/rules.yaml"))
+            .expect("production rules load");
+        let limits = ScanLimits {
+            max_total_uncompressed_bytes: 200 * 1024 * 1024,
+            max_files_in_archive: 5_000,
+            max_nesting_depth: 3,
+            max_single_file_bytes: 50 * 1024 * 1024,
+        };
+
+        let outcome = scan_file(&sample, limits, &rules);
+
+        assert_eq!(outcome.report.verdict, Verdict::Suspicious);
+        assert_eq!(outcome.report.obfuscation.level, ObfuscationLevel::High);
+        assert!(outcome
+            .report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID));
+    }
+
     /// Real mods previously received false positives from isolated API, asset, and namespace facts.
     #[test]
     fn real_mods_are_clean_without_confirmed_dangerous_chains() {
@@ -4744,6 +4873,7 @@ mod tests {
             dependency_version: None,
             reachable_from_entrypoint: true,
             classification_confidence: Confidence::High,
+            custom_bootstrap_methods: Vec::new(),
         }
     }
 

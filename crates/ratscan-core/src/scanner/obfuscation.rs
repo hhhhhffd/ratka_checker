@@ -126,6 +126,17 @@ pub fn analyze(data: &ScanData) -> ObfuscationAnalysis {
         signals.push("string_decoder_methods".to_owned());
     }
 
+    // Mod-defined bootstraps hide real call targets behind runtime linkage.
+    if data
+        .class_files
+        .iter()
+        .filter(|class| is_analyzable_scope(&class.scope))
+        .any(|class| !class.custom_bootstrap_methods.is_empty())
+    {
+        score = score.saturating_add(60);
+        signals.push("custom_invokedynamic_bootstrap".to_owned());
+    }
+
     if data
         .resource_files
         .iter()
