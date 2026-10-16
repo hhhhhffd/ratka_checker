@@ -63,6 +63,7 @@ const CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID: &str = "CONFIRMED_ENCODED_N
 const CONFIRMED_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_WEBHOOK_EXFIL";
 const CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID: &str = "CREDENTIAL_WEBHOOK_CO_LOCATION";
 const SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID: &str = "SESSION_CHAT_EXFIL_CO_LOCATION";
+const EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID: &str = "EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
@@ -241,6 +242,7 @@ fn scan_bytes(
     findings.extend(custom_invokedynamic_bootstrap_finding(&context.data));
     findings.extend(credential_webhook_co_location_finding(&context.data));
     findings.extend(session_chat_exfil_co_location_finding(&context.data));
+    findings.extend(executable_download_exec_co_location_finding(&context.data));
     let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
@@ -1652,6 +1654,65 @@ fn credential_webhook_co_location_finding(data: &ScanData) -> Option<Finding> {
                 related_chain_id: None,
             })
         })
+}
+
+/// Lowercase extensions of files that a process launcher can run directly.
+const EXECUTABLE_URL_SUFFIXES: &[&str] = &[
+    ".jar", ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".sh",
+];
+
+const PROCESS_LAUNCH_MARKERS: &[&str] = &["java/lang/ProcessBuilder", "java/lang/Runtime.exec"];
+
+/// Flags a single class that holds an http(s) URL of an executable file, an HTTP client, and a
+/// process launcher. The flow analysis confirms only download-write-exec chains, so a guarded
+/// or write-less updater would otherwise score nothing; the co-location alone is not proof of
+/// execution, hence suspicious rather than malicious.
+fn executable_download_exec_co_location_finding(data: &ScanData) -> Option<Finding> {
+    data.class_files.iter().find_map(|class_file| {
+        let url = class_file
+            .strings
+            .iter()
+            .find(|value| is_executable_url(value))?;
+        let sink = first_class_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS)?;
+        let launcher = first_class_marker_in_refs(&class_file.bytecode_refs, PROCESS_LAUNCH_MARKERS)?;
+        Some(Finding {
+            rule_id: EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID.to_owned(),
+            category: "correlation".to_owned(),
+            kind: crate::models::scan::FindingKind::Finding,
+            severity: Severity::High,
+            confidence: Confidence::Medium,
+            score_contribution: 60,
+            scope: class_file.scope.clone(),
+            message: "Класс содержит адрес исполняемого файла, HTTP-клиент и запуск процесса. Статически не доказано, что скачанный файл запускается, но такая связка типична для загрузчика.".to_owned(),
+            evidence: vec![Evidence {
+                archive_id: class_file.archive_id.clone(),
+                archive_path: class_file.archive_path.clone(),
+                class_name: class_file.class_name.clone(),
+                method_name: None,
+                method_descriptor: None,
+                bytecode_offset: None,
+                resource_path: Some(class_file.path.clone()),
+                operation: "executable_url_http_and_process_refs".to_owned(),
+                value_preview: Some(format!("{url}; {sink}; {launcher}")),
+                source_value: None,
+                target_value: None,
+                confidence: Confidence::Medium,
+                scope: class_file.scope.clone(),
+            }],
+            related_chain_id: None,
+        })
+    })
+}
+
+fn is_executable_url(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    if !lowered.starts_with("http://") && !lowered.starts_with("https://") {
+        return false;
+    }
+    let path = lowered.split(['?', '#']).next().unwrap_or_default();
+    EXECUTABLE_URL_SUFFIXES
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
 }
 
 /// Minecraft session (account token) or chat-event access that shares a class with an outbound
@@ -3977,11 +4038,12 @@ mod tests {
     use super::{
         add_contextual_findings, confirmed_remote_memory_load,
         credential_webhook_co_location_finding, custom_invokedynamic_bootstrap_finding,
-        file_target_from_origin, finalize_report, has_significant_identifier_overlap,
-        is_credential_target, parse_zip_bytes, risk_score, scan_file,
-        session_chat_exfil_co_location_finding, summarize, verdict_from_evidence, ArchiveContext,
-        ClassScanData, ScanData, ScanLimits, CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID,
-        CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
+        executable_download_exec_co_location_finding, file_target_from_origin, finalize_report,
+        has_significant_identifier_overlap, is_credential_target, parse_zip_bytes, risk_score,
+        scan_file, session_chat_exfil_co_location_finding, summarize, verdict_from_evidence,
+        ArchiveContext, ClassScanData, ScanData, ScanLimits,
+        CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID,
+        EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
         PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
         SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID, TIMESTAMP_OUTLIER_SIGNAL,
     };
@@ -4926,6 +4988,52 @@ mod tests {
         let finding = credential_webhook_co_location_finding(&nested_in_declared_jar)
             .expect("a stealer hidden in a declared nested jar is reported");
         assert_eq!(finding.scope, CodeScope::BundledDependency);
+    }
+
+    /// Mirrors the HubLauncher "2-suspicious" test mod: a guarded updater that fetches a jar
+    /// and launches `java -jar` without a confirmed file write.
+    #[test]
+    fn executable_url_http_client_and_process_launch_in_one_class_is_suspicious() {
+        let class = |strings: &[&str], refs: &[&str]| ClassScanData {
+            class_name: Some("hubtest/FakeUpdater".to_owned()),
+            scope: CodeScope::FirstParty,
+            strings: strings.iter().map(|value| (*value).to_owned()).collect(),
+            bytecode_refs: refs.iter().map(|value| (*value).to_owned()).collect(),
+            ..Default::default()
+        };
+        let refs = [
+            "java/net/URL",
+            "java/net/HttpURLConnection",
+            "java/lang/ProcessBuilder.start",
+        ];
+        let updater = ScanData {
+            class_files: vec![class(&["https://example.com/update.jar"], &refs)],
+            ..Default::default()
+        };
+        let finding = executable_download_exec_co_location_finding(&updater)
+            .expect("executable URL, HTTP client and process launch in one class are reported");
+        assert_eq!(
+            finding.rule_id,
+            EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID
+        );
+        let (verdict, _, _) = finalize_report(&[finding], &[], &Obfuscation::default());
+        assert_eq!(verdict, Verdict::Suspicious);
+
+        // A non-executable URL (version check) next to a browser launch is ordinary.
+        let version_check = ScanData {
+            class_files: vec![class(&["https://example.com/versions.json?jar=1"], &refs)],
+            ..Default::default()
+        };
+        assert!(executable_download_exec_co_location_finding(&version_check).is_none());
+
+        let no_launcher = ScanData {
+            class_files: vec![class(
+                &["https://example.com/update.jar"],
+                &["java/net/URL", "java/net/HttpURLConnection"],
+            )],
+            ..Default::default()
+        };
+        assert!(executable_download_exec_co_location_finding(&no_launcher).is_none());
     }
 
     /// A class that reads the account session or chat events and also opens an HTTP
