@@ -1,7 +1,7 @@
 {
   "name": "obfuscated clean mod",
   "scenario": "obfuscated_clean",
-  "expected_verdict": "suspicious",
+  "expected_verdict": "unknown",
   "risk_score": { "min": 0, "max": 10 },
   "required_findings": [],
   "forbidden_findings": ["CORRELATION_DOWNLOAD_WRITE_EXEC", "REMOTE_CLASS_LOADING"],

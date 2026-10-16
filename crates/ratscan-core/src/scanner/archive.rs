@@ -70,7 +70,6 @@ const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
 const TIMESTAMP_DOMINANT_PERCENT: usize = 90;
 const SHORT_CLASS_NAME_MIN_CLASSES: usize = 8;
 const SHORT_CLASS_NAME_PERCENT: usize = 70;
-const MIN_COVERAGE_FOR_CLEAN_WITH_HIGH_OBFUSCATION: u8 = 70;
 const NETWORK_APIS: &[&str] = &[
     "java/net/Socket",
     "java/net/URL",
@@ -1658,21 +1657,29 @@ fn credential_webhook_co_location_finding(data: &ScanData) -> Option<Finding> {
 /// Minecraft session (account token) or chat-event access that shares a class with an outbound
 /// HTTP client is account theft: the transport is only reachable from the stolen data path.
 /// Obfuscated call sites are invisible to direct call matching, so the class constant pool is used.
+/// Session classes are listed for each mapping a production jar can carry: MCP (Forge <= 1.16),
+/// Mojang (Forge/NeoForge 1.17+), and Fabric intermediary.
 const SESSION_CHAT_SOURCE_MARKERS: &[&str] = &[
     "net/minecraft/util/Session",
+    "net/minecraft/client/User",
+    "net/minecraft/class_320",
     "net/minecraftforge/client/event/ClientChatEvent",
+    "net/neoforged/neoforge/client/event/ClientChatEvent",
+    "net/fabricmc/fabric/api/client/message/v1/ClientSendMessageEvents",
 ];
 
 const HTTP_SINK_MARKERS: &[&str] = &[
     "java/net/URL",
     "java/net/HttpURLConnection",
+    "javax/net/ssl/HttpsURLConnection",
     "java/net/http/HttpClient",
 ];
 
 fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
     data.class_files.iter().find_map(|class_file| {
-        let source = first_marker_in_refs(&class_file.bytecode_refs, SESSION_CHAT_SOURCE_MARKERS)?;
-        let sink = first_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS)?;
+        let source =
+            first_class_marker_in_refs(&class_file.bytecode_refs, SESSION_CHAT_SOURCE_MARKERS)?;
+        let sink = first_class_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS)?;
         Some(Finding {
             rule_id: SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID.to_owned(),
             category: "credential_theft".to_owned(),
@@ -1702,11 +1709,16 @@ fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
     })
 }
 
-fn first_marker_in_refs(refs: &[String], markers: &[&'static str]) -> Option<&'static str> {
-    markers
-        .iter()
-        .copied()
-        .find(|marker| refs.iter().any(|value| value.contains(marker)))
+/// Matches whole class names only: a bare class or member reference, or a type descriptor.
+/// Plain substring matching would let `java/net/URL` match `java/net/URLEncoder`.
+fn first_class_marker_in_refs(refs: &[String], markers: &[&'static str]) -> Option<&'static str> {
+    markers.iter().copied().find(|marker| {
+        let member_prefix = format!("{marker}.");
+        let descriptor = format!("L{marker};");
+        refs.iter().any(|value| {
+            value == marker || value.starts_with(&member_prefix) || value.contains(&descriptor)
+        })
+    })
 }
 
 fn first_marker_in(values: &[String], markers: &[&'static str]) -> Option<&'static str> {
@@ -3830,9 +3842,14 @@ fn verdict_from_evidence(
     let trusted_vt_detection = findings
         .iter()
         .any(|finding| finding.rule_id == "VT_TRUSTED_MALICIOUS_ENGINE");
-    let session_exfiltration = findings
-        .iter()
-        .any(|finding| finding.rule_id == SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID);
+    // Only the mod's own code is decisive; in bundled libraries the co-location is left to scoring.
+    let session_exfiltration = findings.iter().any(|finding| {
+        finding.rule_id == SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID
+            && matches!(
+                finding.scope,
+                CodeScope::FirstParty | CodeScope::NestedMod | CodeScope::Unknown
+            )
+    });
     if has_malicious_chain || trusted_vt_detection || session_exfiltration {
         return Verdict::Malicious;
     }
@@ -3843,7 +3860,8 @@ fn verdict_from_evidence(
     }
 }
 
-/// Prevents a clean verdict when obfuscation and low coverage make a negative result unreliable.
+/// Prevents a clean verdict when obfuscation or missing flow coverage makes a negative result
+/// unreliable.
 fn apply_analysis_limits(
     verdict: Verdict,
     obfuscation: &Obfuscation,
@@ -3853,20 +3871,14 @@ fn apply_analysis_limits(
     let incomplete_obfuscated_network_flow = has_first_party_network_calls
         && analysis_coverage.method_flow_coverage == 0
         && !matches!(obfuscation.level, ObfuscationLevel::None);
+    // Obfuscation hides what the code does, so an absence of findings is not proof of safety.
     if verdict == Verdict::Clean
-        && ((obfuscation.level == ObfuscationLevel::High
-            && analysis_coverage.overall_score < MIN_COVERAGE_FOR_CLEAN_WITH_HIGH_OBFUSCATION)
-            || incomplete_obfuscated_network_flow)
-    {
-        Verdict::Unknown
-    } else if verdict == Verdict::Clean
-        && matches!(
+        && (matches!(
             obfuscation.level,
             ObfuscationLevel::Medium | ObfuscationLevel::High
-        )
+        ) || incomplete_obfuscated_network_flow)
     {
-        // Obfuscation hides what the code does, so an absence of findings is not proof of safety.
-        Verdict::Suspicious
+        Verdict::Unknown
     } else {
         verdict
     }
@@ -4152,10 +4164,10 @@ mod tests {
             super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, true),
             Verdict::Unknown
         );
-        // Any detectable obfuscation keeps a clean verdict from being trusted.
+        // Medium or high obfuscation keeps a clean verdict from being trusted; low does not.
         assert_eq!(
             super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, false),
-            Verdict::Suspicious
+            Verdict::Unknown
         );
         let low = Obfuscation {
             level: ObfuscationLevel::Low,
@@ -4944,6 +4956,23 @@ mod tests {
             ..Default::default()
         };
         assert!(session_chat_exfil_co_location_finding(&session_only).is_none());
+
+        // URL helpers share a prefix with `java/net/URL` but are not an HTTP client.
+        let session_and_url_helper = ScanData {
+            class_files: vec![class(&[
+                "net/minecraft/client/User",
+                "java/net/URLEncoder.encode",
+            ])],
+            ..Default::default()
+        };
+        assert!(session_chat_exfil_co_location_finding(&session_and_url_helper).is_none());
+
+        // In a bundled library the co-location is scored, not decisive.
+        let mut bundled = session_chat_exfil_co_location_finding(&exfil)
+            .expect("session access and HTTP client in one class is reported");
+        bundled.scope = CodeScope::BundledDependency;
+        let (verdict, _, _) = finalize_report(&[bundled], &[], &Obfuscation::default());
+        assert_eq!(verdict, Verdict::Suspicious);
     }
 
     /// A stealer that hides its webhook POST behind indy/condy bootstraps was
