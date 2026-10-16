@@ -61,6 +61,7 @@ const CONFIRMED_REMOTE_MEMORY_LOAD_RULE_ID: &str = "CONFIRMED_REMOTE_MEMORY_LOAD
 const CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID: &str = "CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER";
 const CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID: &str = "CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD";
 const CONFIRMED_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_WEBHOOK_EXFIL";
+const CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID: &str = "CREDENTIAL_WEBHOOK_CO_LOCATION";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
@@ -238,6 +239,7 @@ fn scan_bytes(
     findings.extend(contextual_results.findings);
     add_contextual_findings(&mut findings, &context.data);
     findings.extend(custom_invokedynamic_bootstrap_finding(&context.data));
+    findings.extend(credential_webhook_co_location_finding(&context.data));
     let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
@@ -1589,6 +1591,73 @@ fn custom_invokedynamic_bootstrap_finding(data: &ScanData) -> Option<Finding> {
         evidence,
         related_chain_id: None,
     })
+}
+
+/// Lowercase markers of browser, Discord, and launcher credential stores.
+const CREDENTIAL_STORE_MARKERS: &[&str] = &[
+    "login data",
+    "local state",
+    "local storage\\leveldb",
+    "local storage/leveldb",
+];
+
+/// Lowercase prefixes of webhook endpoints that accept arbitrary POST bodies.
+const WEBHOOK_MARKERS: &[&str] = &[
+    "discord.com/api/webhooks/",
+    "discordapp.com/api/webhooks/",
+    "hooks.slack.com/services/",
+];
+
+/// Flags a single class that holds both a credential store path and a webhook endpoint.
+/// The exfiltration call is often guarded or flow-dependent, so the static flow chain cannot
+/// confirm it; the co-location itself is the stealer signature and must carry risk. Scope is
+/// not filtered because stealers are often hidden in declared nested jars, which classify as
+/// bundled dependencies; the evidence keeps the scope visible.
+fn credential_webhook_co_location_finding(data: &ScanData) -> Option<Finding> {
+    data.class_files
+        .iter()
+        .find_map(|class_file| {
+            let lowered = class_file
+                .strings
+                .iter()
+                .map(|value| value.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            let store = first_marker_in(&lowered, CREDENTIAL_STORE_MARKERS)?;
+            let webhook = first_marker_in(&lowered, WEBHOOK_MARKERS)?;
+            Some(Finding {
+                rule_id: CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID.to_owned(),
+                category: "credential_theft".to_owned(),
+                kind: crate::models::scan::FindingKind::Finding,
+                severity: Severity::Critical,
+                confidence: Confidence::Medium,
+                score_contribution: 80,
+                scope: class_file.scope.clone(),
+                message: "Класс содержит путь к хранилищу учётных данных и webhook-адрес для отправки данных. Статически не доказано, что отправка выполняется, но такая связка типична для стилера.".to_owned(),
+                evidence: vec![Evidence {
+                    archive_id: class_file.archive_id.clone(),
+                    archive_path: class_file.archive_path.clone(),
+                    class_name: class_file.class_name.clone(),
+                    method_name: None,
+                    method_descriptor: None,
+                    bytecode_offset: None,
+                    resource_path: Some(class_file.path.clone()),
+                    operation: "credential_store_and_webhook_strings".to_owned(),
+                    value_preview: Some(format!("{store}; {webhook}")),
+                    source_value: None,
+                    target_value: None,
+                    confidence: Confidence::Medium,
+                    scope: class_file.scope.clone(),
+                }],
+                related_chain_id: None,
+            })
+        })
+}
+
+fn first_marker_in(values: &[String], markers: &[&'static str]) -> Option<&'static str> {
+    markers
+        .iter()
+        .copied()
+        .find(|marker| values.iter().any(|value| value.contains(marker)))
 }
 
 fn has_privacy_network_sync(data: &ScanData) -> bool {
@@ -3828,11 +3897,13 @@ fn unknown_outcome(rule_id: &str, category: &str, message: String) -> ScanOutcom
 mod tests {
     use super::{
         add_contextual_findings, confirmed_remote_memory_load,
-        custom_invokedynamic_bootstrap_finding, file_target_from_origin, finalize_report,
-        has_significant_identifier_overlap, is_credential_target, parse_zip_bytes, risk_score,
-        scan_file, summarize, verdict_from_evidence, ArchiveContext, ClassScanData, ScanData,
-        ScanLimits, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
-        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL, TIMESTAMP_OUTLIER_SIGNAL,
+        credential_webhook_co_location_finding, custom_invokedynamic_bootstrap_finding,
+        file_target_from_origin, finalize_report, has_significant_identifier_overlap,
+        is_credential_target, parse_zip_bytes, risk_score, scan_file, summarize,
+        verdict_from_evidence, ArchiveContext, ClassScanData, ScanData, ScanLimits,
+        CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID,
+        EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
+        TIMESTAMP_OUTLIER_SIGNAL,
     };
 
     use crate::models::scan::{
@@ -4722,6 +4793,49 @@ mod tests {
         let (verdict, risk_score, _) = finalize_report(&[finding], &[], &Obfuscation::default());
         assert_eq!(verdict, Verdict::Suspicious);
         assert!(risk_score > 5);
+    }
+
+    /// A class with a browser credential path and a webhook URL is suspicious even when
+    /// the POST is guarded and even when it sits in a declared nested jar; neither string
+    /// alone may score.
+    #[test]
+    fn credential_store_and_webhook_in_one_class_is_suspicious() {
+        let class = |strings: &[&str], scope| ClassScanData {
+            class_name: Some("hubtest/FakeStealer".to_owned()),
+            scope,
+            strings: strings.iter().map(|value| (*value).to_owned()).collect(),
+            ..Default::default()
+        };
+        let webhook = "https://discord.com/api/webhooks/123456789012345678/hubtest-not-a-real-hook";
+        let store = "Google\\Chrome\\User Data\\Local State";
+
+        let both = ScanData {
+            class_files: vec![class(&[store, webhook], CodeScope::FirstParty)],
+            ..Default::default()
+        };
+        let finding = credential_webhook_co_location_finding(&both)
+            .expect("credential store and webhook in one class is reported");
+        assert_eq!(finding.rule_id, CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID);
+        let (verdict, risk_score, _) = finalize_report(&[finding], &[], &Obfuscation::default());
+        assert_eq!(verdict, Verdict::Suspicious);
+        assert!(risk_score >= 80);
+
+        let split_across_classes = ScanData {
+            class_files: vec![
+                class(&[store], CodeScope::FirstParty),
+                class(&[webhook], CodeScope::FirstParty),
+            ],
+            ..Default::default()
+        };
+        assert!(credential_webhook_co_location_finding(&split_across_classes).is_none());
+
+        let nested_in_declared_jar = ScanData {
+            class_files: vec![class(&[store, webhook], CodeScope::BundledDependency)],
+            ..Default::default()
+        };
+        let finding = credential_webhook_co_location_finding(&nested_in_declared_jar)
+            .expect("a stealer hidden in a declared nested jar is reported");
+        assert_eq!(finding.scope, CodeScope::BundledDependency);
     }
 
     /// A stealer that hides its webhook POST behind indy/condy bootstraps was
