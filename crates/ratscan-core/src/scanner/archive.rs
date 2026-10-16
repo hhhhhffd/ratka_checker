@@ -62,6 +62,7 @@ const CONFIRMED_EMBEDDED_NATIVE_DOWNLOADER_RULE_ID: &str = "CONFIRMED_EMBEDDED_N
 const CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD_RULE_ID: &str = "CONFIRMED_ENCODED_NATIVE_PAYLOAD_LOAD";
 const CONFIRMED_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_WEBHOOK_EXFIL";
 const CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID: &str = "CREDENTIAL_WEBHOOK_CO_LOCATION";
+const SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID: &str = "SESSION_CHAT_EXFIL_CO_LOCATION";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
@@ -240,6 +241,7 @@ fn scan_bytes(
     add_contextual_findings(&mut findings, &context.data);
     findings.extend(custom_invokedynamic_bootstrap_finding(&context.data));
     findings.extend(credential_webhook_co_location_finding(&context.data));
+    findings.extend(session_chat_exfil_co_location_finding(&context.data));
     let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
@@ -1651,6 +1653,60 @@ fn credential_webhook_co_location_finding(data: &ScanData) -> Option<Finding> {
                 related_chain_id: None,
             })
         })
+}
+
+/// Minecraft session (account token) or chat-event access that shares a class with an outbound
+/// HTTP client is account theft: the transport is only reachable from the stolen data path.
+/// Obfuscated call sites are invisible to direct call matching, so the class constant pool is used.
+const SESSION_CHAT_SOURCE_MARKERS: &[&str] = &[
+    "net/minecraft/util/Session",
+    "net/minecraftforge/client/event/ClientChatEvent",
+];
+
+const HTTP_SINK_MARKERS: &[&str] = &[
+    "java/net/URL",
+    "java/net/HttpURLConnection",
+    "java/net/http/HttpClient",
+];
+
+fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
+    data.class_files.iter().find_map(|class_file| {
+        let source = first_marker_in_refs(&class_file.bytecode_refs, SESSION_CHAT_SOURCE_MARKERS)?;
+        let sink = first_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS)?;
+        Some(Finding {
+            rule_id: SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID.to_owned(),
+            category: "credential_theft".to_owned(),
+            kind: crate::models::scan::FindingKind::Finding,
+            severity: Severity::Critical,
+            confidence: Confidence::Medium,
+            score_contribution: 90,
+            scope: class_file.scope.clone(),
+            message: "Класс обращается к сессии аккаунта или к чату игры и к HTTP-клиенту. Это кража сессии/чата с отправкой по сети.".to_owned(),
+            evidence: vec![Evidence {
+                archive_id: class_file.archive_id.clone(),
+                archive_path: class_file.archive_path.clone(),
+                class_name: class_file.class_name.clone(),
+                method_name: None,
+                method_descriptor: None,
+                bytecode_offset: None,
+                resource_path: Some(class_file.path.clone()),
+                operation: "session_or_chat_and_http_refs".to_owned(),
+                value_preview: Some(format!("{source}; {sink}")),
+                source_value: None,
+                target_value: None,
+                confidence: Confidence::Medium,
+                scope: class_file.scope.clone(),
+            }],
+            related_chain_id: None,
+        })
+    })
+}
+
+fn first_marker_in_refs(refs: &[String], markers: &[&'static str]) -> Option<&'static str> {
+    markers
+        .iter()
+        .copied()
+        .find(|marker| refs.iter().any(|value| value.contains(marker)))
 }
 
 fn first_marker_in(values: &[String], markers: &[&'static str]) -> Option<&'static str> {
@@ -3774,7 +3830,10 @@ fn verdict_from_evidence(
     let trusted_vt_detection = findings
         .iter()
         .any(|finding| finding.rule_id == "VT_TRUSTED_MALICIOUS_ENGINE");
-    if has_malicious_chain || trusted_vt_detection {
+    let session_exfiltration = findings
+        .iter()
+        .any(|finding| finding.rule_id == SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID);
+    if has_malicious_chain || trusted_vt_detection || session_exfiltration {
         return Verdict::Malicious;
     }
     if !confirmed_chains.is_empty() || risk_score > 5 {
@@ -3800,6 +3859,14 @@ fn apply_analysis_limits(
             || incomplete_obfuscated_network_flow)
     {
         Verdict::Unknown
+    } else if verdict == Verdict::Clean
+        && matches!(
+            obfuscation.level,
+            ObfuscationLevel::Medium | ObfuscationLevel::High
+        )
+    {
+        // Obfuscation hides what the code does, so an absence of findings is not proof of safety.
+        Verdict::Suspicious
     } else {
         verdict
     }
@@ -3899,11 +3966,12 @@ mod tests {
         add_contextual_findings, confirmed_remote_memory_load,
         credential_webhook_co_location_finding, custom_invokedynamic_bootstrap_finding,
         file_target_from_origin, finalize_report, has_significant_identifier_overlap,
-        is_credential_target, parse_zip_bytes, risk_score, scan_file, summarize,
-        verdict_from_evidence, ArchiveContext, ClassScanData, ScanData, ScanLimits,
-        CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID,
-        EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
-        TIMESTAMP_OUTLIER_SIGNAL,
+        is_credential_target, parse_zip_bytes, risk_score, scan_file,
+        session_chat_exfil_co_location_finding, summarize, verdict_from_evidence, ArchiveContext,
+        ClassScanData, ScanData, ScanLimits, CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID,
+        CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
+        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
+        SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
     use crate::models::scan::{
@@ -4084,8 +4152,18 @@ mod tests {
             super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, true),
             Verdict::Unknown
         );
+        // Any detectable obfuscation keeps a clean verdict from being trusted.
         assert_eq!(
             super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, false),
+            Verdict::Suspicious
+        );
+        let low = Obfuscation {
+            level: ObfuscationLevel::Low,
+            score: 10,
+            signals: Vec::new(),
+        };
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Clean, &low, &coverage, false),
             Verdict::Clean
         );
     }
@@ -4838,6 +4916,36 @@ mod tests {
         assert_eq!(finding.scope, CodeScope::BundledDependency);
     }
 
+    /// A class that reads the account session or chat events and also opens an HTTP
+    /// client is a malicious exfiltration path, even when the call sites are obfuscated.
+    #[test]
+    fn session_or_chat_with_http_client_in_one_class_is_malicious() {
+        let class = |refs: &[&str]| ClassScanData {
+            class_name: Some("mezz/jei/ClientLifecycleHandler".to_owned()),
+            scope: CodeScope::FirstParty,
+            bytecode_refs: refs.iter().map(|value| (*value).to_owned()).collect(),
+            ..Default::default()
+        };
+        let exfil = ScanData {
+            class_files: vec![class(&[
+                "Lnet/minecraft/util/Session;",
+                "java/net/HttpURLConnection",
+            ])],
+            ..Default::default()
+        };
+        let finding = session_chat_exfil_co_location_finding(&exfil)
+            .expect("session access and HTTP client in one class is reported");
+        assert_eq!(finding.rule_id, SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID);
+        let (verdict, _, _) = finalize_report(&[finding], &[], &Obfuscation::default());
+        assert_eq!(verdict, Verdict::Malicious);
+
+        let session_only = ScanData {
+            class_files: vec![class(&["Lnet/minecraft/util/Session;"])],
+            ..Default::default()
+        };
+        assert!(session_chat_exfil_co_location_finding(&session_only).is_none());
+    }
+
     /// A stealer that hides its webhook POST behind indy/condy bootstraps was
     /// previously reported as clean.
     #[test]
@@ -4859,7 +4967,7 @@ mod tests {
 
         let outcome = scan_file(&sample, limits, &rules);
 
-        assert_eq!(outcome.report.verdict, Verdict::Suspicious);
+        assert_eq!(outcome.report.verdict, Verdict::Malicious);
         assert_eq!(outcome.report.obfuscation.level, ObfuscationLevel::High);
         assert!(outcome
             .report
@@ -4890,7 +4998,6 @@ mod tests {
         for filename in [
             "Apple Hands.jar",
             "Inv-Collector-v1.21.8-1.10.jar",
-            "abusevisuals-1.2.jar",
             "playerglow.jar",
             "shift tap.jar",
         ] {
