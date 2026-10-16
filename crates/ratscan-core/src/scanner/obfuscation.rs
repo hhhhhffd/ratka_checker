@@ -815,12 +815,24 @@ fn last_segment(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+/// Renaming obfuscators emit either 1-2 character names or random three-letter names with
+/// mixed case such as `yzO` or `nTK`. Readable three-letter names (`Gui`, `get`) have no
+/// uppercase letter after the first character.
 fn is_short_identifier(identifier: &str) -> bool {
     let character_count = identifier.chars().count();
-    (1..=2).contains(&character_count)
+    let is_tiny = (1..=2).contains(&character_count)
         && identifier
             .chars()
-            .all(|character| character.is_ascii_alphanumeric())
+            .all(|character| character.is_ascii_alphanumeric());
+    let is_random_three_letter = character_count == 3
+        && identifier
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        && identifier
+            .chars()
+            .skip(1)
+            .any(|character| character.is_ascii_uppercase());
+    is_tiny || is_random_three_letter
 }
 
 #[cfg(test)]
@@ -1127,6 +1139,17 @@ mod tests {
             ..ScanData::default()
         };
         assert_eq!(analyze(&data).obfuscation.score, 0);
+    }
+
+    /// troxill renames classes and members to random mixed-case three-letter names.
+    #[test]
+    fn random_three_letter_names_count_as_short_identifiers() {
+        for renamed in ["a", "b2", "yzO", "nTK", "HXU", "iYm"] {
+            assert!(is_short_identifier(renamed), "{renamed}");
+        }
+        for readable in ["Gui", "get", "run", "Hud", "Mod", "tick", "a1b"] {
+            assert!(!is_short_identifier(readable), "{readable}");
+        }
     }
 
     #[test]
