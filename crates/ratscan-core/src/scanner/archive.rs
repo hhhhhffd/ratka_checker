@@ -66,6 +66,9 @@ const SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID: &str = "SESSION_CHAT_EXFIL_CO_LOCA
 const EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID: &str = "EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
+/// Hard ceiling on all entries, including plain resources that `max_files_in_archive` ignores.
+/// Resource bytes are already bounded by the total size limit; this bounds per-entry work.
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const BYTECODE_VERSION_SPREAD_THRESHOLD: u16 = 4;
 const TIMESTAMP_OUTLIER_MIN_FILES: usize = 20;
 const TIMESTAMP_DOMINANT_PERCENT: usize = 90;
@@ -214,7 +217,8 @@ fn scan_bytes(
     let mut context = ArchiveContext {
         limits,
         total_uncompressed_bytes: 0,
-        file_count: 0,
+        code_file_count: 0,
+        entry_count: 0,
         data: ScanData::default(),
         structural_findings: Vec::new(),
         next_archive_id: 0,
@@ -571,7 +575,8 @@ fn parse_zip_bytes(
 struct ArchiveContext {
     limits: ScanLimits,
     total_uncompressed_bytes: u64,
-    file_count: usize,
+    code_file_count: usize,
+    entry_count: usize,
     data: ScanData,
     structural_findings: Vec<Finding>,
     next_archive_id: usize,
@@ -644,11 +649,22 @@ impl ArchiveContext {
         timestamp: Option<String>,
         normalized_timestamp: bool,
     ) -> Result<EntryDisposition, ScanAbort> {
-        self.file_count += 1;
-        if self.file_count > self.limits.max_files_in_archive {
-            return Err(ScanAbort::FileCount {
-                limit: self.limits.max_files_in_archive,
+        self.entry_count += 1;
+        if self.entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err(ScanAbort::EntryCount {
+                limit: MAX_ARCHIVE_ENTRIES,
             });
+        }
+        // Only parsed code counts toward the configured limit: asset-heavy mods such as
+        // cosmetics packs ship thousands of textures and models that need no class analysis.
+        let lower = name.to_ascii_lowercase();
+        if lower.ends_with(".class") || lower.ends_with(".jar") || lower.ends_with(".zip") {
+            self.code_file_count += 1;
+            if self.code_file_count > self.limits.max_files_in_archive {
+                return Err(ScanAbort::FileCount {
+                    limit: self.limits.max_files_in_archive,
+                });
+            }
         }
 
         self.archive_layer_mut(archive_id)?
@@ -3623,8 +3639,10 @@ fn updater_capabilities(chains: &[ConfirmedChain]) -> Vec<Capability> {
 enum ScanAbort {
     #[error("Файл не является валидным zip/jar архивом: {message}")]
     InvalidZip { message: String },
-    #[error("Превышен лимит количества файлов в архиве: максимум {limit}")]
+    #[error("Превышен лимит количества class-файлов и вложенных архивов: максимум {limit}")]
     FileCount { limit: usize },
+    #[error("Превышен лимит общего количества записей в архиве: максимум {limit}")]
+    EntryCount { limit: usize },
     #[error("Превышен лимит общего распакованного размера: максимум {limit} байт")]
     TotalSize { limit: u64 },
     #[error("Превышен лимит размера файла {path}: {actual} байт при лимите {limit} байт")]
@@ -3643,6 +3661,7 @@ impl ScanAbort {
         match self {
             Self::InvalidZip { .. } => "INVALID_ZIP",
             Self::FileCount { .. } => "ZIP_FILE_COUNT_LIMIT",
+            Self::EntryCount { .. } => "ZIP_ENTRY_COUNT_LIMIT",
             Self::TotalSize { .. } => "ZIP_TOTAL_SIZE_LIMIT",
             Self::SingleFileSize { .. } => "ZIP_SINGLE_FILE_LIMIT",
             Self::NestingDepth { .. } => "ZIP_NESTING_DEPTH_LIMIT",
@@ -4843,6 +4862,43 @@ mod tests {
             .contains(&TIMESTAMP_OUTLIER_SIGNAL.to_owned()));
     }
 
+    /// Cosmetics mods ship thousands of textures; only classes and nested archives use the
+    /// configured file limit.
+    #[test]
+    fn file_count_limit_ignores_plain_resources() {
+        let timestamp = zip_timestamp(2024, 1, 1);
+        let mut context = archive_test_context();
+        context.limits.max_total_uncompressed_bytes = 1024;
+        context.limits.max_single_file_bytes = 64;
+        context.limits.max_files_in_archive = 2;
+        let root_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
+        let assets = (0..10)
+            .map(|index| {
+                (
+                    format!("assets/mod/cosmetics/{index}.png"),
+                    timestamp,
+                    b"png".to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        parse_zip_bytes(&zip_bytes(assets), &root_id, &mut context)
+            .expect("resources do not count toward the file limit");
+        assert_eq!(context.data.resource_files.len(), 10);
+
+        let mut context = archive_test_context();
+        context.limits.max_total_uncompressed_bytes = 1024;
+        context.limits.max_single_file_bytes = 64;
+        context.limits.max_files_in_archive = 2;
+        let root_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
+        let classes = (0..3)
+            .map(|index| (format!("mod/C{index}.class"), timestamp, b"cafe".to_vec()))
+            .collect::<Vec<_>>();
+        let error = parse_zip_bytes(&zip_bytes(classes), &root_id, &mut context)
+            .expect_err("class files count toward the file limit");
+        assert_eq!(error.rule_id(), "ZIP_FILE_COUNT_LIMIT");
+    }
+
     #[test]
     fn oversized_entry_is_skipped_without_discarding_other_archive_entries() {
         let timestamp = zip_timestamp(2024, 1, 1);
@@ -5163,7 +5219,8 @@ mod tests {
                 max_single_file_bytes: 1,
             },
             total_uncompressed_bytes: 0,
-            file_count: 0,
+            code_file_count: 0,
+            entry_count: 0,
             data: ScanData {
                 class_files,
                 entrypoint_classes: vec!["com.example.mod.Loader".to_owned()],
@@ -5298,7 +5355,8 @@ mod tests {
                 max_single_file_bytes: 1024 * 1024,
             },
             total_uncompressed_bytes: 0,
-            file_count: 0,
+            code_file_count: 0,
+            entry_count: 0,
             data: ScanData::default(),
             structural_findings: Vec::new(),
             next_archive_id: 0,
