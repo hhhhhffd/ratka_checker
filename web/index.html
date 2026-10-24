@@ -1,52 +1,92 @@
 <!doctype html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RatScan — проверка Minecraft-модов</title>
-  <meta name="description" content="Статический анализ .jar модов Minecraft на стилеры и RAT прямо в браузере. Файл никуда не загружается.">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2316a34a'/><path d='M9 17l5 5 9-11' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <title>RatScan — Minecraft mod malware scanner</title>
+  <meta name="description" content="Static analysis of Minecraft .jar mods for token stealers, droppers and RATs. Runs in your browser via WebAssembly; the file is never uploaded.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%233346d3'/><path d='M8 9h6v6H8zM18 9h6v6h-6zM8 19h6v6H8z' fill='white'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600&family=Martian+Mono:wght@400;500;700&display=swap">
   <link rel="stylesheet" href="style.css">
   <script type="module" src="app.js"></script>
 </head>
 <body>
-  <main class="page">
-    <header class="hero">
-      <h1>RatScan</h1>
-      <p class="lead">Статический анализатор <code>.jar</code> модов Minecraft: ищет стилеры токенов,
-        загрузчики, RAT и эксфильтрацию через вебхуки — разбирая байткод, а не запуская его.</p>
-      <p class="privacy"><span class="dot" aria-hidden="true"></span>Скан идёт локально в WebAssembly — файл не покидает ваш компьютер.</p>
-    </header>
+  <header class="bar">
+    <span class="wordmark">RatScan</span>
+    <a class="bar-link" href="https://github.com/hhhhhffd/ratka_checker">Source on GitHub</a>
+  </header>
 
-    <label class="drop" id="drop">
-      <input type="file" id="file" accept=".jar,.zip,application/java-archive" hidden>
-      <span class="drop-title">Перетащите .jar сюда</span>
-      <span class="drop-hint">или нажмите, чтобы выбрать файл</span>
-    </label>
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <h1>Read the mod.<br>Don't run it.</h1>
+        <p class="lede">RatScan opens a Minecraft <code>.jar</code> the way a disassembler does: it parses the
+          bytecode, follows data between methods, and flags token stealers, droppers and remote loaders
+          only when the evidence connects.</p>
 
-    <p class="status" id="status" role="status" aria-live="polite"></p>
-
-    <section class="result" id="result" hidden>
-      <div class="verdict" id="verdict">
-        <div>
-          <div class="verdict-label" id="verdict-label"></div>
-          <div class="verdict-file" id="verdict-file"></div>
-        </div>
-        <div class="score"><span id="score"></span><small>/100 риск</small></div>
+        <label class="drop" id="drop">
+          <input type="file" id="file" accept=".jar,.zip,application/java-archive">
+          <span class="drop-title">Drop a .jar here</span>
+          <span class="drop-hint">or click to choose a file · up to 100 MB</span>
+        </label>
+        <p class="local">Runs in this tab via WebAssembly. The file is never uploaded.</p>
+        <p class="status" id="status" role="status" aria-live="polite"></p>
       </div>
-      <p class="summary" id="summary"></p>
+
+      <figure class="hex" aria-label="First bytes of the file">
+        <figcaption class="hex-head">
+          <span id="hex-name">example.jar</span>
+          <span id="hex-note">first 64 bytes</span>
+        </figcaption>
+        <pre class="hex-body" id="hex-body"></pre>
+        <p class="hex-legend"><span class="mark">50 4b 03 04</span> starts each archive entry. The scanner reads from here, entry by entry.</p>
+      </figure>
+    </section>
+
+    <section class="result" id="result" hidden aria-labelledby="verdict-label">
+      <div class="verdict" id="verdict">
+        <div class="verdict-main">
+          <p class="eyebrow">Verdict</p>
+          <h2 id="verdict-label"></h2>
+          <p class="verdict-summary" id="summary"></p>
+        </div>
+        <div class="risk">
+          <p class="eyebrow">Risk score</p>
+          <p class="risk-value"><span id="score"></span><span class="risk-max">/100</span></p>
+          <div class="meter" aria-hidden="true"><span id="meter-fill"></span></div>
+        </div>
+      </div>
+
       <dl class="facts" id="facts"></dl>
       <div id="sections"></div>
+
       <div class="actions">
-        <button type="button" id="download">Скачать JSON-отчёт</button>
-        <button type="button" id="reset" class="ghost">Проверить другой файл</button>
+        <button type="button" id="download">Download JSON report</button>
+        <button type="button" id="reset" class="secondary">Scan another file</button>
       </div>
     </section>
 
-    <footer class="footer">
-      <p>Статический анализ не гарантирует безопасность: <em>clean</em> значит «опасных цепочек не найдено», а не «проверено вручную».</p>
-      <p><a href="https://github.com/hhhhhffd/ratka_checker">Исходный код на GitHub</a> · Rust → WebAssembly</p>
-    </footer>
+    <section class="method" aria-label="How the scan works">
+      <div>
+        <h3>Parses, never executes</h3>
+        <p>Classes are decoded from the archive bytes, including nested jars. No JVM is started.</p>
+      </div>
+      <div>
+        <h3>Follows the data</h3>
+        <p>A value read from a token file and sent to a webhook is a chain; the two APIs alone are not.</p>
+      </div>
+      <div>
+        <h3>Says what it missed</h3>
+        <p>Analysis gaps are listed in the report. Heavy obfuscation or unparsed classes keep a mod from being called clean.</p>
+      </div>
+    </section>
   </main>
+
+  <footer class="foot">
+    <p>A clean verdict means no dangerous chain was found, not that a person reviewed the mod.</p>
+    <p>Rust compiled to WebAssembly · <a href="https://github.com/hhhhhffd/ratka_checker">hhhhhffd/ratka_checker</a></p>
+  </footer>
 </body>
 </html>
