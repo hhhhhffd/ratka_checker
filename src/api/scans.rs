@@ -104,7 +104,7 @@ async fn run_scan_worker(
     let mut outcome =
         tokio::task::spawn_blocking(move || archive::scan_file(&scan_path, limits, &rules_engine))
             .await?;
-    if let Some(report) = run_virustotal(scan_id, &storage_path, &filename, &state).await? {
+    if let Some(report) = run_virustotal(scan_id, &storage_path, &filename, &state).await {
         let findings = virustotal::findings_for_report(&report);
         if !findings.is_empty() {
             outcome.summary = merge_virustotal_findings(&mut outcome.report, findings);
@@ -154,24 +154,29 @@ fn verdict_rank(verdict: &crate::models::scan::Verdict) -> u8 {
     }
 }
 
-/// Runs the optional VirusTotal phase and persists its own report without failing static analysis.
+/// Runs the optional VirusTotal phase and persists its own report without failing static analysis:
+/// storage errors in this phase are logged and the static result is kept.
 async fn run_virustotal(
     scan_id: Uuid,
     storage_path: &std::path::Path,
     filename: &str,
     state: &AppState,
-) -> anyhow::Result<Option<crate::models::scan::VirusTotalReport>> {
+) -> Option<crate::models::scan::VirusTotalReport> {
     if !state.config.virustotal.enabled {
-        return Ok(None);
+        return None;
     }
 
-    let sha256 = storage_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow::anyhow!("stored jar path does not contain sha256 filename"))?;
+    let Some(sha256) = storage_path.file_stem().and_then(|value| value.to_str()) else {
+        tracing::warn!(scan_id = %scan_id, "stored jar path does not contain sha256 filename; skipping VirusTotal");
+        return None;
+    };
 
-    if let Some(report) = db::find_fresh_virustotal_report(&state.db, sha256).await? {
-        return Ok(Some(report));
+    match db::find_fresh_virustotal_report(&state.db, sha256).await {
+        Ok(Some(report)) => return Some(report),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(scan_id = %scan_id, %error, "failed to read cached VirusTotal report; querying VirusTotal");
+        }
     }
 
     let report =
@@ -186,15 +191,18 @@ async fn run_virustotal(
         };
 
     if is_cacheable_virustotal_report(&report) {
-        db::upsert_virustotal_report(
+        if let Err(error) = db::upsert_virustotal_report(
             &state.db,
             sha256,
             &report,
             state.config.virustotal.cache_ttl,
         )
-        .await?;
+        .await
+        {
+            tracing::warn!(scan_id = %scan_id, %error, "failed to cache VirusTotal report");
+        }
     }
-    Ok(Some(report))
+    Some(report)
 }
 
 /// Errors are transient and a queued analysis is still in progress, so caching either for the
