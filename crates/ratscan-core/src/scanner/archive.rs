@@ -566,12 +566,21 @@ fn parse_zip_bytes(
             continue;
         }
 
+        // Limits were checked against the declared size, which the archive controls.
+        // Reading one byte past it detects a lying header without inflating a bomb.
         let mut entry_bytes = Vec::new();
-        entry
+        (&mut entry)
+            .take(uncompressed_size.saturating_add(1))
             .read_to_end(&mut entry_bytes)
             .map_err(|error| ScanAbort::InvalidZip {
                 message: error.to_string(),
             })?;
+        if entry_bytes.len() as u64 > uncompressed_size {
+            return Err(ScanAbort::DeclaredSizeMismatch {
+                path: name,
+                declared: uncompressed_size,
+            });
+        }
         context.extract_entry(archive_id, &name, &entry_bytes)?;
     }
 
@@ -3662,6 +3671,10 @@ enum ScanAbort {
     },
     #[error("Превышен лимит вложенности jar: максимум {limit}")]
     NestingDepth { limit: usize },
+    #[error(
+        "Запись {path} распаковывается больше заявленных {declared} байт (возможна zip-бомба)"
+    )]
+    DeclaredSizeMismatch { path: String, declared: u64 },
 }
 
 impl ScanAbort {
@@ -3674,6 +3687,7 @@ impl ScanAbort {
             Self::TotalSize { .. } => "ZIP_TOTAL_SIZE_LIMIT",
             Self::SingleFileSize { .. } => "ZIP_SINGLE_FILE_LIMIT",
             Self::NestingDepth { .. } => "ZIP_NESTING_DEPTH_LIMIT",
+            Self::DeclaredSizeMismatch { .. } => "ZIP_DECLARED_SIZE_MISMATCH",
         }
     }
 }
@@ -4906,6 +4920,37 @@ mod tests {
         let error = parse_zip_bytes(&zip_bytes(classes), &root_id, &mut context)
             .expect_err("class files count toward the file limit");
         assert_eq!(error.rule_id(), "ZIP_FILE_COUNT_LIMIT");
+    }
+
+    /// A zip bomb can declare a tiny size so it passes the limits; inflation must
+    /// stop at the declared size instead of trusting the header.
+    #[test]
+    fn entry_inflating_past_declared_size_is_rejected() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "assets/bomb.txt",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .expect("start entry");
+        writer
+            .write_all(&vec![0; 1024 * 1024])
+            .expect("write entry");
+        let mut bytes = writer.finish().expect("finish zip").into_inner();
+        let declared_size = 10u32.to_le_bytes();
+        bytes[22..26].copy_from_slice(&declared_size);
+        let central_directory = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x01\x02")
+            .expect("central directory");
+        bytes[central_directory + 24..central_directory + 28].copy_from_slice(&declared_size);
+
+        let mut context = archive_test_context();
+        let root_id = context.create_archive_layer(None, "<root>".to_owned(), 0, false);
+        let error = parse_zip_bytes(&bytes, &root_id, &mut context)
+            .expect_err("a lying size header must abort the scan");
+
+        assert_eq!(error.rule_id(), "ZIP_DECLARED_SIZE_MISMATCH");
     }
 
     #[test]
