@@ -15,7 +15,8 @@
 [![Pages](https://img.shields.io/github/actions/workflow/status/hhhhhffd/ratka_checker/pages.yml?style=flat-square&label=PAGES&logo=github&logoColor=white)](https://github.com/hhhhhffd/ratka_checker/actions/workflows/pages.yml)
 
 <!-- No release or license badges: the repo has no releases and no LICENSE file. -->
-[Live Demo (pending deployment)](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment) · Download: _TBD_
+
+[Live Demo (pending deployment)](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment)
 
 </div>
 
@@ -31,17 +32,17 @@ WebAssembly build that runs entirely in the browser.
 
 ## Technical Stack
 
-| Group | Technology | Version | Role |
-| --- | --- | --- | --- |
-| Core | Rust (edition 2021) | 1.99.0, pinned in `rust-toolchain.toml` | Scanner, API, Telegram worker |
-| Core | axum | 0.8 | HTTP API with multipart upload |
-| Core | YAML rules (`config/rules.yaml`) | n/a | Non-scoring heuristic observations |
-| Data | PostgreSQL | 16 (`postgres:16-alpine`) | Scan results, hashes, VirusTotal cache |
-| Data | sqlx | 0.8 | Queries; migrations embedded in the binary |
-| Infra | Docker Compose | n/a | `postgres`, `api`, `dev-ui` |
-| Infra | nginx | 1.27-alpine | `dev-ui` static frontend |
-| Infra | WebAssembly (`wasm32-unknown-unknown`) | n/a | Client-side scanner in `web/` |
-| Infra | GitHub Actions | n/a | `rust-ci.yml`, `pages.yml` |
+| Group | Technology                             | Version                                 | Role                                       |
+| ----- | -------------------------------------- | --------------------------------------- | ------------------------------------------ |
+| Core  | Rust (edition 2021)                    | 1.99.0, pinned in `rust-toolchain.toml` | Scanner, API, Telegram worker              |
+| Core  | axum                                   | 0.8                                     | HTTP API with multipart upload             |
+| Core  | YAML rules (`config/rules.yaml`)       | n/a                                     | Non-scoring heuristic observations         |
+| Data  | PostgreSQL                             | 16 (`postgres:16-alpine`)               | Scan results, hashes, VirusTotal cache     |
+| Data  | sqlx                                   | 0.8                                     | Queries; migrations embedded in the binary |
+| Infra | Docker Compose                         | n/a                                     | `postgres`, `api`, `dev-ui`                |
+| Infra | nginx                                  | 1.27-alpine                             | `dev-ui` static frontend                   |
+| Infra | WebAssembly (`wasm32-unknown-unknown`) | n/a                                     | Client-side scanner in `web/`              |
+| Infra | GitHub Actions                         | n/a                                     | `rust-ci.yml`, `pages.yml`                 |
 
 ## Architecture Deep Dive
 
@@ -89,12 +90,12 @@ sequenceDiagram
 
 ### Architecture decisions
 
-| Decision | Rationale |
-| --- | --- |
-| Scanner in a standalone crate | `ratscan-core` has no server dependencies, so the same logic builds for `wasm32` and the API. It uses pure-Rust zip codecs for that target. |
-| Evidence-gated verdicts | `malicious` requires a confirmed dangerous chain or a trusted VirusTotal detection; weak API matches cannot reach it by accumulation. |
-| Shared report types in `ratscan-models` | The API, the Telegram worker, and the WASM build serialize one contract. |
-| Embedded migrations | The binary runs SQLx migrations at startup, so a host needs only `DATABASE_URL`. |
+| Decision                                | Rationale                                                                                                                                   |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scanner in a standalone crate           | `ratscan-core` has no server dependencies, so the same logic builds for `wasm32` and the API. It uses pure-Rust zip codecs for that target. |
+| Evidence-gated verdicts                 | `malicious` requires a confirmed dangerous chain or a trusted VirusTotal detection; weak API matches cannot reach it by accumulation.       |
+| Shared report types in `ratscan-models` | The API, the Telegram worker, and the WASM build serialize one contract.                                                                    |
+| Embedded migrations                     | The binary runs SQLx migrations at startup, so a host needs only `DATABASE_URL`.                                                            |
 
 ### Scan result model
 
@@ -138,12 +139,12 @@ accumulation alone.
 
 ### API endpoints
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/v1/scans` | Upload a jar (multipart field `file`) |
-| `GET` | `/v1/scans/{id}` | Fetch a scan result |
-| `GET` | `/v1/hashes/{sha256}` | Look up a report by sha256 |
-| `GET` | `/health` | Liveness check |
+| Method | Path                  | Purpose                               |
+| ------ | --------------------- | ------------------------------------- |
+| `POST` | `/v1/scans`           | Upload a jar (multipart field `file`) |
+| `GET`  | `/v1/scans/{id}`      | Fetch a scan result                   |
+| `GET`  | `/v1/hashes/{sha256}` | Look up a report by sha256            |
+| `GET`  | `/health`             | Liveness check                        |
 
 ### VirusTotal
 
@@ -212,11 +213,11 @@ cp .env.example .env
 docker compose up --build
 ```
 
-| Service | Image or build | Port | Purpose |
-| --- | --- | --- | --- |
-| `postgres` | `postgres:16-alpine` | `5432` | Database `ratscan`, user `ratscan`, password `ratscan` |
-| `api` | `Dockerfile` | `8080` | `ratscan` API and optional Telegram worker |
-| `dev-ui` | `nginx:1.27-alpine` | `8081` | Local UI from `deploy/frontend`, proxied per `dev/nginx.conf` |
+| Service    | Image or build       | Port   | Purpose                                                       |
+| ---------- | -------------------- | ------ | ------------------------------------------------------------- |
+| `postgres` | `postgres:16-alpine` | `5432` | Database `ratscan`, user `ratscan`, password `ratscan`        |
+| `api`      | `Dockerfile`         | `8080` | `ratscan` API and optional Telegram worker                    |
+| `dev-ui`   | `nginx:1.27-alpine`  | `8081` | Local UI from `deploy/frontend`, proxied per `dev/nginx.conf` |
 
 Compose overrides `DATABASE_URL` for `api` with
 `postgres://ratscan:ratscan@postgres:5432/ratscan`, so the `localhost` default in
@@ -231,31 +232,31 @@ the `ratscan-storage` volume.
 <details>
 <summary>Full reference (defaults from <code>.env.example</code>)</summary>
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `RUST_LOG` | `info` | Log filter |
-| `DATABASE_URL` | `postgres://ratscan:ratscan@localhost:5432/ratscan` | PostgreSQL connection |
-| `RATSCAN_BIND_ADDR` | `0.0.0.0:8080` | API listen address |
-| `RATSCAN_RULES_PATH` | `config/rules.yaml` | Scanner rules file |
-| `RATSCAN_STORAGE_DIR` | `storage` | Uploaded file storage |
-| `MAX_TOTAL_UNCOMPRESSED_MB` | `200` | Archive size limit after inflation |
-| `MAX_FILES_IN_ARCHIVE` | `5000` | Entry count limit |
-| `MAX_NESTING_DEPTH` | `3` | Nested archive depth limit |
-| `MAX_SINGLE_FILE_MB` | `50` | Single entry size limit |
-| `FILE_RETENTION_DAYS` | `1` | Stored file retention |
-| `FILE_CLEANUP_INTERVAL_MINUTES` | `60` | Cleanup job interval |
-| `VIRUSTOTAL_ENABLED` | `false` | Enable VirusTotal enrichment |
-| `VIRUSTOTAL_API_KEY` | _empty_ | VirusTotal API key |
-| `VIRUSTOTAL_TIMEOUT_SECONDS` | `20` | VirusTotal request timeout |
-| `VIRUSTOTAL_CACHE_TTL_HOURS` | `24` | Report cache lifetime |
-| `VIRUSTOTAL_POLL_ATTEMPTS` | `6` | Analysis poll attempts |
-| `VIRUSTOTAL_POLL_INTERVAL_SECONDS` | `10` | Delay between polls |
-| `TG_BOT_TOKEN` | _empty_ | Telegram bot token; worker starts only with `ALLOWED_TG_ID` |
-| `ALLOWED_TG_ID` | _empty_ | Telegram user allowed to use the bot |
-| `RATSCAN_API_BASE_URL` | `http://127.0.0.1:8080` | API URL used by the worker |
-| `TG_BOT_REQUEST_TIMEOUT_SECONDS` | `30` | Telegram request timeout |
-| `TG_BOT_POLL_ATTEMPTS` | `24` | Scan result poll attempts |
-| `TG_BOT_POLL_INTERVAL_SECONDS` | `5` | Delay between polls |
+| Variable                           | Default                                             | Purpose                                                     |
+| ---------------------------------- | --------------------------------------------------- | ----------------------------------------------------------- |
+| `RUST_LOG`                         | `info`                                              | Log filter                                                  |
+| `DATABASE_URL`                     | `postgres://ratscan:ratscan@localhost:5432/ratscan` | PostgreSQL connection                                       |
+| `RATSCAN_BIND_ADDR`                | `0.0.0.0:8080`                                      | API listen address                                          |
+| `RATSCAN_RULES_PATH`               | `config/rules.yaml`                                 | Scanner rules file                                          |
+| `RATSCAN_STORAGE_DIR`              | `storage`                                           | Uploaded file storage                                       |
+| `MAX_TOTAL_UNCOMPRESSED_MB`        | `200`                                               | Archive size limit after inflation                          |
+| `MAX_FILES_IN_ARCHIVE`             | `5000`                                              | Entry count limit                                           |
+| `MAX_NESTING_DEPTH`                | `3`                                                 | Nested archive depth limit                                  |
+| `MAX_SINGLE_FILE_MB`               | `50`                                                | Single entry size limit                                     |
+| `FILE_RETENTION_DAYS`              | `1`                                                 | Stored file retention                                       |
+| `FILE_CLEANUP_INTERVAL_MINUTES`    | `60`                                                | Cleanup job interval                                        |
+| `VIRUSTOTAL_ENABLED`               | `false`                                             | Enable VirusTotal enrichment                                |
+| `VIRUSTOTAL_API_KEY`               | _empty_                                             | VirusTotal API key                                          |
+| `VIRUSTOTAL_TIMEOUT_SECONDS`       | `20`                                                | VirusTotal request timeout                                  |
+| `VIRUSTOTAL_CACHE_TTL_HOURS`       | `24`                                                | Report cache lifetime                                       |
+| `VIRUSTOTAL_POLL_ATTEMPTS`         | `6`                                                 | Analysis poll attempts                                      |
+| `VIRUSTOTAL_POLL_INTERVAL_SECONDS` | `10`                                                | Delay between polls                                         |
+| `TG_BOT_TOKEN`                     | _empty_                                             | Telegram bot token; worker starts only with `ALLOWED_TG_ID` |
+| `ALLOWED_TG_ID`                    | _empty_                                             | Telegram user allowed to use the bot                        |
+| `RATSCAN_API_BASE_URL`             | `http://127.0.0.1:8080`                             | API URL used by the worker                                  |
+| `TG_BOT_REQUEST_TIMEOUT_SECONDS`   | `30`                                                | Telegram request timeout                                    |
+| `TG_BOT_POLL_ATTEMPTS`             | `24`                                                | Scan result poll attempts                                   |
+| `TG_BOT_POLL_INTERVAL_SECONDS`     | `5`                                                 | Delay between polls                                         |
 
 </details>
 
@@ -327,14 +328,12 @@ nor PostgreSQL.
 
 ## Deliverables & Links
 
-| Item | Link |
-| --- | --- |
+| Item      | Link                                                                                                           |
+| --------- | -------------------------------------------------------------------------------------------------------------- |
 | Live Demo | [hhhhhffd.github.io/ratka_checker](https://hhhhhffd.github.io/ratka_checker/) (pending first Pages deployment) |
-| Demo Video / Pitch | <!-- TODO: demo video URL --> _TBD_ |
-| Presentation | <!-- TODO: presentation URL --> _TBD_ |
-| Releases | <!-- TODO: releases URL, none published yet --> _TBD_ |
 
 ## License
 
 <!-- TODO: add a LICENSE file and state the license here -->
+
 _TBD_: the repository has no LICENSE file yet.
