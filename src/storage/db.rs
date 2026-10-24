@@ -124,7 +124,7 @@ pub async fn create_pending_scan(
     Ok(())
 }
 
-/// Returns the newest scan for a hash so duplicate uploads can reuse existing verdicts.
+/// Returns the newest scan for a hash regardless of status, for read-only hash lookups.
 pub async fn find_latest_scan_by_sha256(
     pool: &PgPool,
     sha256: &str,
@@ -146,6 +146,58 @@ pub async fn find_latest_scan_by_sha256(
         Some(scan) => Ok(Some(scan_response_from_row(pool, scan).await?)),
         None => Ok(None),
     }
+}
+
+/// Returns the newest scan for a hash that a duplicate upload may reuse: a finished scan, or a
+/// pending one younger than `max_pending_age`. Failed and stale pending scans are skipped so a
+/// stuck or failed run never pins the verdict for that hash.
+pub async fn find_reusable_scan_by_sha256(
+    pool: &PgPool,
+    sha256: &str,
+    max_pending_age: Duration,
+) -> anyhow::Result<Option<ScanResponse>> {
+    let row = sqlx::query_as::<_, ScanRow>(
+        r#"
+        SELECT id, sha256, status, verdict, risk_score, confidence, obfuscation, analysis_coverage
+        FROM scans
+        WHERE sha256 = $1
+          AND (status = 'done'
+               OR (status = 'pending' AND created_at > now() - make_interval(secs => $2)))
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(sha256)
+    .bind(max_pending_age.as_secs_f64())
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(scan) => Ok(Some(scan_response_from_row(pool, scan).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Fails every scan left `pending`; scan workers live inside the API process, so at startup
+/// any pending row is orphaned by a previous crash or restart. Returns the number of rows failed.
+pub async fn fail_orphaned_pending_scans(pool: &PgPool) -> sqlx::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE scans
+        SET status = 'failed',
+            verdict = NULL,
+            risk_score = 0,
+            summary = '',
+            error_code = 'scan_interrupted',
+            error_message = 'scan was interrupted by a service restart',
+            updated_at = now(),
+            completed_at = now()
+        WHERE status = 'pending'
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Returns a scan by id with findings for polling clients.

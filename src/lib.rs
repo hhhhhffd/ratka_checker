@@ -32,6 +32,10 @@ pub async fn connect_database(config: &AppConfig) -> anyhow::Result<PgPool> {
 pub async fn serve() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
     let pool = connect_database(&config).await?;
+    let orphaned = storage::db::fail_orphaned_pending_scans(&pool).await?;
+    if orphaned > 0 {
+        tracing::warn!(orphaned, "marked interrupted pending scans as failed");
+    }
     tokio::fs::create_dir_all(&config.storage_dir).await?;
     let rules_engine = rules::engine::RulesEngine::load_from_file(&config.rules_path)?;
     let app_state = api::AppState::new(pool.clone(), config.clone(), rules_engine);

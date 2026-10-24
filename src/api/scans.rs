@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use axum::extract::{Multipart, Path, State};
 use bytes::Bytes;
@@ -15,6 +15,11 @@ use crate::{
     virustotal,
 };
 
+/// A pending scan newer than this is shared by duplicate uploads; an older one is presumed stuck
+/// and a fresh scan is started. It comfortably exceeds a static scan plus the VirusTotal
+/// upload/poll phase, so healthy in-flight scans are not duplicated.
+const PENDING_SCAN_REUSE_WINDOW: Duration = Duration::from_secs(30 * 60);
+
 /// Accepts a multipart jar upload, persists it by sha256, and enqueues a background scan.
 pub async fn create_scan(
     State(state): State<AppState>,
@@ -27,9 +32,10 @@ pub async fn create_scan(
     let storage_path = files::save_jar(&state.config.storage_dir, &sha256, &upload.bytes).await?;
     let storage_path_string = storage_path.to_string_lossy().to_string();
 
-    if let Some(existing) = db::find_latest_scan_by_sha256(&state.db, &sha256)
-        .await
-        .map_err(|error| AppError::internal(error.to_string()))?
+    if let Some(existing) =
+        db::find_reusable_scan_by_sha256(&state.db, &sha256, PENDING_SCAN_REUSE_WINDOW)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
     {
         db::mark_file_available(&state.db, existing.scan_id, &storage_path_string).await?;
         return Ok(PrettyJson(existing));
