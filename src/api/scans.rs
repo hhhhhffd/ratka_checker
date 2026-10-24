@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     api::AppState,
     error::AppError,
-    models::scan::{Finding, ScanReport},
+    models::scan::{Finding, ScanReport, VirusTotalStatus},
     response::PrettyJson,
     scanner::archive,
     storage::{db, files},
@@ -185,14 +185,25 @@ async fn run_virustotal(
             }
         };
 
-    db::upsert_virustotal_report(
-        &state.db,
-        sha256,
-        &report,
-        state.config.virustotal.cache_ttl,
-    )
-    .await?;
+    if is_cacheable_virustotal_report(&report) {
+        db::upsert_virustotal_report(
+            &state.db,
+            sha256,
+            &report,
+            state.config.virustotal.cache_ttl,
+        )
+        .await?;
+    }
     Ok(Some(report))
+}
+
+/// Errors are transient and a queued analysis is still in progress, so caching either for the
+/// full TTL would pin an unusable result; the next scan of the same jar should ask VirusTotal again.
+fn is_cacheable_virustotal_report(report: &crate::models::scan::VirusTotalReport) -> bool {
+    !matches!(
+        report.status,
+        VirusTotalStatus::Error | VirusTotalStatus::Queued
+    )
 }
 
 /// Parsed upload payload from the expected `multipart/form-data` field named `file`.
@@ -243,10 +254,26 @@ fn validate_filename(filename: &str) -> Result<(), AppError> {
 mod tests {
     use crate::models::scan::{
         AnalysisCoverage, Capability, Confidence, Finding, Obfuscation, ScanReport, Severity,
-        Verdict,
+        Verdict, VirusTotalStatus,
     };
 
-    use super::merge_virustotal_findings;
+    use super::{is_cacheable_virustotal_report, merge_virustotal_findings};
+
+    #[test]
+    fn only_settled_virustotal_reports_are_cached() {
+        let mut report = crate::virustotal::error_report("boom".to_owned());
+        assert!(!is_cacheable_virustotal_report(&report));
+        report.status = VirusTotalStatus::Queued;
+        assert!(!is_cacheable_virustotal_report(&report));
+        for status in [
+            VirusTotalStatus::Completed,
+            VirusTotalStatus::NotFound,
+            VirusTotalStatus::TooLargeToUpload,
+        ] {
+            report.status = status;
+            assert!(is_cacheable_virustotal_report(&report));
+        }
+    }
 
     #[test]
     fn virustotal_merge_preserves_non_finding_report_sections() {
