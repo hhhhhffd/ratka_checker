@@ -15,5 +15,10 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "1.0"
 tracing = "0.1"
-zip = "2.2"
+# Pure-Rust codecs only, so the scanner also builds for wasm32. Native builds
+# add the C-backed codecs and AES below to keep server behavior unchanged.
+zip = { version = "2.2", default-features = false, features = ["deflate", "deflate64", "lzma"] }
 ratscan-models = { path = "../ratscan-models" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zip = { version = "2.2", default-features = false, features = ["aes-crypto", "bzip2", "time", "xz", "zstd"] }
