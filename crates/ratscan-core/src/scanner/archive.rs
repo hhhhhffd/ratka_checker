@@ -3974,12 +3974,15 @@ fn apply_analysis_limits(
     let incomplete_obfuscated_network_flow = has_first_party_network_calls
         && analysis_coverage.method_flow_coverage == 0
         && !matches!(obfuscation.level, ObfuscationLevel::None);
+    // An unparsed class contributes no strings or calls, so its code was never analyzed.
+    let unparsed_classes = analysis_coverage.parsed_classes < analysis_coverage.total_classes;
     // Obfuscation hides what the code does, so an absence of findings is not proof of safety.
     if verdict == Verdict::Clean
         && (matches!(
             obfuscation.level,
             ObfuscationLevel::Medium | ObfuscationLevel::High
-        ) || incomplete_obfuscated_network_flow)
+        ) || incomplete_obfuscated_network_flow
+            || unparsed_classes)
     {
         Verdict::Unknown
     } else {
@@ -4205,6 +4208,35 @@ mod tests {
         assert_eq!(
             super::apply_analysis_limits(Verdict::Malicious, &obfuscation, &low_coverage, false),
             Verdict::Malicious
+        );
+    }
+
+    /// Classes the parser rejects contribute no evidence, so they cannot back a clean verdict.
+    #[test]
+    fn unparsed_classes_downgrade_clean_to_unknown() {
+        let partial = AnalysisCoverage {
+            total_classes: 2,
+            parsed_classes: 1,
+            ..Default::default()
+        };
+        let complete = AnalysisCoverage {
+            total_classes: 2,
+            parsed_classes: 2,
+            ..Default::default()
+        };
+        let none = Obfuscation::default();
+
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Clean, &none, &partial, false),
+            Verdict::Unknown
+        );
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Clean, &none, &complete, false),
+            Verdict::Clean
+        );
+        assert_eq!(
+            super::apply_analysis_limits(Verdict::Suspicious, &none, &partial, false),
+            Verdict::Suspicious
         );
     }
 
