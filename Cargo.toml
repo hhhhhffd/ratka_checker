@@ -14,6 +14,7 @@ members = [
     "crates/ratscan-models",
     "crates/ratscan-core",
     "crates/ratscan-api",
+    "crates/ratscan-wasm",
 ]
 resolver = "2"
 
