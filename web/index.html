@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RatScan — проверка Minecraft-модов</title>
+  <meta name="description" content="Статический анализ .jar модов Minecraft на стилеры и RAT прямо в браузере. Файл никуда не загружается.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2316a34a'/><path d='M9 17l5 5 9-11' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <h1>RatScan</h1>
+      <p class="lead">Статический анализатор <code>.jar</code> модов Minecraft: ищет стилеры токенов,
+        загрузчики, RAT и эксфильтрацию через вебхуки — разбирая байткод, а не запуская его.</p>
+      <p class="privacy"><span class="dot" aria-hidden="true"></span>Скан идёт локально в WebAssembly — файл не покидает ваш компьютер.</p>
+    </header>
+
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".jar,.zip,application/java-archive" hidden>
+      <span class="drop-title">Перетащите .jar сюда</span>
+      <span class="drop-hint">или нажмите, чтобы выбрать файл</span>
+    </label>
+
+    <p class="status" id="status" role="status" aria-live="polite"></p>
+
+    <section class="result" id="result" hidden>
+      <div class="verdict" id="verdict">
+        <div>
+          <div class="verdict-label" id="verdict-label"></div>
+          <div class="verdict-file" id="verdict-file"></div>
+        </div>
+        <div class="score"><span id="score"></span><small>/100 риск</small></div>
+      </div>
+      <p class="summary" id="summary"></p>
+      <dl class="facts" id="facts"></dl>
+      <div id="sections"></div>
+      <div class="actions">
+        <button type="button" id="download">Скачать JSON-отчёт</button>
+        <button type="button" id="reset" class="ghost">Проверить другой файл</button>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <p>Статический анализ не гарантирует безопасность: <em>clean</em> значит «опасных цепочек не найдено», а не «проверено вручную».</p>
+      <p><a href="https://github.com/hhhhhffd/ratka_checker">Исходный код на GitHub</a> · Rust → WebAssembly</p>
+    </footer>
+  </main>
+</body>
+</html>

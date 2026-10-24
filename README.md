@@ -10,6 +10,21 @@ tests, Telegram worker startup, scanner regression fixtures, and release builds.
 Formatting and Clippy are checked on both toolchains. CI uses mock Telegram endpoints
 and does not need production credentials or PostgreSQL.
 
+## Web Demo (WebAssembly)
+
+`web/` is a static page that runs the same scanner compiled to WebAssembly, so
+the jar never leaves the browser. VirusTotal and storage are server-only and are
+not part of it. `.github/workflows/pages.yml` deploys it to GitHub Pages on
+pushes to `main` (enable Settings → Pages → Source: GitHub Actions).
+
+Local build, with a `wasm-bindgen-cli` matching the version in `Cargo.lock`:
+
+```sh
+rustup target add wasm32-unknown-unknown
+sh scripts/build_web.sh
+python3 -m http.server -d web 8000
+```
+
 ## Build Binary Package In Docker
 
 Docker is only used as a build environment:

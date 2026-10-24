@@ -15,3 +15,4 @@ __pycache__/
 /ERRORS.md
 /fake-log/
 /tests/realmods/
+/web/pkg/
