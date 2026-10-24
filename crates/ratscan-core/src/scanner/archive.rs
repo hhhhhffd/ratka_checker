@@ -319,6 +319,7 @@ fn scan_bytes(
         &obfuscation.obfuscation,
         &analysis_coverage,
         has_first_party_network_calls,
+        data_flow.budget_exhausted,
     );
 
     let report = ScanReport {
@@ -389,6 +390,13 @@ fn flow_limitation(limitation: &FlowLimitation) -> Limitation {
             format!("Невозможно отследить состояние объекта {object_type}."),
             method,
             Some(*offset),
+        ),
+        FlowLimitation::AnalysisBudgetExhausted { method } => (
+            "FLOW_ANALYSIS_BUDGET_EXHAUSTED",
+            "Исчерпан лимит работы анализа потока данных; часть вызовов не проанализирована."
+                .to_owned(),
+            method,
+            None,
         ),
         FlowLimitation::LinearControlFlow { method } => (
             "LINEAR_CFG_ANALYSIS",
@@ -492,6 +500,7 @@ pub fn finalize_report_with_analysis_limits(
         obfuscation,
         analysis_coverage,
         false,
+        false,
     )
 }
 
@@ -501,6 +510,7 @@ fn finalize_report_with_network_analysis_limits(
     obfuscation: &Obfuscation,
     analysis_coverage: &AnalysisCoverage,
     has_first_party_network_calls: bool,
+    flow_budget_exhausted: bool,
 ) -> (Verdict, u8, String) {
     let (verdict, risk_score, _summary) = finalize_report(findings, confirmed_chains, obfuscation);
     let verdict = apply_analysis_limits(
@@ -508,6 +518,7 @@ fn finalize_report_with_network_analysis_limits(
         obfuscation,
         analysis_coverage,
         has_first_party_network_calls,
+        flow_budget_exhausted,
     );
     let summary = summarize(findings, verdict.clone());
     (verdict, risk_score, summary)
@@ -3970,6 +3981,7 @@ fn apply_analysis_limits(
     obfuscation: &Obfuscation,
     analysis_coverage: &AnalysisCoverage,
     has_first_party_network_calls: bool,
+    flow_budget_exhausted: bool,
 ) -> Verdict {
     let incomplete_obfuscated_network_flow = has_first_party_network_calls
         && analysis_coverage.method_flow_coverage == 0
@@ -3982,7 +3994,8 @@ fn apply_analysis_limits(
             obfuscation.level,
             ObfuscationLevel::Medium | ObfuscationLevel::High
         ) || incomplete_obfuscated_network_flow
-            || unparsed_classes)
+            || unparsed_classes
+            || flow_budget_exhausted)
     {
         Verdict::Unknown
     } else {
@@ -4202,11 +4215,17 @@ mod tests {
         };
 
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &low_coverage, false),
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &low_coverage, false, false),
             Verdict::Unknown
         );
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Malicious, &obfuscation, &low_coverage, false),
+            super::apply_analysis_limits(
+                Verdict::Malicious,
+                &obfuscation,
+                &low_coverage,
+                false,
+                false
+            ),
             Verdict::Malicious
         );
     }
@@ -4227,15 +4246,15 @@ mod tests {
         let none = Obfuscation::default();
 
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &none, &partial, false),
+            super::apply_analysis_limits(Verdict::Clean, &none, &partial, false, false),
             Verdict::Unknown
         );
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &none, &complete, false),
+            super::apply_analysis_limits(Verdict::Clean, &none, &complete, false, false),
             Verdict::Clean
         );
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Suspicious, &none, &partial, false),
+            super::apply_analysis_limits(Verdict::Suspicious, &none, &partial, false, false),
             Verdict::Suspicious
         );
     }
@@ -4297,12 +4316,12 @@ mod tests {
         };
 
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, true),
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, true, false),
             Verdict::Unknown
         );
         // Medium or high obfuscation keeps a clean verdict from being trusted; low does not.
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, false),
+            super::apply_analysis_limits(Verdict::Clean, &obfuscation, &coverage, false, false),
             Verdict::Unknown
         );
         let low = Obfuscation {
@@ -4311,7 +4330,7 @@ mod tests {
             signals: Vec::new(),
         };
         assert_eq!(
-            super::apply_analysis_limits(Verdict::Clean, &low, &coverage, false),
+            super::apply_analysis_limits(Verdict::Clean, &low, &coverage, false, false),
             Verdict::Clean
         );
     }

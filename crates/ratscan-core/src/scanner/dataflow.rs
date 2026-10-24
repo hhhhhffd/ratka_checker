@@ -228,6 +228,10 @@ pub enum FlowLimitation {
     LinearControlFlow {
         method: MethodId,
     },
+    /// The whole-scan work budget ran out; later call trees were not analyzed.
+    AnalysisBudgetExhausted {
+        method: MethodId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -255,7 +259,13 @@ pub struct DataFlowResult {
     pub unresolved_calls: u32,
     pub unknown_file_targets: u32,
     pub resolved_value_targets: u32,
+    pub budget_exhausted: bool,
 }
+
+/// Call trees are re-executed per root without memoization, so a crafted fan-out
+/// (each method calling the next many times) grows as fan-out^depth. Bounding the
+/// total executed operations keeps every scan finite; real mods use far less.
+const MAX_EXECUTED_OPERATIONS: usize = 2_000_000;
 
 /// Runs a conservative flow analysis over independently parsed methods.
 pub fn analyze_method_flows(methods: &[MethodFlow], config: &DataFlowConfig) -> DataFlowResult {
@@ -400,6 +410,7 @@ struct Analyzer<'a> {
     config: &'a DataFlowConfig,
     result: DataFlowResult,
     emitted: HashSet<String>,
+    remaining_operations: usize,
 }
 
 impl<'a> Analyzer<'a> {
@@ -409,6 +420,7 @@ impl<'a> Analyzer<'a> {
             config,
             result: DataFlowResult::default(),
             emitted: HashSet::new(),
+            remaining_operations: MAX_EXECUTED_OPERATIONS,
         }
     }
 
@@ -425,6 +437,26 @@ impl<'a> Analyzer<'a> {
                 return_values: Vec::new(),
             };
         };
+        if self.result.budget_exhausted {
+            return FrameResult {
+                return_values: Vec::new(),
+            };
+        }
+        let Some(remaining) = self
+            .remaining_operations
+            .checked_sub(method.operations.len())
+        else {
+            self.result.budget_exhausted = true;
+            self.result
+                .limitations
+                .push(FlowLimitation::AnalysisBudgetExhausted {
+                    method: method_id.clone(),
+                });
+            return FrameResult {
+                return_values: Vec::new(),
+            };
+        };
+        self.remaining_operations = remaining;
         if !call_stack.insert(method_id.clone()) {
             self.result
                 .limitations
@@ -733,6 +765,46 @@ mod tests {
 
     fn evidence(method: &MethodId, offset: u32, operation: &str) -> FlowEvidence {
         FlowEvidence::for_method(method, offset, operation)
+    }
+
+    /// Each method calls the next one 60 times; without a budget the root would
+    /// re-execute the leaf 60^4 times.
+    #[test]
+    fn fan_out_call_chain_stops_at_the_work_budget() {
+        let methods = (0..5)
+            .map(|level| {
+                let id = method(&format!("m{level}"), Vec::new()).id;
+                let callee = method(&format!("m{}", level + 1), Vec::new()).id;
+                let operations = if level == 4 {
+                    Vec::new()
+                } else {
+                    (0..60)
+                        .map(|offset| Operation::Call {
+                            callee: callee.clone(),
+                            arguments: Vec::new(),
+                            return_to: None,
+                            evidence: evidence(&id, offset, "call"),
+                        })
+                        .collect()
+                };
+                method(&format!("m{level}"), operations)
+            })
+            .collect::<Vec<_>>();
+
+        let result = analyze_method_flows(&methods, &DataFlowConfig::default());
+
+        assert!(result.budget_exhausted);
+        assert_eq!(
+            result
+                .limitations
+                .iter()
+                .filter(|limitation| matches!(
+                    limitation,
+                    FlowLimitation::AnalysisBudgetExhausted { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
