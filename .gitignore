@@ -16,3 +16,9 @@ __pycache__/
 /fake-log/
 /tests/realmods/
 /web/pkg/
+# Local AI agent working files
+/AGENTS.md
+/.agents/
+/.claude/
+/.codex/
+/.playwright-mcp/
