@@ -1313,8 +1313,13 @@ fn table_switch_length(code: &[u8], offset: usize) -> Option<usize> {
     }
     let low = read_i32(code, header + 4)?;
     let high = read_i32(code, header + 8)?;
-    let entries = high.checked_sub(low)?.checked_add(1)? as usize;
-    Some(1 + padding + 12 + entries * 4)
+    // The JVM rejects high < low; wrapping arithmetic here could yield a zero
+    // length and stall or panic the bytecode walkers.
+    if high < low {
+        return None;
+    }
+    let entries = usize::try_from(i64::from(high) - i64::from(low) + 1).ok()?;
+    entries.checked_mul(4)?.checked_add(1 + padding + 12)
 }
 
 fn lookup_switch_length(code: &[u8], offset: usize) -> Option<usize> {
@@ -1323,8 +1328,8 @@ fn lookup_switch_length(code: &[u8], offset: usize) -> Option<usize> {
     if header + 8 > code.len() {
         return None;
     }
-    let pairs = read_i32(code, header + 4)? as usize;
-    Some(1 + padding + 8 + pairs * 8)
+    let pairs = usize::try_from(read_i32(code, header + 4)?).ok()?;
+    pairs.checked_mul(8)?.checked_add(1 + padding + 8)
 }
 
 fn wide_length(code: &[u8], offset: usize) -> Option<usize> {
@@ -1444,6 +1449,26 @@ mod tests {
             error.to_string().contains("invalid class magic")
                 || error.to_string().contains("truncated")
         );
+    }
+
+    /// A tableswitch with high < low once wrapped to a zero instruction length,
+    /// panicking the decoder and looping the byte-array recovery forever.
+    #[test]
+    fn malformed_tableswitch_is_rejected_without_panic_or_hang() {
+        let tableswitch = [
+            0xaa, 0, 0, 0, // opcode and padding
+            0, 0, 0, 0, // default
+            0, 0, 0, 0, // low = 0
+            0xff, 0xff, 0xff, 0xfb, // high = -5
+        ];
+        assert!(super::decode_instructions(&tableswitch).is_err());
+
+        let mut with_newarray = tableswitch.to_vec();
+        with_newarray.extend_from_slice(&[0xbc, 0x08]);
+        super::recover_byte_array_strings(&with_newarray);
+
+        let negative_lookupswitch = [0xab, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+        assert!(super::decode_instructions(&negative_lookupswitch).is_err());
     }
 
     /// Obfuscators link hidden calls through mod-defined bootstraps; javac
