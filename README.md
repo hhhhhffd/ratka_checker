@@ -16,7 +16,7 @@
 
 <!-- No release or license badges: the repo has no releases and no LICENSE file. -->
 
-[Live Demo (pending deployment)](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment)
+[Live Demo](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment)
 
 </div>
 
@@ -330,7 +330,7 @@ nor PostgreSQL.
 
 | Item      | Link                                                                                                           |
 | --------- | -------------------------------------------------------------------------------------------------------------- |
-| Live Demo | [hhhhhffd.github.io/ratka_checker](https://hhhhhffd.github.io/ratka_checker/) (pending first Pages deployment) |
+| Live Demo | [hhhhhffd.github.io/ratka_checker](https://hhhhhffd.github.io/ratka_checker/) |
 
 ## License
 
