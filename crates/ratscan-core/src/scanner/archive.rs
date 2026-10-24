@@ -198,14 +198,23 @@ pub struct ScanOutcome {
 
 /// Scans a stored jar from disk; intended to run inside `spawn_blocking`.
 pub fn scan_file(path: &Path, limits: ScanLimits, rules_engine: &RulesEngine) -> ScanOutcome {
-    match read_file(path).and_then(|bytes| scan_bytes(&bytes, limits, rules_engine)) {
-        Ok(outcome) => outcome,
-        Err(error) => unknown_outcome(
-            "SCAN_TECHNICAL_FAILURE",
-            "static_scan",
-            format!("Скан не выполнен технически: {error}"),
-        ),
+    match read_file(path) {
+        Ok(bytes) => scan_jar_bytes(&bytes, limits, rules_engine),
+        Err(error) => technical_failure_outcome(error),
     }
+}
+
+/// Scans jar bytes already held in memory, e.g. a file a browser user selected.
+pub fn scan_jar_bytes(bytes: &[u8], limits: ScanLimits, rules_engine: &RulesEngine) -> ScanOutcome {
+    scan_bytes(bytes, limits, rules_engine).unwrap_or_else(technical_failure_outcome)
+}
+
+fn technical_failure_outcome(error: anyhow::Error) -> ScanOutcome {
+    unknown_outcome(
+        "SCAN_TECHNICAL_FAILURE",
+        "static_scan",
+        format!("Скан не выполнен технически: {error}"),
+    )
 }
 
 /// Parses and evaluates in-memory jar bytes without extracting unbounded entries.

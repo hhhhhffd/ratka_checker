@@ -23,8 +23,12 @@ struct CompiledRule {
 impl RulesEngine {
     /// Loads and validates YAML rules once at startup to fail fast on bad config.
     pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
-        let yaml = fs::read_to_string(path)?;
-        let rules: Vec<Rule> = serde_yaml::from_str(&yaml)?;
+        Self::from_yaml(&fs::read_to_string(path)?)
+    }
+
+    /// Builds the engine from YAML text for hosts without a filesystem (wasm).
+    pub fn from_yaml(yaml: &str) -> anyhow::Result<Self> {
+        let rules: Vec<Rule> = serde_yaml::from_str(yaml)?;
         let compiled = rules
             .into_iter()
             .map(|rule| {
