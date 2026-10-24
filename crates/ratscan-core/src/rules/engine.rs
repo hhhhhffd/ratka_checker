@@ -241,6 +241,8 @@ mod tests {
             first_party_strings: vec![
                 "visit(Lnet/caffeinemc/mods/sodium/client/render/chunk/RenderSection;)V".into(),
                 "VeloTune metrics: avg={} ms, pressure={}, {}".into(),
+                "entity.tower_defender.name".into(),
+                "Defender".into(),
             ],
             ..Default::default()
         };
@@ -262,7 +264,11 @@ mod tests {
         )
         .expect("production rules load");
         let data = ScanData {
-            first_party_strings: vec!["msmpeng.exe".into(), "avgnt.exe".into()],
+            first_party_strings: vec![
+                "msmpeng.exe".into(),
+                "avgnt.exe".into(),
+                "Windows Defender".into(),
+            ],
             ..Default::default()
         };
 

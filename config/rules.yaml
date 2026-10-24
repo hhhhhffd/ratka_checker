@@ -404,7 +404,7 @@
   category: evasion
   severity: medium
   match_type: regex
-  pattern: "\\b(?:avast|kaspersky|defender|msmpeng|wireshark|processhacker)(?:\\.exe)?\\b|\\bavg(?:nt|svc|ui|wdsvc|idsagent)(?:\\.exe)?\\b"
+  pattern: "\\b(?:avast|kaspersky|windows ?defender|windefend|msmpeng|wireshark|processhacker)(?:\\.exe)?\\b|\\bavg(?:nt|svc|ui|wdsvc|idsagent)(?:\\.exe)?\\b"
   message: "Обнаружен поиск процессов анализа или антивирусов"
 - rule_id: LONG_SLEEP
   category: evasion
