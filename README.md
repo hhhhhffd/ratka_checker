@@ -170,6 +170,24 @@ sh scripts/build_web.sh
 python3 -m http.server -d web 8000
 ```
 
+### Launcher plugin releases
+
+RatScan is also shipped as a plugin of the `_k0t1k` launcher: a GitHub Release
+with `plugin.json`, `plugin.json.sig` and the `wasm-bindgen --target web` files
+`ratscan_wasm.js` and `ratscan_wasm_bg.wasm`. The release tag `v<version>` uses
+the `ratscan-wasm` crate version, so bump it in `crates/ratscan-wasm/Cargo.toml`
+and push before releasing. Plugin API v1 exports `default` (init) and
+`scan(bytes) -> string` (JSON `{summary, report}`, throws on error).
+
+```sh
+bash scripts/release-plugin.sh   # needs gh, openssl, jq, wasm-bindgen-cli
+```
+
+The script refuses on a dirty tree, an unpushed `HEAD`, an existing tag or
+release, or a signature that does not verify against the launcher's public key.
+It signs with `$K0T1K_PLUGIN_KEY` (default `~/.config/k0t1k/plugin-signing-key.pem`);
+the key must never be stored in the repository.
+
 ### Service boundaries
 
 RatScan API and the Rust Telegram worker are one deployable service. The API owns scan
