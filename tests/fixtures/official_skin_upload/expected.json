@@ -1,0 +1,11 @@
+{
+  "name": "session token sent only to the official skin upload API",
+  "scenario": "official_skin_upload",
+  "expected_verdict": "clean",
+  "risk_score": { "min": 0, "max": 5 },
+  "required_findings": [],
+  "forbidden_findings": ["SESSION_CHAT_EXFIL_CO_LOCATION", "CONFIRMED_CREDENTIAL_EXFILTRATION"],
+  "forbidden_confirmed_chains": ["CONFIRMED_CREDENTIAL_EXFILTRATION"],
+  "expected_capabilities": [],
+  "expected_obfuscation_level": "none"
+}

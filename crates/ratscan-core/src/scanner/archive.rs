@@ -1781,11 +1781,28 @@ const HTTP_SINK_MARKERS: &[&str] = &[
     "java/net/http/HttpClient",
 ];
 
+/// Mojang and Microsoft account endpoints that legitimately receive the session token, e.g. a
+/// skin upload to `api.minecraftservices.com` (Entity Texture Features skin editor).
+const OFFICIAL_ACCOUNT_HOSTS: &[&str] = &[
+    "api.minecraftservices.com",
+    "sessionserver.mojang.com",
+    "authserver.mojang.com",
+    "api.mojang.com",
+    "textures.minecraft.net",
+    "login.live.com",
+    "login.microsoftonline.com",
+    "user.auth.xboxlive.com",
+    "xsts.auth.xboxlive.com",
+];
+
 fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
     data.class_files.iter().find_map(|class_file| {
         let source =
             first_class_marker_in_refs(&class_file.bytecode_refs, SESSION_CHAT_SOURCE_MARKERS)?;
         let sink = first_class_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS)?;
+        if targets_only_official_account_hosts(&class_file.strings) {
+            return None;
+        }
         Some(Finding {
             rule_id: SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID.to_owned(),
             category: "credential_theft".to_owned(),
@@ -1813,6 +1830,30 @@ fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
             related_chain_id: None,
         })
     })
+}
+
+/// True when the class holds at least one http(s) URL and every one of them points to an
+/// official account host. A class without any URL literal stays reportable: its destination is
+/// built at runtime and cannot be checked statically.
+fn targets_only_official_account_hosts(strings: &[String]) -> bool {
+    let mut hosts = strings
+        .iter()
+        .filter_map(|value| http_url_host(value))
+        .peekable();
+    hosts.peek().is_some() && hosts.all(|host| OFFICIAL_ACCOUNT_HOSTS.contains(&host.as_str()))
+}
+
+/// Lowercase host of an http(s) URL, ignoring userinfo and port so that
+/// `https://api.mojang.com@evil.example/` resolves to `evil.example`.
+fn http_url_host(value: &str) -> Option<String> {
+    let lowered = value.trim().to_ascii_lowercase();
+    let rest = lowered
+        .strip_prefix("https://")
+        .or_else(|| lowered.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = host_and_port.split(':').next().unwrap_or_default();
+    Some(host.trim_end_matches('.').to_owned())
 }
 
 /// Matches whole class names only: a bare class or member reference, or a type descriptor.
@@ -5242,6 +5283,46 @@ mod tests {
         bundled.scope = CodeScope::BundledDependency;
         let (verdict, _, _) = finalize_report(&[bundled], &[], &Obfuscation::default());
         assert_eq!(verdict, Verdict::Suspicious);
+    }
+
+    /// Sending the session token only to Mojang/Microsoft account endpoints (skin upload in
+    /// Entity Texture Features) is not exfiltration; any other or hidden destination still is.
+    #[test]
+    fn session_with_http_client_to_official_account_host_is_not_exfiltration() {
+        let class = |strings: &[&str]| ScanData {
+            class_files: vec![ClassScanData {
+                class_name: Some("example/skin/SkinUpload".to_owned()),
+                scope: CodeScope::FirstParty,
+                strings: strings.iter().map(|value| (*value).to_owned()).collect(),
+                bytecode_refs: vec![
+                    "net/minecraft/client/User.getAccessToken".to_owned(),
+                    "java/net/http/HttpClient.send".to_owned(),
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let skin_upload = class(&[
+            "https://api.minecraftservices.com/minecraft/profile/skins",
+            "Authorization",
+        ]);
+        assert!(session_chat_exfil_co_location_finding(&skin_upload).is_none());
+
+        for strings in [
+            &[
+                "https://api.minecraftservices.com/minecraft/profile/skins",
+                "https://discord.com/api/webhooks/1/x",
+            ][..],
+            &["https://api.minecraftservices.com@evil.example/collect"][..],
+            &["https://api.minecraftservices.com.evil.example/collect"][..],
+            &["Authorization"][..],
+        ] {
+            assert!(
+                session_chat_exfil_co_location_finding(&class(strings)).is_some(),
+                "{strings:?} must stay reported"
+            );
+        }
     }
 
     /// A stealer that hides its webhook POST behind indy/condy bootstraps was

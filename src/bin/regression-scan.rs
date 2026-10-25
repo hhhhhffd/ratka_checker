@@ -84,6 +84,7 @@ enum Scenario {
     SafeUpdater,
     IntermethodDownloader,
     NestedMalicious,
+    OfficialSkinUpload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,6 +572,11 @@ const BASE64_DECODE: MethodReference = MethodReference {
     name: "decode",
     descriptor: "(Ljava/lang/String;)[B",
 };
+const USER_GET_ACCESS_TOKEN: MethodReference = MethodReference {
+    owner: "net/minecraft/client/User",
+    name: "getAccessToken",
+    descriptor: "()Ljava/lang/String;",
+};
 const DEFINE_CLASS: MethodReference = MethodReference {
     owner: "java/lang/ClassLoader",
     name: "defineClass",
@@ -720,6 +726,10 @@ impl From<Scenario> for ScenarioDefinition {
                 methods: Vec::new(),
                 resources: Vec::new(),
             },
+            Scenario::OfficialSkinUpload => Self {
+                methods: vec![official_skin_upload_method()],
+                resources: Vec::new(),
+            },
         }
     }
 }
@@ -761,6 +771,31 @@ fn credential_exfiltration_method() -> MethodDefinition {
             FixtureInstruction::StoreLocal(2),
             FixtureInstruction::LoadLocal(2),
             FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(HTTP_POST),
+            FixtureInstruction::Return,
+        ],
+    }
+}
+
+/// Mirrors the Entity Texture Features skin editor: the session token is read and a skin is
+/// posted to the official Minecraft services API.
+fn official_skin_upload_method() -> MethodDefinition {
+    MethodDefinition {
+        name: "uploadSkin",
+        instructions: vec![
+            FixtureInstruction::InvokeStatic(USER_GET_ACCESS_TOKEN),
+            FixtureInstruction::StoreLocal(0),
+            FixtureInstruction::LoadString("skin_printout.png"),
+            FixtureInstruction::StoreLocal(1),
+            FixtureInstruction::LoadLocal(1),
+            FixtureInstruction::InvokeStatic(FILES_READ_ALL_BYTES),
+            FixtureInstruction::StoreLocal(2),
+            FixtureInstruction::LoadString(
+                "https://api.minecraftservices.com/minecraft/profile/skins",
+            ),
+            FixtureInstruction::StoreLocal(3),
+            FixtureInstruction::LoadLocal(3),
+            FixtureInstruction::LoadLocal(2),
             FixtureInstruction::InvokeStatic(HTTP_POST),
             FixtureInstruction::Return,
         ],
