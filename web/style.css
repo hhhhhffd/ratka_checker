@@ -186,8 +186,11 @@ button:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
 .method h3 { margin: 0 0 6px; font: 500 0.85rem var(--mono); letter-spacing: -0.01em; }
 .method p { margin: 0; font-size: 0.92rem; color: var(--graphite); }
 
-.foot { padding: 24px 0 40px; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--graphite); }
-.foot p { margin: 2px 0; }
+.foot {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 24px;
+  padding: 24px 0 40px; border-top: 1px solid var(--rule); font-size: 0.85rem; color: var(--graphite);
+}
+.foot p { margin: 0; }
 
 @media (max-width: 880px) {
   .hero { grid-template-columns: 1fr; gap: 32px; padding: 40px 0; }
