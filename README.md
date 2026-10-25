@@ -14,7 +14,7 @@
 [![Rust CI](https://img.shields.io/github/actions/workflow/status/hhhhhffd/ratka_checker/rust-ci.yml?style=flat-square&label=RUST%20CI&logo=githubactions&logoColor=white)](https://github.com/hhhhhffd/ratka_checker/actions/workflows/rust-ci.yml)
 [![Pages](https://img.shields.io/github/actions/workflow/status/hhhhhffd/ratka_checker/pages.yml?style=flat-square&label=PAGES&logo=github&logoColor=white)](https://github.com/hhhhhffd/ratka_checker/actions/workflows/pages.yml)
 
-<!-- No release or license badges: the repo has no releases and no LICENSE file. -->
+<!-- No release or license badges: the repo has no releases and the license is proprietary. -->
 
 [Live Demo](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment)
 
@@ -334,6 +334,4 @@ nor PostgreSQL.
 
 ## License
 
-<!-- TODO: add a LICENSE file and state the license here -->
-
-_TBD_: the repository has no LICENSE file yet.
+Proprietary. © 2026 hhhhhffd. All rights reserved. See [LICENSE](LICENSE).
