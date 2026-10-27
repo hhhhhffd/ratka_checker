@@ -1,34 +1,41 @@
 <div align="center">
 
-<h1>RatScan</h1>
+<h1>RatScan — Malware Analysis for Minecraft Mods</h1>
 <hr>
 
-**Static analysis of Minecraft `.jar` mods in one place: evidence-backed verdicts, optional VirusTotal enrichment, and a browser build that never uploads the file**
+**Static analysis of Minecraft `.jar` mods in one place: a custom JVM bytecode parser, proven-chain verdicts, optional VirusTotal enrichment, and a browser build that never uploads the file**
 
 ![Rust](https://img.shields.io/badge/RUST-1.99-DEA584?style=flat-square&logo=rust&logoColor=white)
-![Axum](https://img.shields.io/badge/AXUM-0.8-000000?style=flat-square&logo=rust&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/POSTGRESQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white)
 ![WebAssembly](https://img.shields.io/badge/WEBASSEMBLY-wasm32-654FF0?style=flat-square&logo=webassembly&logoColor=white)
-![Docker](https://img.shields.io/badge/DOCKER-compose-2496ED?style=flat-square&logo=docker&logoColor=white)
 
 [![Rust CI](https://img.shields.io/github/actions/workflow/status/hhhhhffd/ratka_checker/rust-ci.yml?style=flat-square&label=RUST%20CI&logo=githubactions&logoColor=white)](https://github.com/hhhhhffd/ratka_checker/actions/workflows/rust-ci.yml)
-[![Pages](https://img.shields.io/github/actions/workflow/status/hhhhhffd/ratka_checker/pages.yml?style=flat-square&label=PAGES&logo=github&logoColor=white)](https://github.com/hhhhhffd/ratka_checker/actions/workflows/pages.yml)
+[![Release](https://img.shields.io/github/v/release/hhhhhffd/ratka_checker?style=flat-square&label=RELEASE)](https://github.com/hhhhhffd/ratka_checker/releases)
+[![License](https://img.shields.io/badge/LICENSE-AGPL--3.0-blue?style=flat-square)](LICENSE)
 
-<!-- No release or license badges: the repo has no releases and the license is proprietary. -->
-
-[Live Demo](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment)
+[Live Demo](https://hhhhhffd.github.io/ratka_checker/) · [Architecture](#architecture-deep-dive) · [Setup](#setup--deployment) · [Releases](https://github.com/hhhhhffd/ratka_checker/releases) · English · [Русский](README.ru.md)
 
 </div>
 
-## Executive Summary
+## What it is
 
-RatScan statically scans Minecraft `.jar` mods for stealers and remote access
-trojans. It never executes the archive: it parses bytecode and resources, tracks
-data flow, and reports risk only when evidence links an API to a dangerous chain.
+Minecraft mods are `.jar` archives that run with full user privileges, and stealers
+and remote access trojans are distributed as mods. RatScan scans a jar without
+executing it: it parses the bytecode and resources, tracks data flow, and calls a
+mod `malicious` only when evidence links an API to a dangerous chain.
 
-The scanner is one Rust library (`ratscan-core`) shared by two front doors: an
-`axum` API with PostgreSQL storage and an integrated Telegram worker, and a
-WebAssembly build that runs entirely in the browser.
+The scanner is one Rust library (`ratscan-core`) shared by three front doors: an
+`axum` API with PostgreSQL storage, a Telegram bot worker, and a WebAssembly build
+that runs entirely in the browser and as a plugin of the
+[`_k0t1k`](https://github.com/hhhhhffd/_k0t1k) launcher.
+
+## Highlights
+
+- Custom JVM bytecode parser (`class_file.rs`) that builds basic blocks and control-flow edges per method.
+- Cross-method taint tracking: a `malicious` verdict needs a proven chain such as credential read to network send. Weak API matches cannot reach it by accumulation.
+- 81 YAML rules in `config/rules.yaml` produce non-scoring heuristic observations that guide manual review.
+- Optional VirusTotal enrichment, a Telegram bot, and a WebAssembly build used inside the `_k0t1k` launcher.
+- Regression corpus of fixture jars under `tests/` (source fixtures and compiled fixtures with `expected.json` contracts), run in CI.
 
 ## Technical Stack
 
@@ -36,6 +43,7 @@ WebAssembly build that runs entirely in the browser.
 | ----- | -------------------------------------- | --------------------------------------- | ------------------------------------------ |
 | Core  | Rust (edition 2021)                    | 1.99.0, pinned in `rust-toolchain.toml` | Scanner, API, Telegram worker              |
 | Core  | axum                                   | 0.8                                     | HTTP API with multipart upload             |
+| Core  | Bytecode parser, CFG, data-flow        | n/a                                     | Custom code in `ratscan-core`, no class-file crate |
 | Core  | YAML rules (`config/rules.yaml`)       | n/a                                     | Non-scoring heuristic observations         |
 | Data  | PostgreSQL                             | 16 (`postgres:16-alpine`)               | Scan results, hashes, VirusTotal cache     |
 | Data  | sqlx                                   | 0.8                                     | Queries; migrations embedded in the binary |
@@ -172,7 +180,7 @@ python3 -m http.server -d web 8000
 
 ### Launcher plugin releases
 
-RatScan is also shipped as a plugin of the `_k0t1k` launcher: a GitHub Release
+RatScan is also shipped as a plugin of the [`_k0t1k`](https://github.com/hhhhhffd/_k0t1k) launcher: a GitHub Release
 with `plugin.json`, `plugin.json.sig` and the `wasm-bindgen --target web` files
 `ratscan_wasm.js` and `ratscan_wasm_bg.wasm`. The release tag `v<version>` uses
 the `ratscan-wasm` crate version, so bump it in `crates/ratscan-wasm/Cargo.toml`
@@ -344,12 +352,6 @@ requests, plus Telegram worker startup, scanner regression fixtures, and release
 builds. CI uses mock Telegram endpoints and needs neither production credentials
 nor PostgreSQL.
 
-## Deliverables & Links
-
-| Item      | Link                                                                                                           |
-| --------- | -------------------------------------------------------------------------------------------------------------- |
-| Live Demo | [hhhhhffd.github.io/ratka_checker](https://hhhhhffd.github.io/ratka_checker/) |
-
 ## License
 
-Proprietary. © 2026 hhhhhffd. All rights reserved. See [LICENSE](LICENSE).
+AGPL-3.0-only. © 2026 hhhhhffd. See [LICENSE](LICENSE).
