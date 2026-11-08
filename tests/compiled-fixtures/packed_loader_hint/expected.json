@@ -1,0 +1,8 @@
+{
+  "name": "packed loader capability hint without a proven chain",
+  "expected_verdict": "suspicious",
+  "risk_score": {"min": 6, "max": 100},
+  "required_findings": ["PACKED_DOWNLOAD_EXEC_CO_LOCATION"],
+  "forbidden_confirmed_chains": ["CONFIRMED_DOWNLOAD_WRITE_EXEC", "CONFIRMED_REMOTE_MEMORY_LOAD"],
+  "expected_obfuscation_level": "none"
+}
