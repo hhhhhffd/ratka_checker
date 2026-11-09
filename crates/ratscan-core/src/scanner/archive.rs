@@ -1756,6 +1756,19 @@ fn executable_download_exec_co_location_finding(data: &ScanData) -> Option<Findi
 /// same-archive helper merit review, but do not prove downloaded bytes reach a process.
 /// Never emit a confirmed chain from this heuristic.
 fn packed_download_exec_co_location_finding(data: &ScanData) -> Option<Finding> {
+    // Index HTTP helpers once; do not rescan the archive for every potential loader.
+    let mut network_helpers = HashMap::new();
+    for class_file in &data.class_files {
+        if let (Some(name), Some(network)) = (
+            class_file.class_name.as_deref(),
+            first_class_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS),
+        ) {
+            network_helpers
+                .entry((class_file.archive_id.as_str(), name))
+                .or_insert_with(Vec::new)
+                .push((class_file, network));
+        }
+    }
     data.class_files.iter().find_map(|class_file| {
         let refs = &class_file.bytecode_refs;
         let archive = first_class_marker_in_refs(
@@ -1771,25 +1784,23 @@ fn packed_download_exec_co_location_finding(data: &ScanData) -> Option<Finding> 
             ],
         )?;
         let launcher = first_class_marker_in_refs(refs, PROCESS_LAUNCH_MARKERS)?;
-        let network_class = if first_class_marker_in_refs(refs, HTTP_SINK_MARKERS).is_some() {
-            class_file
+        let (network_class, network) = if let Some(network) =
+            first_class_marker_in_refs(refs, HTTP_SINK_MARKERS)
+        {
+            (class_file, network)
         } else {
-            data.class_files.iter().find(|helper| {
-                helper.archive_id == class_file.archive_id
-                    && first_class_marker_in_refs(&helper.bytecode_refs, HTTP_SINK_MARKERS).is_some()
-                    && class_file.methods.iter().any(|method| {
-                        method.calls.iter().any(|call| {
-                            call.owner.is_some()
-                                && call.owner == helper.class_name
-                                && helper.methods.iter().any(|target| {
-                                    target.method_name == call.name
-                                        && target.descriptor == call.descriptor
-                                })
-                        })
+            class_file.methods.iter().flat_map(|method| &method.calls).find_map(|call| {
+                let helpers = network_helpers.get(&(
+                    class_file.archive_id.as_str(),
+                    call.owner.as_deref()?,
+                ))?;
+                helpers.iter().copied().find(|(helper, _)| {
+                    helper.methods.iter().any(|target| {
+                        target.method_name == call.name && target.descriptor == call.descriptor
                     })
+                })
             })?
         };
-        let network = first_class_marker_in_refs(&network_class.bytecode_refs, HTTP_SINK_MARKERS)?;
         Some(Finding {
             rule_id: PACKED_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID.to_owned(),
             category: "correlation".to_owned(),
@@ -5372,6 +5383,16 @@ mod tests {
         data.class_files[1].methods[0].descriptor = "(I)V".to_owned();
         assert!(packed_download_exec_co_location_finding(&data).is_none());
         data.class_files[1].methods[0].descriptor = "()V".to_owned();
+        data.class_files[0].methods[0].calls[0].owner = Some("example/Other".to_owned());
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+        data.class_files[0].methods[0].calls[0].owner = None;
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+        data.class_files[0].methods[0].calls[0].owner = Some("example/Http".to_owned());
+        // Duplicate class definitions must not hide a matching helper signature.
+        let matching_helper = data.class_files[1].clone();
+        data.class_files[1].methods[0].descriptor = "(I)V".to_owned();
+        data.class_files.push(matching_helper);
+        assert!(packed_download_exec_co_location_finding(&data).is_some());
         data.class_files[0].methods[0].calls.clear();
         assert!(packed_download_exec_co_location_finding(&data).is_none());
     }
