@@ -5498,7 +5498,7 @@ mod tests {
     /// A stealer that hides its webhook POST behind indy/condy bootstraps was
     /// previously reported as clean.
     #[test]
-    fn real_custom_bootstrap_stealer_is_not_clean() {
+    fn real_custom_bootstrap_chat_stealer_is_malicious() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let sample = root.join("tests/realmods/jei-7.8.0.1011.jar");
         if !sample.is_file() {
@@ -5516,10 +5516,12 @@ mod tests {
 
         let outcome = scan_file(&sample, limits, &rules);
 
-        assert!(matches!(
-            outcome.report.verdict,
-            Verdict::Suspicious | Verdict::Malicious
-        ));
+        assert_eq!(outcome.report.verdict, Verdict::Malicious);
+        assert!(outcome
+            .report
+            .confirmed_chains
+            .iter()
+            .any(|chain| { chain.rule_id == super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID }));
         assert_eq!(outcome.report.obfuscation.level, ObfuscationLevel::High);
         assert!(outcome
             .report

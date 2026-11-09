@@ -42,10 +42,10 @@ pub struct MethodScanData {
     pub stack_origins: Vec<StackOrigin>,
     /// Values returned by explicit JVM return instructions.
     pub return_origins: Vec<ReturnOrigin>,
-    /// Reference and byte element assignments observed in the linear pass.
-    /// Used for Java varargs, immutable lists, and constant binary signatures.
+    /// Reference, byte, and char assignments observed in the linear pass.
+    /// Used for varargs, constant binary signatures, and literal decoders.
     pub array_elements: Vec<ArrayElementOrigin>,
-    /// Byte-array reads retained for container-header comparisons.
+    /// Reference/byte reads retained for bootstrap tables and container headers.
     pub array_reads: Vec<ArrayReadOrigin>,
     /// Conditional values retained so security recognizers can prove that a
     /// rejecting branch guards a following sensitive operation.
@@ -195,6 +195,9 @@ const MIN_DECODED_STRING_LENGTH: usize = 4;
 #[derive(Clone, Debug)]
 enum ConstantPoolEntry {
     Utf8(String),
+    /// Modified UTF-8 may encode unpaired UTF-16 units in encrypted literals.
+    Utf16(Vec<u16>),
+    ResolvedString(String),
     Integer(i32),
     String {
         string_index: u16,
@@ -231,7 +234,7 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
 
     let _minor_version = cursor.read_u16()?;
     let major_version = cursor.read_u16()?;
-    let entries = parse_constant_pool(&mut cursor)?;
+    let mut entries = parse_constant_pool(&mut cursor)?;
 
     let _access_flags = cursor.read_u16()?;
     let this_class = cursor.read_u16()?;
@@ -239,7 +242,7 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
     let class_name = resolve_class_name(&entries, this_class);
 
     skip_interfaces(&mut cursor)?;
-    skip_members(&mut cursor)?;
+    let private_fields = private_static_fields(&mut cursor, &entries)?;
 
     let mut method_strings = Vec::new();
     let mut archive_signals = Vec::new();
@@ -254,12 +257,34 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
         class_name.as_deref().unwrap_or_default(),
         &mut methods,
     )?;
-    let bootstrap_method_handles = parse_bootstrap_method_handles(&mut cursor, &entries)?;
+    let (bootstrap_method_handles, bootstrap_arguments) =
+        parse_bootstrap_method_handles(&mut cursor, &entries)?;
     let custom_bootstrap_methods = custom_bootstrap_methods(&entries, &bootstrap_method_handles);
+
+    normalize_hidden_literals(
+        &mut entries,
+        &mut methods,
+        &bootstrap_method_handles,
+        &bootstrap_arguments,
+        class_name.as_deref().unwrap_or_default(),
+        &private_fields,
+    )?;
 
     let mut strings = constant_pool_strings(&entries);
     strings.extend(integer_ip_strings(&entries));
     strings.extend(method_strings);
+    strings.extend(
+        methods
+            .iter()
+            .flat_map(|method| method.constants.iter())
+            .filter_map(|constant| {
+                if let ConstantValue::String(value) = &constant.value {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            }),
+    );
 
     let mut bytecode_refs = strings.clone();
     for entry in &entries {
@@ -290,6 +315,838 @@ pub fn parse_class_file(bytes: &[u8]) -> anyhow::Result<ClassFileData> {
     })
 }
 
+fn modified_utf16(bytes: &[u8]) -> anyhow::Result<Vec<u16>> {
+    if let Ok(value) = std::str::from_utf8(bytes) {
+        return Ok(value.encode_utf16().collect());
+    }
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let first = bytes[index];
+        let (width, mut value) = match first {
+            0..=0x7f => (1, u16::from(first)),
+            0xc0..=0xdf => (2, u16::from(first & 0x1f)),
+            0xe0..=0xef => (3, u16::from(first & 0x0f)),
+            _ => anyhow::bail!("invalid modified UTF-8 leading byte"),
+        };
+        for next in 1..width {
+            let byte = *bytes
+                .get(index + next)
+                .ok_or_else(|| anyhow::anyhow!("truncated modified UTF-8"))?;
+            if byte & 0xc0 != 0x80 {
+                anyhow::bail!("invalid modified UTF-8 continuation")
+            }
+            value = (value << 6) | u16::from(byte & 0x3f);
+        }
+        units.push(value);
+        index += width;
+    }
+    Ok(units)
+}
+
+/// Only two explicit, bounded literal-decoder templates are evaluated. This
+/// never invokes a bootstrap, class initializer, reflection, or archive code.
+fn normalize_hidden_literals(
+    entries: &mut [ConstantPoolEntry],
+    methods: &mut [MethodScanData],
+    handles: &[u16],
+    arguments: &[Vec<u16>],
+    class_name: &str,
+    private_fields: &[(String, String)],
+) -> anyhow::Result<()> {
+    let mut remaining_bytes = MAX_NORMALIZED_STRING_BYTES;
+    let decoders = methods
+        .iter()
+        .filter(|method| char_array_decoder(method))
+        .map(|method| method.method_name.clone())
+        .collect::<Vec<_>>();
+    let mut resolved = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let ConstantPoolEntry::Dynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } = entry
+        else {
+            continue;
+        };
+        if resolve_name_and_type(entries, *name_and_type_index)
+            .is_none_or(|(_, descriptor)| descriptor != "Ljava/lang/String;")
+        {
+            continue;
+        }
+        let bootstrap_index = usize::from(*bootstrap_method_attr_index);
+        let Some(bootstrap) = handles
+            .get(bootstrap_index)
+            .and_then(|handle| resolve_method_handle(entries, *handle))
+        else {
+            continue;
+        };
+        if bootstrap.owner != class_name
+            || !methods.iter().any(|method| {
+                method.method_name == bootstrap.name
+                    && method.descriptor == bootstrap.descriptor
+                    && indexed_constant_decoder(method)
+            })
+        {
+            continue;
+        }
+        let Some(args) = arguments.get(bootstrap_index) else {
+            continue;
+        };
+        let [cipher, key, salt] = args.as_slice() else {
+            continue;
+        };
+        let Some(ConstantPoolEntry::String { string_index }) = entries.get(usize::from(*cipher))
+        else {
+            continue;
+        };
+        let units = match entries.get(usize::from(*string_index)) {
+            Some(ConstantPoolEntry::Utf8(value)) => value.encode_utf16().collect::<Vec<_>>(),
+            Some(ConstantPoolEntry::Utf16(units)) => units.clone(),
+            _ => continue,
+        };
+        if units.len() > 16 * 1024 {
+            continue;
+        }
+        // Charge the maximum UTF-8 size before decoding, including repeated
+        // CP references to the same cipher. Class-wide expansion is bounded.
+        let cost = units.len().saturating_mul(3).max(1);
+        if cost > remaining_bytes {
+            break;
+        }
+        remaining_bytes -= cost;
+        let (Some(ConstantPoolEntry::Integer(key)), Some(ConstantPoolEntry::Integer(salt))) = (
+            entries.get(usize::from(*key)),
+            entries.get(usize::from(*salt)),
+        ) else {
+            continue;
+        };
+        let decoded = units
+            .iter()
+            .enumerate()
+            .map(|(i, unit)| unit ^ (*key as u16) ^ (salt.wrapping_add(i as i32) as u16))
+            .collect::<Vec<_>>();
+        if let Ok(value) = String::from_utf16(&decoded) {
+            resolved.push((index, value));
+        }
+    }
+    if resolved.is_empty() && decoders.is_empty() {
+        return Ok(());
+    }
+    for (index, value) in resolved {
+        entries[index] = ConstantPoolEntry::ResolvedString(value);
+    }
+    for method in methods.iter_mut() {
+        method.constants.clear();
+        method.calls.clear();
+        method.field_reads.clear();
+        method.field_writes.clear();
+        method.local_origins.clear();
+        method.stack_origins.clear();
+        method.return_origins.clear();
+        method.array_elements.clear();
+        method.array_reads.clear();
+        method.branch_conditions.clear();
+        populate_value_origins_with_budget(entries, method, &decoders, &mut remaining_bytes)?;
+    }
+    resolve_table_calls(entries, methods, handles, class_name, private_fields);
+    Ok(())
+}
+
+/// The supported loop computes `(char + shift) - key[index % key.length]`.
+/// Operand slots, loop guards, updates and returned array must all agree.
+fn char_array_decoder(method: &MethodScanData) -> bool {
+    method.is_static
+        && decoder_loop(method, 4, 0, true)
+        && method.local_origins.len() == 5
+        && method
+            .local_origins
+            .iter()
+            .all(|record| (3..=7).contains(&record.local_index))
+        && method
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode == 0x84)
+            .count()
+            == 2
+        && method.descriptor == "([CLjava/lang/String;I)Ljava/lang/String;"
+        && method.calls.len() == 3
+        && method.calls.iter().all(|call| {
+            call.owner.as_deref() == Some("java/lang/String")
+                && matches!(call.name.as_str(), "length" | "charAt" | "<init>")
+        })
+        && method.instructions.windows(4).any(|window| {
+            window
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .eq([0x60, 0x15, 0x64, 0x92])
+        })
+        && method
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode == 0x55)
+            .count()
+            == 1
+        && [0x34, 0x60, 0x64, 0x70, 0x92].into_iter().all(|opcode| {
+            method
+                .instructions
+                .iter()
+                .filter(|instruction| instruction.opcode == opcode)
+                .count()
+                == 1
+        })
+        && [3, 4].into_iter().all(|slot| {
+            method
+                .local_origins
+                .iter()
+                .filter(|record| record.local_index == slot)
+                .count()
+                == 1
+                && method.local_origins.iter().any(|record| {
+                    record.local_index == slot
+                        && record.origin == ValueOrigin::Constant(ConstantValue::Integer(0))
+                })
+                && method.instructions.iter().any(|instruction| {
+                    instruction.opcode == 0x84 && instruction.operands == [slot as u8, 1]
+                })
+        })
+        && method.field_writes.is_empty()
+        && method.calls.iter().any(|call| {
+            call.name == "charAt" && call.receiver_origin == Some(ValueOrigin::Local(1))
+        })
+        && method.calls.iter().any(|call| {
+            call.name == "length" && call.receiver_origin == Some(ValueOrigin::Local(1))
+        })
+        && method.calls.iter().any(|call| {
+            call.name == "<init>"
+                && call.argument_origins == [ValueOrigin::Local(0)]
+                && method.return_origins.len() == 1
+                && method.return_origins[0].value_origin == call.receiver_origin
+        })
+        && method
+            .control_flow_edges
+            .iter()
+            .any(|edge| edge.to_offset < edge.from_offset)
+        && method
+            .control_flow_edges
+            .iter()
+            .filter(|edge| edge.kind == ControlFlowEdgeKind::Branch)
+            .count()
+            == 2
+        && method.instructions.windows(11).any(|w| {
+            local_load(&w[0]) == Some(5)
+                && local_load(&w[1]) == Some(2)
+                && w[2].opcode == 0x60
+                && local_load(&w[3]) == Some(6)
+                && w[4].opcode == 0x64
+                && w[5].opcode == 0x92
+                && local_store(&w[6]) == Some(7)
+                && local_load(&w[7]) == Some(0)
+                && local_load(&w[8]) == Some(4)
+                && local_load(&w[9]) == Some(7)
+                && w[10].opcode == 0x55
+        })
+        && method.instructions.windows(6).any(|w| {
+            local_load(&w[0]) == Some(1)
+                && local_load(&w[1]) == Some(3)
+                && local_load(&w[2]) == Some(1)
+                && w[4].opcode == 0x70
+                && method
+                    .calls
+                    .iter()
+                    .any(|call| call.offset == w[3].offset && call.name == "length")
+                && method
+                    .calls
+                    .iter()
+                    .any(|call| call.offset == w[5].offset && call.name == "charAt")
+        })
+        && method.instructions.windows(3).any(|w| {
+            local_load(&w[0]) == Some(0)
+                && local_load(&w[1]) == Some(4)
+                && w[2].opcode == 0x34
+                && method.local_origins.iter().any(|record| {
+                    record.local_index == 5
+                        && record.origin == ValueOrigin::Instruction(w[2].offset)
+                })
+        })
+        && method
+            .calls
+            .iter()
+            .find(|call| call.name == "charAt")
+            .is_some_and(|call| {
+                method.local_origins.iter().any(|record| {
+                    record.local_index == 6 && Some(&record.origin) == call.result_origin.as_ref()
+                })
+            })
+}
+
+fn local_load(instruction: &Instruction) -> Option<u16> {
+    match instruction.opcode {
+        0x15 | 0x19 => instruction.operands.first().copied().map(u16::from),
+        0x1a..=0x1d => Some(u16::from(instruction.opcode - 0x1a)),
+        0x2a..=0x2d => Some(u16::from(instruction.opcode - 0x2a)),
+        _ => None,
+    }
+}
+
+fn local_store(instruction: &Instruction) -> Option<u16> {
+    match instruction.opcode {
+        0x36 | 0x3a => instruction.operands.first().copied().map(u16::from),
+        0x3b..=0x3e => Some(u16::from(instruction.opcode - 0x3b)),
+        0x4b..=0x4e => Some(u16::from(instruction.opcode - 0x4b)),
+        _ => None,
+    }
+}
+
+fn indexed_constant_decoder(method: &MethodScanData) -> bool {
+    method.is_static
+        && decoder_loop(method, 7, 6, false)
+        && method.local_origins.len() == 2
+        && method.instructions.iter().filter(|instruction| instruction.opcode == 0x84).count() == 1
+        && method.descriptor == "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;Ljava/lang/String;II)Ljava/lang/String;"
+        && method.calls.len() == 2
+        && method.calls.iter().any(|call| call.owner.as_deref() == Some("java/lang/String") && call.name == "toCharArray" && call.receiver_origin == Some(ValueOrigin::Local(3)))
+        && method.calls.iter().any(|call| call.owner.as_deref() == Some("java/lang/String") && call.name == "<init>" && call.descriptor == "([C)V")
+        && method.instructions.windows(9).any(|window| {
+            window.iter().map(|instruction| instruction.opcode).eq([0x34, 0x15, 0x15, 0x15, 0x60, 0x82, 0x82, 0x92, 0x55])
+                && window[1].operands == [4] && window[2].operands == [5] && window[3].operands == [7]
+        })
+        && method.instructions.iter().any(|instruction| instruction.opcode == 0x84 && instruction.operands == [7, 1])
+        && method.local_origins.iter().filter(|record| record.local_index == 7).count() == 1
+        && method.local_origins.iter().any(|record| record.local_index == 7 && record.origin == ValueOrigin::Constant(ConstantValue::Integer(0)))
+        && [0x34, 0x55, 0x60].into_iter().all(|opcode| method.instructions.iter().filter(|instruction| instruction.opcode == opcode).count() == 1)
+        && method.field_writes.is_empty()
+        && method.control_flow_edges.iter().filter(|edge| edge.kind == ControlFlowEdgeKind::Branch).count() == 2
+        && method.instructions.windows(13).any(|w| {
+            local_load(&w[0]) == Some(6) && local_load(&w[1]) == Some(7)
+                && local_load(&w[2]) == Some(6) && local_load(&w[3]) == Some(7)
+                && w[4].opcode == 0x34 && local_load(&w[5]) == Some(4)
+                && local_load(&w[6]) == Some(5) && local_load(&w[7]) == Some(7)
+                && w[8].opcode == 0x60 && w[9].opcode == 0x82 && w[10].opcode == 0x82
+                && w[11].opcode == 0x92 && w[12].opcode == 0x55
+        })
+        && method.calls.iter().find(|call| call.name == "toCharArray").is_some_and(|input| {
+            method.local_origins.iter().any(|record| record.local_index == 6 && Some(&record.origin) == input.result_origin.as_ref())
+                && method.calls.iter().any(|output| output.name == "<init>" && output.argument_origins.first() == input.result_origin.as_ref()
+                && method.return_origins.len() == 1 && method.return_origins[0].value_origin == output.receiver_origin)
+        })
+}
+
+fn decoder_loop(
+    method: &MethodScanData,
+    index_slot: u16,
+    array_slot: u16,
+    post_test: bool,
+) -> bool {
+    if method
+        .instructions
+        .iter()
+        .any(|instruction| instruction.opcode == 0xc4)
+    {
+        return false;
+    }
+    if method
+        .control_flow_edges
+        .iter()
+        .filter(|edge| edge.kind != ControlFlowEdgeKind::Fallthrough)
+        .count()
+        != 2
+    {
+        return false;
+    }
+    let Some(exit) = method
+        .calls
+        .iter()
+        .find(|call| call.name == "<init>")
+        .and_then(|call| {
+            if let Some(ValueOrigin::Instruction(offset)) = call.receiver_origin {
+                Some(offset)
+            } else {
+                None
+            }
+        })
+    else {
+        return false;
+    };
+    method.instructions.windows(4).any(|guard| {
+        if local_load(&guard[0]) != Some(index_slot)
+            || local_load(&guard[1]) != Some(array_slot)
+            || guard[2].opcode != 0xbe
+            || guard[3].opcode != if post_test { 0xa1 } else { 0xa2 }
+        {
+            return false;
+        }
+        let Some(branch) = method.control_flow_edges.iter().find(|edge| {
+            edge.from_offset == guard[3].offset && edge.kind == ControlFlowEdgeKind::Branch
+        }) else {
+            return false;
+        };
+        if post_test {
+            method.instructions.windows(3).any(|body| {
+                local_load(&body[0]) == Some(array_slot)
+                    && local_load(&body[1]) == Some(index_slot)
+                    && body[2].opcode == 0x34
+                    && branch.to_offset == body[0].offset
+            }) && method
+                .instructions
+                .iter()
+                .find(|instruction| instruction.offset > guard[3].offset)
+                .is_some_and(|instruction| instruction.offset == exit)
+                && method.control_flow_edges.iter().any(|edge| {
+                    edge.to_offset == guard[0].offset
+                        && edge.kind == ControlFlowEdgeKind::Branch
+                        && edge.from_offset < branch.to_offset
+                        && method.instructions.iter().any(|instruction| {
+                            instruction.offset == edge.from_offset && instruction.opcode == 0xa7
+                        })
+                })
+        } else {
+            branch.to_offset == exit
+                && method.control_flow_edges.iter().any(|edge| {
+                    edge.to_offset == guard[0].offset
+                        && edge.kind == ControlFlowEdgeKind::Branch
+                        && edge.from_offset > guard[3].offset
+                        && method.instructions.iter().any(|instruction| {
+                            instruction.offset == edge.from_offset && instruction.opcode == 0xa7
+                        })
+                })
+        }
+    })
+}
+
+fn split_part(method: &MethodScanData, origin: &ValueOrigin, split: &CallSite, index: i32) -> bool {
+    method.array_reads.iter().any(|read| {
+        *origin == ValueOrigin::Instruction(read.offset)
+            && split.result_origin.as_ref() == Some(&read.array_origin)
+            && read.index_origin == ValueOrigin::Constant(ConstantValue::Integer(index))
+    })
+}
+
+/// Recognizes numeric-name dispatch through an immutable literal String[] table.
+/// Both the row layout and the virtual/static branch must match the lookup code.
+fn dispatch_table(method: &MethodScanData) -> Option<ValueOrigin> {
+    let parse = method.calls.iter().find(|call| {
+        call.owner.as_deref() == Some("java/lang/Integer")
+            && call.name == "parseInt"
+            && call.argument_origins == [ValueOrigin::Local(1)]
+    })?;
+    let split = method.calls.iter().find(|call| {
+        call.owner.as_deref() == Some("java/lang/String")
+            && call.name == "split"
+            && call.argument_origins
+                == [ValueOrigin::Constant(ConstantValue::String(":".to_owned()))]
+    })?;
+    let table = method.array_reads.iter().find(|read| {
+        split.receiver_origin == Some(ValueOrigin::Instruction(read.offset))
+            && parse.result_origin.as_ref() == Some(&read.index_origin)
+    })?;
+    if !matches!(&table.array_origin, ValueOrigin::Field { owner, descriptor, .. } if owner == &method.class_name && descriptor == "[Ljava/lang/String;")
+    {
+        return None;
+    }
+    let owner = method.calls.iter().find(|call| {
+        call.owner.as_deref() == Some("java/lang/Class")
+            && call.name == "forName"
+            && call
+                .argument_origins
+                .first()
+                .is_some_and(|origin| split_part(method, origin, split, 0))
+    })?;
+    let descriptor = method.calls.iter().find(|call| {
+        call.owner.as_deref() == Some("java/lang/invoke/MethodType")
+            && call.name == "fromMethodDescriptorString"
+            && call
+                .argument_origins
+                .first()
+                .is_some_and(|origin| split_part(method, origin, split, 2))
+    })?;
+    let kind_length = method.calls.iter().find(|call| {
+        call.owner.as_deref() == Some("java/lang/String")
+            && call.name == "length"
+            && call
+                .receiver_origin
+                .as_ref()
+                .is_some_and(|origin| split_part(method, origin, split, 3))
+    })?;
+    let valid_lookup = |call: &&CallSite, name: &str| {
+        call.owner.as_deref() == Some("java/lang/invoke/MethodHandles$Lookup")
+            && call.name == name
+            && call.receiver_origin == Some(ValueOrigin::Local(0))
+            && call.argument_origins.len() == 3
+            && owner.result_origin.as_ref() == call.argument_origins.first()
+            && split_part(method, &call.argument_origins[1], split, 1)
+            && descriptor.result_origin.as_ref() == call.argument_origins.get(2)
+    };
+    let virtual_call = method
+        .calls
+        .iter()
+        .find(|call| valid_lookup(call, "findVirtual"))?;
+    let static_call = method
+        .calls
+        .iter()
+        .find(|call| valid_lookup(call, "findStatic"))?;
+    let branch = method.branch_conditions.iter().find(|branch| {
+        branch.opcode == 0xa0
+            && kind_length.result_origin.as_ref() == Some(&branch.value_origin)
+            && branch.compared_origin == Some(ValueOrigin::Constant(ConstantValue::Integer(2)))
+    })?;
+    let target = method
+        .control_flow_edges
+        .iter()
+        .find(|edge| edge.from_offset == branch.offset && edge.kind == ControlFlowEdgeKind::Branch)?
+        .to_offset;
+    if !(branch.offset < virtual_call.offset
+        && virtual_call.offset < target
+        && target <= static_call.offset)
+    {
+        return None;
+    }
+    if !returns_lookup_result(method, virtual_call, static_call) {
+        return None;
+    }
+    Some(table.array_origin.clone())
+}
+
+fn returns_lookup_result(
+    method: &MethodScanData,
+    virtual_call: &CallSite,
+    static_call: &CallSite,
+) -> bool {
+    let constructors = method
+        .calls
+        .iter()
+        .filter(|call| {
+            call.owner.as_deref() == Some("java/lang/invoke/ConstantCallSite")
+                && call.name == "<init>"
+        })
+        .collect::<Vec<_>>();
+    let [constructor] = constructors.as_slice() else {
+        return false;
+    };
+    if constructor.descriptor != "(Ljava/lang/invoke/MethodHandle;)V" {
+        return false;
+    }
+    let Some(index) = method
+        .instructions
+        .iter()
+        .position(|instruction| instruction.offset == constructor.offset)
+    else {
+        return false;
+    };
+    let Some(prefix) = index
+        .checked_sub(3)
+        .and_then(|start| method.instructions.get(start..index))
+    else {
+        return false;
+    };
+    let Some(load) = prefix.last() else {
+        return false;
+    };
+    let slot = match load.opcode {
+        0x19 => load.operands.first().copied().map(u16::from),
+        0x2a..=0x2d => Some(u16::from(load.opcode - 0x2a)),
+        _ => None,
+    };
+    let Some(slot) = slot else { return false };
+    if prefix[0].opcode != 0xbb
+        || prefix[1].opcode != 0x59
+        || constructor.receiver_origin != Some(ValueOrigin::Instruction(prefix[0].offset))
+        || method
+            .instructions
+            .get(index + 1)
+            .is_none_or(|instruction| instruction.opcode != 0xb0)
+        || !method
+            .return_origins
+            .iter()
+            .any(|returned| returned.value_origin == constructor.receiver_origin)
+    {
+        return false;
+    }
+    [virtual_call, static_call].into_iter().all(|lookup| {
+        let Some(call_index) = method
+            .instructions
+            .iter()
+            .position(|instruction| instruction.offset == lookup.offset)
+        else {
+            return false;
+        };
+        let Some(store) = method.instructions.get(call_index + 1) else {
+            return false;
+        };
+        let stored_slot = match store.opcode {
+            0x3a => store.operands.first().copied().map(u16::from),
+            0x4b..=0x4e => Some(u16::from(store.opcode - 0x4b)),
+            _ => None,
+        };
+        stored_slot == Some(slot)
+            && method.local_origins.iter().any(|record| {
+                record.offset == store.offset
+                    && record.local_index == slot
+                    && Some(&record.origin) == lookup.result_origin.as_ref()
+            })
+            && method
+                .instructions
+                .get(call_index + 2)
+                .is_some_and(|jump| jump_reaches(method, jump.offset, prefix[0].offset))
+    })
+}
+
+fn jump_reaches(method: &MethodScanData, mut offset: u32, target: u32) -> bool {
+    for _ in 0..4 {
+        if method
+            .instructions
+            .iter()
+            .find(|instruction| instruction.offset == offset)
+            .is_none_or(|instruction| instruction.opcode != 0xa7)
+        {
+            return false;
+        }
+        let Some(edge) = method
+            .control_flow_edges
+            .iter()
+            .find(|edge| edge.from_offset == offset && edge.kind == ControlFlowEdgeKind::Branch)
+        else {
+            return false;
+        };
+        if edge.to_offset == target {
+            return true;
+        }
+        offset = edge.to_offset;
+    }
+    false
+}
+
+fn literal_table(
+    methods: &[MethodScanData],
+    table: &ValueOrigin,
+) -> Option<std::collections::HashMap<u16, String>> {
+    let ValueOrigin::Field {
+        owner,
+        name,
+        descriptor,
+    } = table
+    else {
+        return None;
+    };
+    let mut writes = methods
+        .iter()
+        .flat_map(|method| method.field_writes.iter().map(move |write| (method, write)))
+        .filter(|(_, write)| {
+            write.owner == *owner && write.name == *name && write.descriptor == *descriptor
+        });
+    let (initializer, assignment) = writes.next()?;
+    if initializer.method_name != "<clinit>"
+        && !methods.iter().any(|method| {
+            method.method_name == "<clinit>"
+                && method.calls.first().is_some_and(|call| {
+                    call.offset == 0
+                        && call.kind == InvokeKind::Static
+                        && call.owner.as_deref() == Some(initializer.class_name.as_str())
+                        && call.name == initializer.method_name
+                        && call.descriptor == "()V"
+                })
+        })
+    {
+        return None;
+    }
+    if writes.next().is_some()
+        || !initializer.is_static
+        || initializer.descriptor != "()V"
+        || initializer
+            .control_flow_edges
+            .iter()
+            .any(|edge| edge.kind != ControlFlowEdgeKind::Fallthrough)
+        || !matches!(assignment.value_origin, Some(ValueOrigin::Instruction(offset)) if initializer.instructions.iter().any(|instruction| instruction.offset == offset && instruction.opcode == 0xbd))
+    {
+        return None;
+    }
+    let allocation = assignment.value_origin.as_ref()?;
+    if initializer.field_writes.iter().any(|write| {
+        write.offset != assignment.offset && write.value_origin.as_ref() == Some(allocation)
+    }) || initializer.array_elements.iter().any(|element| {
+        element.value_origin == *allocation
+            || (element.array_origin == *allocation && element.offset > assignment.offset)
+    }) || initializer.calls.iter().any(|call| {
+        call.argument_origins.contains(allocation)
+            || call.receiver_origin.as_ref() == Some(allocation)
+    }) || initializer
+        .return_origins
+        .iter()
+        .any(|value| value.value_origin.as_ref() == Some(allocation))
+    {
+        return None;
+    }
+    // The supported initializer is literal-only. It must not expose the table
+    // to another call/field/array or permit later stores through aliases.
+    if methods.iter().any(|method| {
+        method.calls.iter().any(|call| {
+            call.argument_origins.contains(table) || call.receiver_origin.as_ref() == Some(table)
+        }) || method
+            .field_writes
+            .iter()
+            .any(|write| write.value_origin.as_ref() == Some(table))
+            || method
+                .return_origins
+                .iter()
+                .any(|value| value.value_origin.as_ref() == Some(table))
+            || method.array_elements.iter().any(|element| {
+                element.value_origin == *table
+                    || (element.array_origin == *table && !std::ptr::eq(method, initializer))
+            })
+    }) {
+        return None;
+    }
+    if initializer.calls.iter().any(|call| {
+        !matches!(
+            call.result_origin,
+            Some(ValueOrigin::Constant(ConstantValue::String(_)))
+        ) && !(call.owner.as_deref() == Some("java/lang/String")
+            && call.name == "<init>"
+            && initializer.constants.iter().any(|value| {
+                value.offset == call.offset && matches!(value.value, ConstantValue::String(_))
+            }))
+    }) {
+        return None;
+    }
+    let mut rows = std::collections::HashMap::new();
+    for element in initializer
+        .array_elements
+        .iter()
+        .filter(|element| element.array_origin == *table)
+    {
+        let ValueOrigin::Constant(ConstantValue::String(value)) = &element.value_origin else {
+            return None;
+        };
+        let index = element.index?;
+        if element.offset < assignment.offset
+            || value.len() > 2048
+            || rows.len() == 512
+            || rows.insert(index, value.clone()).is_some()
+        {
+            return None;
+        }
+    }
+    (!rows.is_empty()).then_some(rows)
+}
+
+fn resolve_table_calls(
+    entries: &[ConstantPoolEntry],
+    methods: &mut [MethodScanData],
+    handles: &[u16],
+    class_name: &str,
+    private_fields: &[(String, String)],
+) {
+    const DESCRIPTOR: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;";
+    let tables = methods
+        .iter()
+        .filter(|method| method.is_static && method.descriptor == DESCRIPTOR)
+        .take(8)
+        .filter_map(|factory| {
+            let table = dispatch_table(factory)?;
+            let ValueOrigin::Field {
+                name, descriptor, ..
+            } = &table
+            else {
+                return None;
+            };
+            if !private_fields
+                .iter()
+                .any(|field| field.0 == *name && field.1 == *descriptor)
+            {
+                return None;
+            }
+            Some((factory.method_name.clone(), literal_table(methods, &table)?))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut targets = std::collections::HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let ConstantPoolEntry::Dynamic {
+            bootstrap_method_attr_index,
+            name_and_type_index,
+        } = entry
+        else {
+            continue;
+        };
+        let Some(bootstrap) = handles
+            .get(usize::from(*bootstrap_method_attr_index))
+            .and_then(|handle| resolve_method_handle(entries, *handle))
+        else {
+            continue;
+        };
+        if bootstrap.owner != class_name || bootstrap.descriptor != DESCRIPTOR {
+            continue;
+        }
+        let Some(table) = tables.get(&bootstrap.name) else {
+            continue;
+        };
+        let Some((name, site_descriptor)) = resolve_name_and_type(entries, *name_and_type_index)
+        else {
+            continue;
+        };
+        let Ok(row_index) = name.parse::<u16>() else {
+            continue;
+        };
+        let Some(row) = table.get(&row_index) else {
+            continue;
+        };
+        let parts = row.split(':').collect::<Vec<_>>();
+        let [owner, name, descriptor, kind] = parts.as_slice() else {
+            continue;
+        };
+        let kind = match *kind {
+            " " => InvokeKind::Static,
+            "  " => InvokeKind::Virtual,
+            _ => continue,
+        };
+        if !descriptor.starts_with('(') || descriptor_shape(descriptor).is_none() {
+            continue;
+        }
+        let owner = owner.replace('.', "/");
+        let expected = if kind == InvokeKind::Virtual {
+            format!("(L{owner};{}", &descriptor[1..])
+        } else {
+            descriptor.to_string()
+        };
+        if site_descriptor != expected {
+            continue;
+        }
+        targets.insert(
+            index as u16,
+            (owner, name.to_string(), descriptor.to_string(), kind),
+        );
+    }
+    for method in methods {
+        for call in method
+            .calls
+            .iter_mut()
+            .filter(|call| call.kind == InvokeKind::Dynamic)
+        {
+            let Some(instruction) = method.instructions.iter().find(|instruction| {
+                instruction.offset == call.offset && instruction.opcode == 0xba
+            }) else {
+                continue;
+            };
+            let Some(bytes) = instruction.operands.get(..2) else {
+                continue;
+            };
+            let index = u16::from_be_bytes([bytes[0], bytes[1]]);
+            let Some((owner, name, descriptor, kind)) = targets.get(&index) else {
+                continue;
+            };
+            if *kind == InvokeKind::Virtual {
+                if call.argument_origins.is_empty() {
+                    continue;
+                }
+                call.receiver_origin = Some(call.argument_origins.remove(0));
+            }
+            call.owner = Some(owner.clone());
+            call.name = name.clone();
+            call.descriptor = descriptor.clone();
+            call.kind = *kind;
+        }
+    }
+}
+
 fn parse_constant_pool(cursor: &mut ClassCursor<'_>) -> anyhow::Result<Vec<ConstantPoolEntry>> {
     let constant_pool_count = cursor.read_u16()? as usize;
     let mut entries = vec![ConstantPoolEntry::Other; constant_pool_count];
@@ -301,8 +1158,11 @@ fn parse_constant_pool(cursor: &mut ClassCursor<'_>) -> anyhow::Result<Vec<Const
             1 => {
                 let length = cursor.read_u16()? as usize;
                 let bytes = cursor.read_bytes(length)?;
-                entries[index] =
-                    ConstantPoolEntry::Utf8(String::from_utf8_lossy(bytes).to_string());
+                let units = modified_utf16(bytes)?;
+                entries[index] = match String::from_utf16(&units) {
+                    Ok(value) => ConstantPoolEntry::Utf8(value),
+                    Err(_) => ConstantPoolEntry::Utf16(units),
+                };
             }
             3 => {
                 entries[index] = ConstantPoolEntry::Integer(cursor.read_u32()? as i32);
@@ -363,7 +1223,9 @@ fn constant_pool_strings(entries: &[ConstantPoolEntry]) -> Vec<String> {
     entries
         .iter()
         .filter_map(|entry| match entry {
-            ConstantPoolEntry::Utf8(value) => Some(value.clone()),
+            ConstantPoolEntry::Utf8(value) | ConstantPoolEntry::ResolvedString(value) => {
+                Some(value.clone())
+            }
             _ => None,
         })
         .collect()
@@ -401,15 +1263,26 @@ fn skip_interfaces(cursor: &mut ClassCursor<'_>) -> anyhow::Result<()> {
     cursor.skip(interface_count * 2)
 }
 
-fn skip_members(cursor: &mut ClassCursor<'_>) -> anyhow::Result<()> {
+fn private_static_fields(
+    cursor: &mut ClassCursor<'_>,
+    entries: &[ConstantPoolEntry],
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut fields = Vec::new();
     let member_count = cursor.read_u16()? as usize;
     for _ in 0..member_count {
-        let _access_flags = cursor.read_u16()?;
-        let _name_index = cursor.read_u16()?;
-        let _descriptor_index = cursor.read_u16()?;
+        let access_flags = cursor.read_u16()?;
+        let name_index = cursor.read_u16()?;
+        let descriptor_index = cursor.read_u16()?;
+        if access_flags & 0x000a == 0x000a {
+            if let (Some(name), Some(descriptor)) =
+                (utf8(entries, name_index), utf8(entries, descriptor_index))
+            {
+                fields.push((name.to_owned(), descriptor.to_owned()));
+            }
+        }
         skip_attributes(cursor)?;
     }
-    Ok(())
+    Ok(fields)
 }
 
 fn parse_methods(
@@ -457,12 +1330,13 @@ fn parse_methods(
 }
 
 /// Reads the class-level attributes and returns the method-handle index of each
-/// `BootstrapMethods` entry; bootstrap arguments are not needed for scoring.
+/// `BootstrapMethods` entry together with its constant-pool arguments.
 fn parse_bootstrap_method_handles(
     cursor: &mut ClassCursor<'_>,
     entries: &[ConstantPoolEntry],
-) -> anyhow::Result<Vec<u16>> {
+) -> anyhow::Result<(Vec<u16>, Vec<Vec<u16>>)> {
     let mut handles = Vec::new();
+    let mut arguments = Vec::new();
     let attribute_count = cursor.read_u16()? as usize;
     for _ in 0..attribute_count {
         let attribute_name_index = cursor.read_u16()?;
@@ -476,10 +1350,14 @@ fn parse_bootstrap_method_handles(
         for _ in 0..bootstrap_count {
             handles.push(attribute.read_u16()?);
             let argument_count = attribute.read_u16()? as usize;
-            attribute.skip(argument_count * 2)?;
+            let mut values = Vec::with_capacity(argument_count);
+            for _ in 0..argument_count {
+                values.push(attribute.read_u16()?);
+            }
+            arguments.push(values);
         }
     }
-    Ok(handles)
+    Ok((handles, arguments))
 }
 
 /// Resolves bootstrap methods actually referenced from the constant pool and
@@ -782,11 +1660,43 @@ fn populate_value_origins(
     entries: &[ConstantPoolEntry],
     data: &mut MethodScanData,
 ) -> anyhow::Result<()> {
+    populate_value_origins_with_budget(entries, data, &[], &mut 0)
+}
+
+#[cfg(test)]
+fn populate_value_origins_with_decoders(
+    entries: &[ConstantPoolEntry],
+    data: &mut MethodScanData,
+    decoder_names: &[String],
+) -> anyhow::Result<()> {
+    let mut remaining_bytes = MAX_NORMALIZED_STRING_BYTES;
+    populate_value_origins_with_budget(entries, data, decoder_names, &mut remaining_bytes)
+}
+
+fn populate_value_origins_with_budget(
+    entries: &[ConstantPoolEntry],
+    data: &mut MethodScanData,
+    decoder_names: &[String],
+    remaining_bytes: &mut usize,
+) -> anyhow::Result<()> {
     let mut stack = Vec::new();
     let mut locals = std::collections::BTreeMap::<u16, ValueOrigin>::new();
+    let mut char_array_lengths = Vec::<(ValueOrigin, usize)>::new();
+    let mut branch_target_offsets = std::collections::BTreeSet::new();
+
+    for instruction in &data.instructions {
+        for (target, _) in branch_targets(instruction)? {
+            if let Ok(target) = u32::try_from(target) {
+                branch_target_offsets.insert(target);
+            }
+        }
+    }
 
     for instruction in data.instructions.clone() {
         let offset = instruction.offset;
+        if branch_target_offsets.contains(&offset) {
+            invalidate_control_flow_state(&mut stack, &mut locals, &mut char_array_lengths);
+        }
         match instruction.opcode {
             0x01 => stack.push(ValueOrigin::Unknown),
             0x02..=0x08 => stack.push(ValueOrigin::Constant(ConstantValue::Integer(
@@ -832,7 +1742,7 @@ fn populate_value_origins(
             0x2e..=0x35 => {
                 let index_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
                 let array_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
-                if instruction.opcode == 0x33 {
+                if matches!(instruction.opcode, 0x32 | 0x33) {
                     data.array_reads.push(ArrayReadOrigin {
                         offset,
                         array_origin,
@@ -882,16 +1792,33 @@ fn populate_value_origins(
                 stack.push(previous);
             }
             0x74..=0x77 | 0x85..=0x93 => {
-                let _ = stack.pop();
-                stack.push(ValueOrigin::Instruction(offset));
+                let operand = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                stack.push(
+                    fold_unary_integer(instruction.opcode, &operand)
+                        .map(|value| ValueOrigin::Constant(ConstantValue::Integer(value)))
+                        .unwrap_or(ValueOrigin::Instruction(offset)),
+                );
             }
             0x60..=0x73 | 0x78..=0x83 | 0x94..=0x98 => {
-                let _ = stack.pop();
-                let _ = stack.pop();
-                stack.push(ValueOrigin::Instruction(offset));
+                let right = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                let left = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                stack.push(
+                    fold_binary_integer(instruction.opcode, &left, &right)
+                        .map(|value| ValueOrigin::Constant(ConstantValue::Integer(value)))
+                        .unwrap_or(ValueOrigin::Instruction(offset)),
+                );
             }
-            0x84 => {}
-            0x4f..=0x56 => store_array_element(&mut stack, data, offset, instruction.opcode),
+            0x84 => {
+                let index = u16::from(instruction.operands[0]);
+                locals.insert(index, ValueOrigin::Instruction(offset));
+            }
+            0x4f..=0x56 => store_array_element(
+                &mut stack,
+                data,
+                offset,
+                instruction.opcode,
+                &mut char_array_lengths,
+            ),
             0x99..=0x9e | 0xc6 | 0xc7 => {
                 let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
                 data.branch_conditions.push(BranchCondition {
@@ -911,8 +1838,23 @@ fn populate_value_origins(
                     compared_origin,
                 });
             }
-            0xb2..=0xb5 => populate_field_access(entries, &instruction, &mut stack, data)?,
-            0xb6..=0xb9 | 0xba => populate_call(entries, &instruction, &mut stack, data)?,
+            0xb2..=0xb5 => {
+                if matches!(instruction.opcode, 0xb3 | 0xb5) {
+                    if let Some(value) = stack.last() {
+                        invalidate_cached_char_array(value, &mut char_array_lengths);
+                    }
+                }
+                populate_field_access(entries, &instruction, &mut stack, data)?;
+            }
+            0xb6..=0xb9 | 0xba => populate_call(
+                entries,
+                &instruction,
+                &mut stack,
+                data,
+                decoder_names,
+                &mut char_array_lengths,
+                remaining_bytes,
+            )?,
             0xbb => stack.push(ValueOrigin::Instruction(offset)),
             0xbd => {
                 let _ = stack.pop();
@@ -926,12 +1868,24 @@ fn populate_value_origins(
                 stack.push(ValueOrigin::Instruction(offset));
             }
             0xbc => {
-                let _ = stack.pop();
-                stack.push(ValueOrigin::Instruction(offset));
+                let length = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                let array_origin = ValueOrigin::Instruction(offset);
+                if instruction.operands.first() == Some(&5) {
+                    if let ValueOrigin::Constant(ConstantValue::Integer(length)) = length {
+                        if (0..=MAX_CONSTANT_CHAR_ARRAY_LENGTH as i32).contains(&length) {
+                            char_array_lengths.push((array_origin.clone(), length as usize));
+                        }
+                    }
+                }
+                stack.push(array_origin);
             }
             0xbe => {
                 let _ = stack.pop();
                 stack.push(ValueOrigin::Instruction(offset));
+            }
+            0xc4 if instruction.operands.first() == Some(&0x84) => {
+                let index = u16::from_be_bytes([instruction.operands[1], instruction.operands[2]]);
+                locals.insert(index, ValueOrigin::Instruction(offset));
             }
             0xac..=0xb0 => {
                 data.return_origins.push(ReturnOrigin {
@@ -947,10 +1901,79 @@ fn populate_value_origins(
         if !branch_targets(&instruction)?.is_empty() {
             // A single linear state cannot soundly represent a join. Clear it
             // rather than fabricating a value relationship across branches.
-            stack.clear();
+            invalidate_control_flow_state(&mut stack, &mut locals, &mut char_array_lengths);
         }
     }
     Ok(())
+}
+
+const MAX_CONSTANT_CHAR_ARRAY_LENGTH: usize = 16 * 1024;
+const MAX_NORMALIZED_STRING_BYTES: usize = 256 * 1024;
+
+fn invalidate_control_flow_state(
+    stack: &mut Vec<ValueOrigin>,
+    locals: &mut std::collections::BTreeMap<u16, ValueOrigin>,
+    char_array_lengths: &mut Vec<(ValueOrigin, usize)>,
+) {
+    stack.clear();
+    char_array_lengths.clear();
+    for (index, origin) in locals {
+        if matches!(origin, ValueOrigin::Constant(_)) {
+            *origin = ValueOrigin::Local(*index);
+        }
+    }
+}
+
+fn invalidate_cached_char_array(
+    array_origin: &ValueOrigin,
+    char_array_lengths: &mut Vec<(ValueOrigin, usize)>,
+) {
+    char_array_lengths.retain(|(origin, _)| origin != array_origin);
+}
+
+fn fold_unary_integer(opcode: u8, operand: &ValueOrigin) -> Option<i32> {
+    let ValueOrigin::Constant(ConstantValue::Integer(value)) = operand else {
+        return None;
+    };
+    match opcode {
+        0x74 => Some(value.wrapping_neg()),
+        0x91 => Some((*value as i8) as i32),
+        0x92 => Some((*value as u16) as i32),
+        0x93 => Some((*value as i16) as i32),
+        _ => None,
+    }
+}
+
+fn fold_binary_integer(opcode: u8, left: &ValueOrigin, right: &ValueOrigin) -> Option<i32> {
+    let (
+        ValueOrigin::Constant(ConstantValue::Integer(left)),
+        ValueOrigin::Constant(ConstantValue::Integer(right)),
+    ) = (left, right)
+    else {
+        return None;
+    };
+    match opcode {
+        0x60 => Some(left.wrapping_add(*right)),
+        0x64 => Some(left.wrapping_sub(*right)),
+        0x68 => Some(left.wrapping_mul(*right)),
+        0x6c if *right != 0 => Some(if *left == i32::MIN && *right == -1 {
+            i32::MIN
+        } else {
+            *left / *right
+        }),
+        0x70 if *right != 0 => Some(if *left == i32::MIN && *right == -1 {
+            0
+        } else {
+            *left % *right
+        }),
+        0x78 => Some(left.wrapping_shl((*right as u32) & 0x1f)),
+        0x7a => Some(*left >> ((*right as u32) & 0x1f)),
+        0x7c => Some(((*left as u32) >> ((*right as u32) & 0x1f)) as i32),
+        0x7e => Some(*left & *right),
+        0x80 => Some(*left | *right),
+        0x82 => Some(*left ^ *right),
+        _ => None,
+    }
 }
 
 fn store_array_element(
@@ -958,8 +1981,12 @@ fn store_array_element(
     data: &mut MethodScanData,
     offset: u32,
     opcode: u8,
+    char_array_lengths: &mut Vec<(ValueOrigin, usize)>,
 ) {
     let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+    if opcode == 0x53 {
+        invalidate_cached_char_array(&value_origin, char_array_lengths);
+    }
     let index = match stack.pop() {
         Some(ValueOrigin::Constant(ConstantValue::Integer(value))) if value >= 0 => {
             u16::try_from(value).ok()
@@ -967,7 +1994,7 @@ fn store_array_element(
         _ => None,
     };
     let array_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
-    if matches!(opcode, 0x53 | 0x54) {
+    if matches!(opcode, 0x53 | 0x54 | 0x55) {
         data.array_elements.push(ArrayElementOrigin {
             offset,
             array_origin,
@@ -1071,6 +2098,9 @@ fn populate_call(
     instruction: &Instruction,
     stack: &mut Vec<ValueOrigin>,
     data: &mut MethodScanData,
+    decoder_names: &[String],
+    char_array_lengths: &mut Vec<(ValueOrigin, usize)>,
+    remaining_bytes: &mut usize,
 ) -> anyhow::Result<()> {
     let index = u16::from_be_bytes([instruction.operands[0], instruction.operands[1]]);
     let (kind, reference) = match instruction.opcode {
@@ -1093,29 +2123,172 @@ fn populate_call(
         InvokeKind::Static | InvokeKind::Dynamic => None,
         _ => Some(stack.pop().unwrap_or(ValueOrigin::Unknown)),
     };
+    let is_string_char_array_copy = kind == InvokeKind::Special
+        && owner == "java/lang/String"
+        && name == "<init>"
+        && descriptor == "([C)V";
+    let normalized_string = (*remaining_bytes > 0)
+        .then(|| {
+            decode_char_array_call(
+                &owner,
+                &name,
+                &descriptor,
+                kind,
+                data,
+                &argument_origins,
+                decoder_names,
+                char_array_lengths,
+                instruction.offset,
+            )
+            .or_else(|| {
+                if is_string_char_array_copy {
+                    let array = argument_origins.first()?;
+                    let units =
+                        constant_char_array(data, array, char_array_lengths, instruction.offset)?;
+                    String::from_utf16(&units).ok()
+                } else {
+                    None
+                }
+            })
+        })
+        .flatten()
+        .filter(|value| {
+            if value.len().max(1) > *remaining_bytes {
+                *remaining_bytes = 0;
+                false
+            } else {
+                *remaining_bytes -= value.len().max(1);
+                true
+            }
+        });
+    if !is_string_char_array_copy {
+        // Calls may mutate char[] arguments. The recognized decoder is also
+        // treated as in-place after its current contents have been normalized.
+        char_array_lengths
+            .retain(|(origin, _)| !argument_origins.iter().any(|argument| argument == origin));
+    }
     data.stack_origins.push(StackOrigin {
         offset: instruction.offset,
         values: argument_origins.clone(),
     });
-    let result_origin = has_result.then_some(ValueOrigin::Instruction(instruction.offset));
+    let result_origin = if has_result {
+        if let Some(value) = normalized_string.as_ref() {
+            Some(ValueOrigin::Constant(ConstantValue::String(value.clone())))
+        } else {
+            Some(ValueOrigin::Instruction(instruction.offset))
+        }
+    } else {
+        None
+    };
     data.calls.push(CallSite {
         offset: instruction.offset,
         kind,
         owner: (!owner.is_empty()).then_some(owner),
         name,
         descriptor,
-        receiver_origin,
+        receiver_origin: receiver_origin.clone(),
         argument_origins,
         result_origin: result_origin.clone(),
     });
     if let Some(origin) = result_origin {
         stack.push(origin);
     }
+    if let Some(value) = normalized_string {
+        data.constants.push(LoadedConstant {
+            offset: instruction.offset,
+            value: ConstantValue::String(value.clone()),
+        });
+        if !has_result {
+            if let Some(receiver) = receiver_origin.as_ref() {
+                let normalized = ValueOrigin::Constant(ConstantValue::String(value));
+                for origin in stack {
+                    if origin == receiver {
+                        *origin = normalized.clone();
+                    }
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+fn decode_char_array_call(
+    owner: &str,
+    name: &str,
+    descriptor: &str,
+    kind: InvokeKind,
+    data: &MethodScanData,
+    arguments: &[ValueOrigin],
+    decoder_names: &[String],
+    char_array_lengths: &[(ValueOrigin, usize)],
+    call_offset: u32,
+) -> Option<String> {
+    if kind != InvokeKind::Static
+        || owner != data.class_name
+        || descriptor != "([CLjava/lang/String;I)Ljava/lang/String;"
+        || !decoder_names.iter().any(|decoder| decoder == name)
+    {
+        return None;
+    }
+    let array = arguments.first()?;
+    let key = match arguments.get(1)? {
+        ValueOrigin::Constant(ConstantValue::String(key)) => key,
+        _ => return None,
+    };
+    let shift = match arguments.get(2)? {
+        ValueOrigin::Constant(ConstantValue::Integer(value)) => *value as u16,
+        _ => return None,
+    };
+    let units = constant_char_array(data, array, char_array_lengths, call_offset)?;
+    let key_units: Vec<u16> = key.encode_utf16().collect();
+    if key_units.is_empty() {
+        return None;
+    }
+    let decoded: Vec<u16> = units
+        .iter()
+        .enumerate()
+        .map(|(index, unit)| {
+            unit.wrapping_add(shift)
+                .wrapping_sub(key_units[index % key_units.len()])
+        })
+        .collect();
+    String::from_utf16(&decoded).ok()
+}
+
+fn constant_char_array(
+    data: &MethodScanData,
+    array_origin: &ValueOrigin,
+    char_array_lengths: &[(ValueOrigin, usize)],
+    before_offset: u32,
+) -> Option<Vec<u16>> {
+    let length = char_array_lengths
+        .iter()
+        .find(|(origin, _)| origin == array_origin)
+        .map(|(_, length)| *length)?;
+    if length > MAX_CONSTANT_CHAR_ARRAY_LENGTH {
+        return None;
+    }
+    let mut values = vec![None; length];
+    for element in data
+        .array_elements
+        .iter()
+        .filter(|element| element.array_origin == *array_origin && element.offset < before_offset)
+    {
+        let index = usize::from(element.index?);
+        if index >= length {
+            return None;
+        }
+        let ValueOrigin::Constant(ConstantValue::Integer(value)) = &element.value_origin else {
+            return None;
+        };
+        values[index] = Some(*value as u16);
+    }
+    values.into_iter().collect()
 }
 
 fn constant_value(entries: &[ConstantPoolEntry], index: u16) -> ConstantValue {
     match entries.get(index as usize) {
+        Some(ConstantPoolEntry::ResolvedString(value)) => ConstantValue::String(value.clone()),
         Some(ConstantPoolEntry::String { string_index }) => utf8(entries, *string_index)
             .map(|value| ConstantValue::String(value.to_owned()))
             .unwrap_or(ConstantValue::Unknown),
@@ -1475,6 +2648,356 @@ impl<'a> ClassCursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn modified_utf8_preserves_encrypted_surrogates_and_nulls() {
+        assert_eq!(super::modified_utf16(&[0xc0, 0x80]).unwrap(), [0]);
+        assert_eq!(
+            super::modified_utf16(&[0xed, 0xa0, 0x80]).unwrap(),
+            [0xd800]
+        );
+        assert_eq!(
+            super::modified_utf16(&[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]).unwrap(),
+            [0xd83d, 0xde00]
+        );
+        assert!(super::modified_utf16(&[0xed, 0xa0]).is_err());
+    }
+
+    #[test]
+    fn resolves_only_the_supported_indexed_string_bootstrap() {
+        use super::ConstantPoolEntry::*;
+        const DESCRIPTOR: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;Ljava/lang/String;II)Ljava/lang/String;";
+        let encoded = "/login "
+            .encode_utf16()
+            .enumerate()
+            .map(|(i, unit)| unit ^ 0xd800 ^ i as u16)
+            .collect();
+        let entries = vec![
+            Other,
+            Utf8("java/lang/String".to_owned()),
+            Class { name_index: 1 },
+            Utf8("toCharArray".to_owned()),
+            Utf8("()[C".to_owned()),
+            NameAndType {
+                name_index: 3,
+                descriptor_index: 4,
+            },
+            Ref {
+                tag: 10,
+                class_index: 2,
+                name_and_type_index: 5,
+            },
+            Utf8("<init>".to_owned()),
+            Utf8("([C)V".to_owned()),
+            NameAndType {
+                name_index: 7,
+                descriptor_index: 8,
+            },
+            Ref {
+                tag: 10,
+                class_index: 2,
+                name_and_type_index: 9,
+            },
+            Utf8("example/Test".to_owned()),
+            Class { name_index: 11 },
+            Utf8("decode".to_owned()),
+            Utf8(DESCRIPTOR.to_owned()),
+            NameAndType {
+                name_index: 13,
+                descriptor_index: 14,
+            },
+            Ref {
+                tag: 10,
+                class_index: 12,
+                name_and_type_index: 15,
+            },
+            MethodHandle {
+                reference_index: 16,
+            },
+            Utf16(encoded),
+            String { string_index: 18 },
+            Integer(0xd800),
+            Integer(0),
+            Utf8("hidden".to_owned()),
+            Utf8("Ljava/lang/String;".to_owned()),
+            NameAndType {
+                name_index: 22,
+                descriptor_index: 23,
+            },
+            Dynamic {
+                bootstrap_method_attr_index: 0,
+                name_and_type_index: 24,
+            },
+        ];
+        let code = [
+            0x2d, 0xb6, 0, 6, 0x3a, 6, 0x11, 0x1c, 0xd0, 0x11, 0x82, 0x20, 0x7e, 0x36, 7, 0x15, 7,
+            0x19, 6, 0xbe, 0xa2, 0, 29, 0x19, 6, 0x15, 7, 0x19, 6, 0x15, 7, 0x34, 0x15, 4, 0x15, 5,
+            0x15, 7, 0x60, 0x82, 0x82, 0x92, 0x55, 0x84, 7, 1, 0xa7, 0xff, 0xe1, 0xbb, 0, 2, 0x59,
+            0x19, 6, 0xb7, 0, 10, 0xb0,
+        ];
+        let method =
+            super::parse_method_code(&entries, &code, "example/Test", "decode", DESCRIPTOR, true)
+                .unwrap();
+        assert!(super::indexed_constant_decoder(&method));
+        let mut wide_update = method.clone();
+        wide_update.instructions.push(super::Instruction {
+            offset: 59,
+            opcode: 0xc4,
+            operands: vec![0x84, 0, 7, 0, 1],
+        });
+        assert!(!super::indexed_constant_decoder(&wide_update));
+        let mut resolved = entries.clone();
+        super::normalize_hidden_literals(
+            &mut resolved,
+            &mut [method.clone()],
+            &[17],
+            &[vec![19, 20, 21]],
+            "example/Test",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            super::constant_value(&resolved, 25),
+            super::ConstantValue::String("/login ".to_owned())
+        );
+        let mut expanded = entries.clone();
+        expanded[18] = Utf16((0..16 * 1024).map(|i| 65 ^ 0xd800 ^ i as u16).collect());
+        expanded.extend((0..32).map(|_| Dynamic {
+            bootstrap_method_attr_index: 0,
+            name_and_type_index: 24,
+        }));
+        super::normalize_hidden_literals(
+            &mut expanded,
+            &mut [method.clone()],
+            &[17],
+            &[vec![19, 20, 21]],
+            "example/Test",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            expanded
+                .iter()
+                .filter(|entry| matches!(entry, ResolvedString(_)))
+                .count(),
+            super::MAX_NORMALIZED_STRING_BYTES / (16 * 1024 * 3)
+        );
+        let mut changed_condition = code;
+        changed_condition[20] = 0xa1;
+        let skipped = super::parse_method_code(
+            &entries,
+            &changed_condition,
+            "example/Test",
+            "decode",
+            DESCRIPTOR,
+            true,
+        )
+        .unwrap();
+        assert!(!super::indexed_constant_decoder(&skipped));
+        let mut changed_key = code;
+        changed_key[33] = 5;
+        let method = super::parse_method_code(
+            &entries,
+            &changed_key,
+            "example/Test",
+            "decode",
+            DESCRIPTOR,
+            true,
+        )
+        .unwrap();
+        let mut unresolved = entries;
+        super::normalize_hidden_literals(
+            &mut unresolved,
+            &mut [method],
+            &[17],
+            &[vec![19, 20, 21]],
+            "example/Test",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            super::constant_value(&unresolved, 25),
+            super::ConstantValue::Unknown
+        );
+    }
+
+    #[test]
+    fn dispatch_must_return_the_selected_lookup_handle() {
+        use super::{
+            CallSite, ControlFlowEdge, ControlFlowEdgeKind, Instruction, InvokeKind,
+            LocalValueOrigin, MethodScanData, ReturnOrigin, ValueOrigin,
+        };
+        let lookup = |offset| CallSite {
+            offset,
+            kind: InvokeKind::Virtual,
+            owner: Some("java/lang/invoke/MethodHandles$Lookup".to_owned()),
+            name: "lookup".to_owned(),
+            descriptor: "()Ljava/lang/invoke/MethodHandle;".to_owned(),
+            receiver_origin: Some(ValueOrigin::Local(0)),
+            argument_origins: vec![],
+            result_origin: Some(ValueOrigin::Instruction(offset)),
+        };
+        let virtual_call = lookup(1);
+        let static_call = lookup(10);
+        let constructor = CallSite {
+            offset: 25,
+            kind: InvokeKind::Special,
+            owner: Some("java/lang/invoke/ConstantCallSite".to_owned()),
+            name: "<init>".to_owned(),
+            descriptor: "(Ljava/lang/invoke/MethodHandle;)V".to_owned(),
+            receiver_origin: Some(ValueOrigin::Instruction(20)),
+            argument_origins: vec![ValueOrigin::Instruction(10)],
+            result_origin: None,
+        };
+        let mut method = MethodScanData {
+            calls: vec![virtual_call.clone(), static_call.clone(), constructor],
+            instructions: [
+                (1, 0xb6, vec![]),
+                (4, 0x3a, vec![6]),
+                (6, 0xa7, vec![]),
+                (10, 0xb6, vec![]),
+                (13, 0x3a, vec![6]),
+                (15, 0xa7, vec![]),
+                (20, 0xbb, vec![]),
+                (23, 0x59, vec![]),
+                (24, 0x19, vec![6]),
+                (25, 0xb7, vec![]),
+                (28, 0xb0, vec![]),
+            ]
+            .into_iter()
+            .map(|(offset, opcode, operands)| Instruction {
+                offset,
+                opcode,
+                operands,
+            })
+            .collect(),
+            local_origins: vec![
+                LocalValueOrigin {
+                    offset: 4,
+                    local_index: 6,
+                    origin: ValueOrigin::Instruction(1),
+                },
+                LocalValueOrigin {
+                    offset: 13,
+                    local_index: 6,
+                    origin: ValueOrigin::Instruction(10),
+                },
+            ],
+            control_flow_edges: vec![
+                ControlFlowEdge {
+                    from_offset: 6,
+                    to_offset: 15,
+                    kind: ControlFlowEdgeKind::Branch,
+                },
+                ControlFlowEdge {
+                    from_offset: 15,
+                    to_offset: 20,
+                    kind: ControlFlowEdgeKind::Branch,
+                },
+            ],
+            return_origins: vec![ReturnOrigin {
+                offset: 28,
+                value_origin: Some(ValueOrigin::Instruction(20)),
+            }],
+            ..Default::default()
+        };
+        assert!(super::returns_lookup_result(
+            &method,
+            &virtual_call,
+            &static_call
+        ));
+        method.instructions[8].operands = vec![5];
+        assert!(!super::returns_lookup_result(
+            &method,
+            &virtual_call,
+            &static_call
+        ));
+    }
+
+    #[test]
+    fn dispatch_table_must_be_literal_private_and_not_escape() {
+        use super::{
+            ArrayElementOrigin, ConstantPoolEntry, ConstantValue, FieldAccess, Instruction,
+            MethodScanData, ValueOrigin,
+        };
+        let table = ValueOrigin::Field {
+            owner: "example/Test".to_owned(),
+            name: "targets".to_owned(),
+            descriptor: "[Ljava/lang/String;".to_owned(),
+        };
+        let initial = MethodScanData {
+            method_name: "<clinit>".to_owned(),
+            is_static: true,
+            descriptor: "()V".to_owned(),
+            instructions: vec![Instruction {
+                offset: 0,
+                opcode: 0xbd,
+                operands: vec![],
+            }],
+            field_writes: vec![FieldAccess {
+                offset: 3,
+                owner: "example/Test".to_owned(),
+                name: "targets".to_owned(),
+                descriptor: "[Ljava/lang/String;".to_owned(),
+                receiver_origin: None,
+                value_origin: Some(ValueOrigin::Instruction(0)),
+            }],
+            array_elements: vec![ArrayElementOrigin {
+                offset: 6,
+                array_origin: table.clone(),
+                index: Some(0),
+                value_origin: ValueOrigin::Constant(ConstantValue::String(
+                    "example/Sink:post:()V: ".to_owned(),
+                )),
+            }],
+            ..Default::default()
+        };
+        assert!(super::literal_table(std::slice::from_ref(&initial), &table).is_some());
+        let mut unused = initial.clone();
+        unused.method_name = "unused".to_owned();
+        assert!(super::literal_table(&[unused], &table).is_none());
+        let mut allocation_alias = initial.clone();
+        let mut alias_store = allocation_alias.array_elements[0].clone();
+        alias_store.array_origin = ValueOrigin::Instruction(0);
+        alias_store.offset = 7;
+        allocation_alias.array_elements.push(alias_store);
+        assert!(super::literal_table(&[allocation_alias], &table).is_none());
+        let mut reassigned = initial.clone();
+        reassigned
+            .field_writes
+            .push(reassigned.field_writes[0].clone());
+        assert!(super::literal_table(&[reassigned], &table).is_none());
+        let mut dynamic_index = initial.clone();
+        dynamic_index.array_elements[0].index = None;
+        assert!(super::literal_table(&[dynamic_index], &table).is_none());
+        let mut escaped = initial.clone();
+        escaped.field_writes.push(FieldAccess {
+            offset: 7,
+            owner: "example/Test".to_owned(),
+            name: "alias".to_owned(),
+            descriptor: "[Ljava/lang/String;".to_owned(),
+            receiver_origin: None,
+            value_origin: Some(table.clone()),
+        });
+        assert!(super::literal_table(&[escaped], &table).is_none());
+        let mut conditional = initial;
+        conditional.control_flow_edges.push(super::ControlFlowEdge {
+            from_offset: 0,
+            to_offset: 6,
+            kind: super::ControlFlowEdgeKind::Branch,
+        });
+        assert!(super::literal_table(&[conditional], &table).is_none());
+        let pool = [
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Utf8("targets".to_owned()),
+            ConstantPoolEntry::Utf8("[Ljava/lang/String;".to_owned()),
+        ];
+        for flags in [0x000a_u16, 0x0009] {
+            let bytes = [0, 1, 0, flags as u8, 0, 1, 0, 2, 0, 0];
+            let fields =
+                super::private_static_fields(&mut super::ClassCursor::new(&bytes), &pool).unwrap();
+            assert_eq!(fields.len(), usize::from(flags == 0x000a));
+        }
+    }
     /// Verifies the parser rejects non-class bytes instead of silently ignoring them.
     #[test]
     fn parse_class_file_rejects_invalid_magic() {
@@ -1764,6 +3287,403 @@ mod tests {
                 index: Some(0),
                 value_origin: super::ValueOrigin::Constant(super::ConstantValue::Integer(42)),
             }]
+        );
+    }
+
+    #[test]
+    fn folds_constant_integer_arithmetic_with_java_narrowing() {
+        // iconst_2; iconst_3; imul; iconst_4; iadd; ineg; i2b; ireturn
+        let method = super::parse_method_code(
+            &[],
+            &[0x05, 0x06, 0x68, 0x07, 0x60, 0x74, 0x91, 0xac],
+            "example/Test",
+            "number",
+            "()I",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+
+        assert_eq!(
+            method.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Constant(super::ConstantValue::Integer(
+                -10
+            )))
+        );
+    }
+
+    #[test]
+    fn normalizes_only_recognized_same_class_char_array_decoders() {
+        use super::ConstantPoolEntry;
+
+        let entries = vec![
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Class { name_index: 2 },
+            ConstantPoolEntry::Utf8("example/Test".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            ConstantPoolEntry::Utf8("decode".to_owned()),
+            ConstantPoolEntry::Utf8("([CLjava/lang/String;I)Ljava/lang/String;".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 1,
+                name_and_type_index: 3,
+            },
+            ConstantPoolEntry::String { string_index: 8 },
+            ConstantPoolEntry::Utf8("xy".to_owned()),
+        ];
+        // char[] { 182, 213, 231 }; "xy"; 5; decode(char[], key, k); areturn
+        let code = [
+            0x06, 0xbc, 0x05, // new char[3]
+            0x59, 0x03, 0x11, 0x00, 0xb6, 0x55, // array[0] = 182
+            0x59, 0x04, 0x11, 0x00, 0xd5, 0x55, // array[1] = 213
+            0x59, 0x05, 0x11, 0x00, 0xe7, 0x55, // array[2] = 231
+            0x12, 0x07, 0x08, 0xb8, 0x00, 0x06, 0xb0,
+        ];
+        let make_method = || super::MethodScanData {
+            class_name: "example/Test".to_owned(),
+            method_name: "decodeTable".to_owned(),
+            descriptor: "()Ljava/lang/String;".to_owned(),
+            is_static: true,
+            instructions: super::decode_instructions(&code).expect("code must decode"),
+            ..super::MethodScanData::default()
+        };
+
+        let mut normalized = make_method();
+        super::populate_value_origins_with_decoders(
+            &entries,
+            &mut normalized,
+            &["decode".to_owned()],
+        )
+        .expect("origin pass must succeed");
+        assert_eq!(
+            normalized.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Constant(super::ConstantValue::String(
+                "Cat".to_owned()
+            )))
+        );
+        assert!(normalized.constants.iter().any(|constant| {
+            constant.offset == 24
+                && constant.value == super::ConstantValue::String("Cat".to_owned())
+        }));
+
+        let mut unrecognized = make_method();
+        super::populate_value_origins_with_decoders(&entries, &mut unrecognized, &[])
+            .expect("origin pass must succeed");
+        assert_eq!(
+            unrecognized.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(24))
+        );
+    }
+
+    #[test]
+    fn invalidates_char_array_constants_after_mutating_calls() {
+        use super::ConstantPoolEntry;
+
+        let entries = vec![
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Class { name_index: 2 },
+            ConstantPoolEntry::Utf8("example/Test".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            ConstantPoolEntry::Utf8("decode".to_owned()),
+            ConstantPoolEntry::Utf8("([CLjava/lang/String;I)Ljava/lang/String;".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 1,
+                name_and_type_index: 3,
+            },
+            ConstantPoolEntry::String { string_index: 8 },
+            ConstantPoolEntry::Utf8("x".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 10,
+                descriptor_index: 11,
+            },
+            ConstantPoolEntry::Utf8("mutate".to_owned()),
+            ConstantPoolEntry::Utf8("([C)V".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 1,
+                name_and_type_index: 9,
+            },
+        ];
+        let decoder_names = ["decode".to_owned()];
+        let run = |method_name: &str, code: &[u8]| {
+            let mut method = super::MethodScanData {
+                class_name: "example/Test".to_owned(),
+                method_name: method_name.to_owned(),
+                descriptor: "()Ljava/lang/String;".to_owned(),
+                is_static: true,
+                instructions: super::decode_instructions(code).expect("code must decode"),
+                ..super::MethodScanData::default()
+            };
+            super::populate_value_origins_with_decoders(&entries, &mut method, &decoder_names)
+                .expect("origin pass must succeed");
+            method
+        };
+
+        // An unknown call receives a duplicate of char[] before the decoder.
+        // The pre-call literal must not be reused after that call.
+        let after_mutation = run(
+            "afterMutation",
+            &[
+                0x04, 0xbc, 0x05, 0x59, 0x03, 0x10, 0x41, 0x55, 0x59, 0xb8, 0x00, 0x0c, 0x12, 0x07,
+                0x10, 0x78, 0xb8, 0x00, 0x06, 0xb0,
+            ],
+        );
+        assert_eq!(
+            after_mutation.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(16))
+        );
+
+        // The first recognized decoder normalizes the current contents, then
+        // invalidates the in-place array before the second invocation.
+        let after_decoder = run(
+            "afterDecoder",
+            &[
+                0x04, 0xbc, 0x05, 0x59, 0x03, 0x10, 0x41, 0x55, 0x59, 0x12, 0x07, 0x10, 0x78, 0xb8,
+                0x00, 0x06, 0x57, 0x59, 0x12, 0x07, 0x10, 0x78, 0xb8, 0x00, 0x06, 0xb0,
+            ],
+        );
+        assert_eq!(
+            after_decoder.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(22))
+        );
+    }
+
+    #[test]
+    fn invalidates_literals_and_scalar_constants_at_control_flow_joins() {
+        use super::ConstantPoolEntry;
+
+        let entries = vec![
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Class { name_index: 2 },
+            ConstantPoolEntry::Utf8("example/Test".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            ConstantPoolEntry::Utf8("decode".to_owned()),
+            ConstantPoolEntry::Utf8("([CLjava/lang/String;I)Ljava/lang/String;".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 1,
+                name_and_type_index: 3,
+            },
+            ConstantPoolEntry::String { string_index: 8 },
+            ConstantPoolEntry::Utf8("x".to_owned()),
+        ];
+        // The conditional target skips the char[] allocation and stores.
+        // Linear fallthrough reaches the join after creating a literal array.
+        let code = [
+            0x03, 0x99, 0x00, 0x0c, // iconst_0; ifeq target at 13
+            0x04, 0xbc, 0x05, // new char[1]
+            0x59, 0x03, 0x10, 0x41, 0x55, // array[0] = 'A'
+            0x4b, // astore_0
+            0x2a, 0x12, 0x07, 0x10, 0x78, 0xb8, 0x00, 0x06, 0xb0,
+        ];
+        let mut method = super::MethodScanData {
+            class_name: "example/Test".to_owned(),
+            method_name: "conditionalArray".to_owned(),
+            descriptor: "()Ljava/lang/String;".to_owned(),
+            is_static: true,
+            instructions: super::decode_instructions(&code).expect("code must decode"),
+            ..super::MethodScanData::default()
+        };
+        super::populate_value_origins_with_decoders(&entries, &mut method, &["decode".to_owned()])
+            .expect("origin pass must succeed");
+        assert_eq!(
+            method.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(18))
+        );
+
+        // A join also invalidates scalar constants while retaining the local
+        // identity needed by downstream dataflow.
+        let scalar = super::parse_method_code(
+            &[],
+            &[
+                0x10, 0x07, 0x3b, 0x03, 0x99, 0x00, 0x05, 0x1a, 0xac, 0x1a, 0xac,
+            ],
+            "example/Test",
+            "conditionalScalar",
+            "()I",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+        assert_eq!(
+            scalar
+                .return_origins
+                .iter()
+                .map(|returned| returned.value_origin.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(super::ValueOrigin::Local(0)),
+                Some(super::ValueOrigin::Local(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalidates_char_arrays_when_they_escape_to_fields_or_object_arrays() {
+        use super::ConstantPoolEntry;
+
+        let entries = vec![
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Class { name_index: 2 },
+            ConstantPoolEntry::Utf8("example/Test".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            ConstantPoolEntry::Utf8("decode".to_owned()),
+            ConstantPoolEntry::Utf8("([CLjava/lang/String;I)Ljava/lang/String;".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 1,
+                name_and_type_index: 3,
+            },
+            ConstantPoolEntry::String { string_index: 8 },
+            ConstantPoolEntry::Utf8("x".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 10,
+                descriptor_index: 11,
+            },
+            ConstantPoolEntry::Utf8("chars".to_owned()),
+            ConstantPoolEntry::Utf8("[C".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 9,
+                class_index: 1,
+                name_and_type_index: 9,
+            },
+        ];
+        let decoder_names = ["decode".to_owned()];
+        let run = |method_name: &str, descriptor: &str, is_static: bool, code: &[u8]| {
+            let mut method = super::MethodScanData {
+                class_name: "example/Test".to_owned(),
+                method_name: method_name.to_owned(),
+                descriptor: descriptor.to_owned(),
+                is_static,
+                instructions: super::decode_instructions(code).expect("code must decode"),
+                ..super::MethodScanData::default()
+            };
+            super::populate_value_origins_with_decoders(&entries, &mut method, &decoder_names)
+                .expect("origin pass must succeed");
+            method
+        };
+
+        let setup = [0x04, 0xbc, 0x05, 0x59, 0x03, 0x10, 0x41, 0x55, 0x4c];
+        let putstatic = run(
+            "putstaticEscape",
+            "()Ljava/lang/String;",
+            true,
+            &[
+                setup.as_slice(),
+                &[
+                    0x2b, 0xb3, 0x00, 0x0c, 0x2b, 0x12, 0x07, 0x10, 0x78, 0xb8, 0x00, 0x06, 0xb0,
+                ],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            putstatic.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(18))
+        );
+
+        let putfield = run(
+            "putfieldEscape",
+            "()Ljava/lang/String;",
+            false,
+            &[
+                setup.as_slice(),
+                &[
+                    0x2a, 0x2b, 0xb5, 0x00, 0x0c, 0x2b, 0x12, 0x07, 0x10, 0x78, 0xb8, 0x00, 0x06,
+                    0xb0,
+                ],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            putfield.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(19))
+        );
+
+        let aastore = run(
+            "aastoreEscape",
+            "([Ljava/lang/Object;)Ljava/lang/String;",
+            true,
+            &[
+                setup.as_slice(),
+                &[
+                    0x2a, 0x03, 0x2b, 0x53, 0x2b, 0x12, 0x07, 0x10, 0x78, 0xb8, 0x00, 0x06, 0xb0,
+                ],
+            ]
+            .concat(),
+        );
+        assert_eq!(
+            aastore.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(18))
+        );
+    }
+
+    #[test]
+    fn iinc_invalidates_constant_local_origins_including_wide_iinc() {
+        use super::ConstantPoolEntry;
+
+        let entries = vec![
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Class { name_index: 2 },
+            ConstantPoolEntry::Utf8("example/Test".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            ConstantPoolEntry::Utf8("decode".to_owned()),
+            ConstantPoolEntry::Utf8("([CLjava/lang/String;I)Ljava/lang/String;".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 1,
+                name_and_type_index: 3,
+            },
+            ConstantPoolEntry::String { string_index: 8 },
+            ConstantPoolEntry::Utf8("x".to_owned()),
+        ];
+        let code = [
+            0x04, 0xbc, 0x05, 0x59, 0x03, 0x10, 0x41, 0x55, 0x4c, // char[] 'A' in local 1
+            0x10, 0x78, 0x3b, 0x84, 0x00, 0x01, // local 0 = 120; iinc 0, 1
+            0x2b, 0x12, 0x07, 0x1a, 0xb8, 0x00, 0x06, 0xb0,
+        ];
+        let mut method = super::MethodScanData {
+            class_name: "example/Test".to_owned(),
+            method_name: "incrementedKey".to_owned(),
+            descriptor: "()Ljava/lang/String;".to_owned(),
+            is_static: true,
+            instructions: super::decode_instructions(&code).expect("code must decode"),
+            ..super::MethodScanData::default()
+        };
+        super::populate_value_origins_with_decoders(&entries, &mut method, &["decode".to_owned()])
+            .expect("origin pass must succeed");
+        assert_eq!(
+            method.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(19))
+        );
+
+        let wide = super::parse_method_code(
+            &[],
+            &[
+                0x10, 0x78, 0x3b, 0xc4, 0x84, 0x00, 0x00, 0x00, 0x01, 0x1a, 0xac,
+            ],
+            "example/Test",
+            "wideIncrement",
+            "()I",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+        assert_eq!(
+            wide.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Instruction(3))
         );
     }
 
