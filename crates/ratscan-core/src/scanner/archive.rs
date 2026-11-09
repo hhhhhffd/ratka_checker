@@ -258,6 +258,7 @@ fn scan_bytes(
     findings.extend(session_chat_exfil_co_location_finding(&context.data));
     findings.extend(executable_download_exec_co_location_finding(&context.data));
     findings.extend(packed_download_exec_co_location_finding(&context.data));
+    findings.extend(super::packed_loader::finding(&context.data));
     let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
@@ -3979,7 +3980,7 @@ fn is_flow_supported_instruction(opcode: u8) -> bool {
     matches!(
         opcode,
         0x01..=0x19
-            | 0x1a..=0x2d
+            | 0x1a..=0x35
             | 0x36..=0x3a
             | 0x3b..=0x4e
             | 0x57..=0x5f
@@ -4080,7 +4081,12 @@ fn verdict_from_evidence(
     let trusted_vt_detection = findings
         .iter()
         .any(|finding| finding.rule_id == "VT_TRUSTED_MALICIOUS_ENGINE");
-    if has_malicious_chain || trusted_vt_detection {
+    let concealed_payload_loader = findings.iter().any(|finding| {
+        finding.rule_id == super::packed_loader::RULE_ID
+            && finding.confidence == Confidence::High
+            && finding_is_risk_bearing(finding)
+    });
+    if has_malicious_chain || trusted_vt_detection || concealed_payload_loader {
         return Verdict::Malicious;
     }
     if !confirmed_chains.is_empty() || risk_score > 5 {
@@ -4495,6 +4501,7 @@ mod tests {
             owner: CLASS_NAME.to_owned(),
             name: "payload".to_owned(),
             descriptor: "Ljava/lang/String;".to_owned(),
+            receiver_origin: None,
             value_origin: Some(ValueOrigin::Instruction(30)),
         };
         let decoder = MethodScanData {
@@ -4728,6 +4735,7 @@ mod tests {
                 owner: "mod/Config".to_owned(),
                 name: "webhookUrl".to_owned(),
                 descriptor: "Ljava/lang/String;".to_owned(),
+                receiver_origin: None,
                 value_origin: None,
             }],
             ..MethodScanData::default()
@@ -5520,6 +5528,33 @@ mod tests {
             .any(|finding| finding.rule_id == CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID));
     }
 
+    #[test]
+    fn real_concealed_png_payload_loader_is_malicious() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sample = root.join("tests/realmods/resource-pack-hub-mc1.21.11.jar");
+        if !sample.is_file() {
+            // The real-mod corpus is local; the compiled synthetic fixture covers CI.
+            return;
+        }
+        let rules = RulesEngine::load_from_file(&root.join("config/rules.yaml"))
+            .expect("production rules load");
+        let outcome = scan_file(
+            &sample,
+            ScanLimits {
+                max_total_uncompressed_bytes: 200 * 1024 * 1024,
+                max_files_in_archive: 5_000,
+                max_nesting_depth: 3,
+                max_single_file_bytes: 50 * 1024 * 1024,
+            },
+            &rules,
+        );
+        assert_eq!(outcome.report.verdict, Verdict::Malicious);
+        assert!(outcome.report.findings.iter().any(|finding| {
+            finding.rule_id == super::super::packed_loader::RULE_ID
+                && finding.confidence == Confidence::High
+        }));
+    }
+
     /// Real mods previously received false positives from isolated API, asset, and namespace facts.
     #[test]
     fn real_mods_are_clean_without_confirmed_dangerous_chains() {
@@ -5660,6 +5695,7 @@ mod tests {
             stack_origins: Vec::new(),
             return_origins: Vec::new(),
             array_elements: Vec::new(),
+            array_reads: Vec::new(),
             branch_conditions: Vec::new(),
         }
     }

@@ -42,9 +42,11 @@ pub struct MethodScanData {
     pub stack_origins: Vec<StackOrigin>,
     /// Values returned by explicit JVM return instructions.
     pub return_origins: Vec<ReturnOrigin>,
-    /// Element assignments observed for arrays assembled in the linear pass.
-    /// This is used for Java varargs and immutable list factories.
+    /// Reference and byte element assignments observed in the linear pass.
+    /// Used for Java varargs, immutable lists, and constant binary signatures.
     pub array_elements: Vec<ArrayElementOrigin>,
+    /// Byte-array reads retained for container-header comparisons.
+    pub array_reads: Vec<ArrayReadOrigin>,
     /// Conditional values retained so security recognizers can prove that a
     /// rejecting branch guards a following sensitive operation.
     pub branch_conditions: Vec<BranchCondition>,
@@ -102,6 +104,8 @@ pub struct FieldAccess {
     pub owner: String,
     pub name: String,
     pub descriptor: String,
+    /// The object read or written by instance field instructions; absent for statics.
+    pub receiver_origin: Option<ValueOrigin>,
     pub value_origin: Option<ValueOrigin>,
 }
 
@@ -171,10 +175,18 @@ pub struct ArrayElementOrigin {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayReadOrigin {
+    pub offset: u32,
+    pub array_origin: ValueOrigin,
+    pub index_origin: ValueOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchCondition {
     pub offset: u32,
     pub opcode: u8,
     pub value_origin: ValueOrigin,
+    pub compared_origin: Option<ValueOrigin>,
 }
 
 const XOR_LOOP_SIGNAL: &str = "xor_loop_string_decode";
@@ -817,6 +829,18 @@ fn populate_value_origins(
                         .unwrap_or(ValueOrigin::Local(index)),
                 );
             }
+            0x2e..=0x35 => {
+                let index_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                let array_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
+                if instruction.opcode == 0x33 {
+                    data.array_reads.push(ArrayReadOrigin {
+                        offset,
+                        array_origin,
+                        index_origin,
+                    });
+                }
+                stack.push(ValueOrigin::Instruction(offset));
+            }
             0x36..=0x3a => {
                 let index = u16::from(instruction.operands[0]);
                 store_local(
@@ -857,7 +881,11 @@ fn populate_value_origins(
                 stack.push(last);
                 stack.push(previous);
             }
-            0x60..=0x83 | 0x85..=0x98 => {
+            0x74..=0x77 | 0x85..=0x93 => {
+                let _ = stack.pop();
+                stack.push(ValueOrigin::Instruction(offset));
+            }
+            0x60..=0x73 | 0x78..=0x83 | 0x94..=0x98 => {
                 let _ = stack.pop();
                 let _ = stack.pop();
                 stack.push(ValueOrigin::Instruction(offset));
@@ -870,15 +898,17 @@ fn populate_value_origins(
                     offset,
                     opcode: instruction.opcode,
                     value_origin,
+                    compared_origin: None,
                 });
             }
             0x9f..=0xa6 => {
-                let _ = stack.pop();
+                let compared_origin = stack.pop();
                 let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
                 data.branch_conditions.push(BranchCondition {
                     offset,
                     opcode: instruction.opcode,
                     value_origin,
+                    compared_origin,
                 });
             }
             0xb2..=0xb5 => populate_field_access(entries, &instruction, &mut stack, data)?,
@@ -937,7 +967,7 @@ fn store_array_element(
         _ => None,
     };
     let array_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
-    if opcode == 0x53 {
+    if matches!(opcode, 0x53 | 0x54) {
         data.array_elements.push(ArrayElementOrigin {
             offset,
             array_origin,
@@ -983,6 +1013,7 @@ fn populate_field_access(
                 owner: owner.clone(),
                 name: name.clone(),
                 descriptor: descriptor.clone(),
+                receiver_origin: None,
                 value_origin: None,
             });
             stack.push(ValueOrigin::Field {
@@ -998,16 +1029,18 @@ fn populate_field_access(
                 owner,
                 name,
                 descriptor,
+                receiver_origin: None,
                 value_origin: Some(value_origin),
             });
         }
         0xb4 => {
-            let _ = stack.pop();
+            let receiver_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
             data.field_reads.push(FieldAccess {
                 offset: instruction.offset,
                 owner: owner.clone(),
                 name: name.clone(),
                 descriptor: descriptor.clone(),
+                receiver_origin: Some(receiver_origin),
                 value_origin: None,
             });
             stack.push(ValueOrigin::Field {
@@ -1018,12 +1051,13 @@ fn populate_field_access(
         }
         0xb5 => {
             let value_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
-            let _ = stack.pop();
+            let receiver_origin = stack.pop().unwrap_or(ValueOrigin::Unknown);
             data.field_writes.push(FieldAccess {
                 offset: instruction.offset,
                 owner,
                 name,
                 descriptor,
+                receiver_origin: Some(receiver_origin),
                 value_origin: Some(value_origin),
             });
         }
@@ -1571,6 +1605,165 @@ mod tests {
             vec![super::ValueOrigin::Constant(super::ConstantValue::String(
                 "https://example.invalid/payload".to_owned()
             ))]
+        );
+    }
+
+    #[test]
+    fn tracks_instance_field_receivers_and_leaves_static_receivers_empty() {
+        use super::ConstantPoolEntry;
+
+        let entries = vec![
+            ConstantPoolEntry::Other,
+            ConstantPoolEntry::Class { name_index: 2 },
+            ConstantPoolEntry::Utf8("example/Receiver".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 4,
+                descriptor_index: 5,
+            },
+            ConstantPoolEntry::Utf8("response".to_owned()),
+            ConstantPoolEntry::Utf8("[B".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 9,
+                class_index: 1,
+                name_and_type_index: 3,
+            },
+            ConstantPoolEntry::Class { name_index: 8 },
+            ConstantPoolEntry::Utf8("example/Network".to_owned()),
+            ConstantPoolEntry::NameAndType {
+                name_index: 10,
+                descriptor_index: 11,
+            },
+            ConstantPoolEntry::Utf8("fetch".to_owned()),
+            ConstantPoolEntry::Utf8("()Lexample/Receiver;".to_owned()),
+            ConstantPoolEntry::Ref {
+                tag: 10,
+                class_index: 7,
+                name_and_type_index: 9,
+            },
+        ];
+
+        // invokestatic fetch; iconst_1; i2c; pop; getfield response; areturn.
+        // Unary conversions must preserve the object below the converted value.
+        let read = super::parse_method_code(
+            &entries,
+            &[0xb8, 0x00, 0x0c, 0x04, 0x92, 0x57, 0xb4, 0x00, 0x06, 0xb0],
+            "example/Test",
+            "read",
+            "()[B",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+
+        assert_eq!(
+            read.field_reads[0].receiver_origin,
+            Some(super::ValueOrigin::Instruction(0))
+        );
+        assert_eq!(read.field_reads[0].value_origin, None);
+        assert_eq!(
+            read.return_origins[0].value_origin,
+            Some(super::ValueOrigin::Field {
+                owner: "example/Receiver".to_owned(),
+                name: "response".to_owned(),
+                descriptor: "[B".to_owned(),
+            })
+        );
+
+        // invokestatic fetch; iconst_2; newarray byte; putfield response; return
+        let write = super::parse_method_code(
+            &entries,
+            &[0xb8, 0x00, 0x0c, 0x05, 0xbc, 0x08, 0xb5, 0x00, 0x06, 0xb1],
+            "example/Test",
+            "write",
+            "()V",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+
+        assert_eq!(
+            write.field_writes[0].receiver_origin,
+            Some(super::ValueOrigin::Instruction(0))
+        );
+        assert_eq!(
+            write.field_writes[0].value_origin,
+            Some(super::ValueOrigin::Instruction(4))
+        );
+
+        // getstatic response; areturn
+        let static_read = super::parse_method_code(
+            &entries,
+            &[0xb2, 0x00, 0x06, 0xb0],
+            "example/Test",
+            "static_read",
+            "()[B",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+        assert_eq!(static_read.field_reads[0].receiver_origin, None);
+
+        // iconst_0; putstatic response; return
+        let static_write = super::parse_method_code(
+            &entries,
+            &[0x03, 0xb3, 0x00, 0x06, 0xb1],
+            "example/Test",
+            "static_write",
+            "()V",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+        assert_eq!(static_write.field_writes[0].receiver_origin, None);
+    }
+
+    #[test]
+    fn tracks_both_arrays_and_operands_in_byte_comparisons() {
+        let method = super::parse_method_code(
+            &[],
+            &[0x2a, 0x03, 0x33, 0x2b, 0x03, 0x33, 0x9f, 0x00, 0x03, 0xb1],
+            "example/Test",
+            "compare",
+            "([B[B)V",
+            true,
+        )
+        .expect("byte-array comparison parses");
+        assert_eq!(method.array_reads.len(), 2);
+        assert_eq!(
+            method.array_reads[0].array_origin,
+            super::ValueOrigin::Local(0)
+        );
+        assert_eq!(
+            method.array_reads[1].array_origin,
+            super::ValueOrigin::Local(1)
+        );
+        assert_eq!(
+            method.branch_conditions[0].value_origin,
+            super::ValueOrigin::Instruction(2)
+        );
+        assert_eq!(
+            method.branch_conditions[0].compared_origin,
+            Some(super::ValueOrigin::Instruction(5))
+        );
+    }
+
+    #[test]
+    fn tracks_byte_array_store_origins_and_constant_values() {
+        // iconst_2; newarray byte; dup; iconst_0; bipush 42; bastore; areturn
+        let method = super::parse_method_code(
+            &[],
+            &[0x05, 0xbc, 0x08, 0x59, 0x03, 0x10, 0x2a, 0x54, 0xb0],
+            "example/Test",
+            "bytes",
+            "()[B",
+            true,
+        )
+        .expect("bounded static parse must succeed");
+
+        assert_eq!(
+            method.array_elements,
+            vec![super::ArrayElementOrigin {
+                offset: 7,
+                array_origin: super::ValueOrigin::Instruction(1),
+                index: Some(0),
+                value_origin: super::ValueOrigin::Constant(super::ConstantValue::Integer(42)),
+            }]
         );
     }
 

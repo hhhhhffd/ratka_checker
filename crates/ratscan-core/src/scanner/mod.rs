@@ -6,6 +6,7 @@ pub mod dataflow;
 pub mod metadata;
 pub mod native;
 pub mod obfuscation;
+mod packed_loader;
 pub mod paths;
 pub mod scope;
 pub mod strings;

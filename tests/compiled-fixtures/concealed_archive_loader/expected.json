@@ -1,0 +1,8 @@
+{
+  "name": "network image container unpacked and launched from the same root",
+  "expected_verdict": "malicious",
+  "risk_score": {"min": 80, "max": 100},
+  "required_findings": ["CONCEALED_ARCHIVE_PAYLOAD_EXEC"],
+  "forbidden_confirmed_chains": ["CONFIRMED_CREDENTIAL_EXFILTRATION", "CONFIRMED_DOWNLOAD_WRITE_EXEC"],
+  "expected_obfuscation_level": "none"
+}
