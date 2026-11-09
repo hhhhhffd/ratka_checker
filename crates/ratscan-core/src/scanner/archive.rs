@@ -4205,10 +4205,9 @@ mod tests {
         has_significant_identifier_overlap, is_credential_target,
         packed_download_exec_co_location_finding, parse_zip_bytes, risk_score, scan_file,
         session_chat_exfil_co_location_finding, summarize, verdict_from_evidence, ArchiveContext,
-        ClassScanData, ScanData, ScanLimits,
-        CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID,
-        EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
-        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
+        ClassScanData, ScanData, ScanLimits, CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID,
+        CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID, EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID,
+        EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
         SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
