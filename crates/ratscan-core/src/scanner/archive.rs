@@ -64,6 +64,7 @@ const CONFIRMED_WEBHOOK_EXFIL_RULE_ID: &str = "CONFIRMED_WEBHOOK_EXFIL";
 const CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID: &str = "CREDENTIAL_WEBHOOK_CO_LOCATION";
 const SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID: &str = "SESSION_CHAT_EXFIL_CO_LOCATION";
 const EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID: &str = "EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION";
+const PACKED_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID: &str = "PACKED_DOWNLOAD_EXEC_CO_LOCATION";
 const OVERSIZED_ARCHIVE_ENTRY_RULE_ID: &str = "OVERSIZED_ARCHIVE_ENTRY";
 const LARGE_ASSET_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
 /// Hard ceiling on all entries, including plain resources that `max_files_in_archive` ignores.
@@ -256,6 +257,8 @@ fn scan_bytes(
     findings.extend(credential_webhook_co_location_finding(&context.data));
     findings.extend(session_chat_exfil_co_location_finding(&context.data));
     findings.extend(executable_download_exec_co_location_finding(&context.data));
+    findings.extend(packed_download_exec_co_location_finding(&context.data));
+    findings.extend(super::packed_loader::finding(&context.data));
     let mut confirmed_chains = data_flow
         .confirmed_chains
         .iter()
@@ -1749,6 +1752,88 @@ fn executable_download_exec_co_location_finding(data: &ScanData) -> Option<Findi
     })
 }
 
+/// Packed downloads can have arbitrary URL suffixes and computed destinations.
+/// Archive/write/process capabilities and HTTP in the class or a directly called
+/// same-archive helper merit review, but do not prove downloaded bytes reach a process.
+/// Never emit a confirmed chain from this heuristic.
+fn packed_download_exec_co_location_finding(data: &ScanData) -> Option<Finding> {
+    // Index HTTP helpers once; do not rescan the archive for every potential loader.
+    let mut network_helpers = HashMap::new();
+    for class_file in &data.class_files {
+        if let (Some(name), Some(network)) = (
+            class_file.class_name.as_deref(),
+            first_class_marker_in_refs(&class_file.bytecode_refs, HTTP_SINK_MARKERS),
+        ) {
+            network_helpers
+                .entry((class_file.archive_id.as_str(), name))
+                .or_insert_with(Vec::new)
+                .push((class_file, network));
+        }
+    }
+    data.class_files.iter().find_map(|class_file| {
+        let refs = &class_file.bytecode_refs;
+        let archive = first_class_marker_in_refs(
+            refs,
+            &["java/util/zip/ZipInputStream", "java/util/jar/JarInputStream"],
+        )?;
+        let writer = first_marker_in(
+            refs,
+            &[
+                "java/nio/file/Files.copy",
+                "java/nio/file/Files.write",
+                "java/io/FileOutputStream",
+            ],
+        )?;
+        let launcher = first_class_marker_in_refs(refs, PROCESS_LAUNCH_MARKERS)?;
+        let (network_class, network) = if let Some(network) =
+            first_class_marker_in_refs(refs, HTTP_SINK_MARKERS)
+        {
+            (class_file, network)
+        } else {
+            class_file.methods.iter().flat_map(|method| &method.calls).find_map(|call| {
+                let helpers = network_helpers.get(&(
+                    class_file.archive_id.as_str(),
+                    call.owner.as_deref()?,
+                ))?;
+                helpers.iter().copied().find(|(helper, _)| {
+                    helper.methods.iter().any(|target| {
+                        target.method_name == call.name && target.descriptor == call.descriptor
+                    })
+                })
+            })?
+        };
+        Some(Finding {
+            rule_id: PACKED_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID.to_owned(),
+            category: "correlation".to_owned(),
+            kind: crate::models::scan::FindingKind::Finding,
+            severity: Severity::High,
+            confidence: Confidence::Low,
+            score_contribution: 40,
+            scope: class_file.scope.clone(),
+            message: "Класс содержит чтение архива, запись файлов и запуск процесса, а также HTTP-клиент или вызов сетевого вспомогательного класса. Поток скачанных данных до запуска не доказан; возможен упакованный загрузчик или легитимный установщик.".to_owned(),
+            evidence: vec![Evidence {
+                archive_id: class_file.archive_id.clone(),
+                archive_path: class_file.archive_path.clone(),
+                class_name: class_file.class_name.clone(),
+                method_name: None,
+                method_descriptor: None,
+                bytecode_offset: None,
+                resource_path: Some(class_file.path.clone()),
+                operation: "http_archive_write_process_refs".to_owned(),
+                value_preview: Some(format!(
+                    "{}: {network}; {archive}; {writer}; {launcher}",
+                    network_class.class_name.as_deref().unwrap_or("<unknown>")
+                )),
+                source_value: None,
+                target_value: None,
+                confidence: Confidence::Low,
+                scope: class_file.scope.clone(),
+            }],
+            related_chain_id: None,
+        })
+    })
+}
+
 fn is_executable_url(value: &str) -> bool {
     let lowered = value.to_ascii_lowercase();
     if !lowered.starts_with("http://") && !lowered.starts_with("https://") {
@@ -1760,9 +1845,8 @@ fn is_executable_url(value: &str) -> bool {
         .any(|suffix| path.ends_with(suffix))
 }
 
-/// Minecraft session (account token) or chat-event access that shares a class with an outbound
-/// HTTP client is account theft: the transport is only reachable from the stolen data path.
-/// Obfuscated call sites are invisible to direct call matching, so the class constant pool is used.
+/// Session/chat and HTTP references in one class are a review hint, not proof of theft.
+/// Constant-pool references establish neither reachability nor which value is transmitted.
 /// Session classes are listed for each mapping a production jar can carry: MCP (Forge <= 1.16),
 /// Mojang (Forge/NeoForge 1.17+), and Fabric intermediary.
 const SESSION_CHAT_SOURCE_MARKERS: &[&str] = &[
@@ -1807,11 +1891,11 @@ fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
             rule_id: SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID.to_owned(),
             category: "credential_theft".to_owned(),
             kind: crate::models::scan::FindingKind::Finding,
-            severity: Severity::Critical,
-            confidence: Confidence::Medium,
-            score_contribution: 90,
+            severity: Severity::Medium,
+            confidence: Confidence::Low,
+            score_contribution: 15,
             scope: class_file.scope.clone(),
-            message: "Класс обращается к сессии аккаунта или к чату игры и к HTTP-клиенту. Это кража сессии/чата с отправкой по сети.".to_owned(),
+            message: "В классе есть ссылки на сессию аккаунта или чат и HTTP-клиент. Передача приватных данных не доказана; требуется проверка потока данных.".to_owned(),
             evidence: vec![Evidence {
                 archive_id: class_file.archive_id.clone(),
                 archive_path: class_file.archive_path.clone(),
@@ -1824,7 +1908,7 @@ fn session_chat_exfil_co_location_finding(data: &ScanData) -> Option<Finding> {
                 value_preview: Some(format!("{source}; {sink}")),
                 source_value: None,
                 target_value: None,
-                confidence: Confidence::Medium,
+                confidence: Confidence::Low,
                 scope: class_file.scope.clone(),
             }],
             related_chain_id: None,
@@ -3896,7 +3980,7 @@ fn is_flow_supported_instruction(opcode: u8) -> bool {
     matches!(
         opcode,
         0x01..=0x19
-            | 0x1a..=0x2d
+            | 0x1a..=0x35
             | 0x36..=0x3a
             | 0x3b..=0x4e
             | 0x57..=0x5f
@@ -3997,15 +4081,12 @@ fn verdict_from_evidence(
     let trusted_vt_detection = findings
         .iter()
         .any(|finding| finding.rule_id == "VT_TRUSTED_MALICIOUS_ENGINE");
-    // Only the mod's own code is decisive; in bundled libraries the co-location is left to scoring.
-    let session_exfiltration = findings.iter().any(|finding| {
-        finding.rule_id == SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID
-            && matches!(
-                finding.scope,
-                CodeScope::FirstParty | CodeScope::NestedMod | CodeScope::Unknown
-            )
+    let concealed_payload_loader = findings.iter().any(|finding| {
+        finding.rule_id == super::packed_loader::RULE_ID
+            && finding.confidence == Confidence::High
+            && finding_is_risk_bearing(finding)
     });
-    if has_malicious_chain || trusted_vt_detection || session_exfiltration {
+    if has_malicious_chain || trusted_vt_detection || concealed_payload_loader {
         return Verdict::Malicious;
     }
     if !confirmed_chains.is_empty() || risk_score > 5 {
@@ -4138,12 +4219,12 @@ mod tests {
         add_contextual_findings, confirmed_remote_memory_load,
         credential_webhook_co_location_finding, custom_invokedynamic_bootstrap_finding,
         executable_download_exec_co_location_finding, file_target_from_origin, finalize_report,
-        has_significant_identifier_overlap, is_credential_target, parse_zip_bytes, risk_score,
-        scan_file, session_chat_exfil_co_location_finding, summarize, verdict_from_evidence,
-        ArchiveContext, ClassScanData, ScanData, ScanLimits,
-        CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID, CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID,
-        EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID, EXTERNAL_URLCLASSLOADER_SIGNAL,
-        PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
+        has_significant_identifier_overlap, is_credential_target,
+        packed_download_exec_co_location_finding, parse_zip_bytes, risk_score, scan_file,
+        session_chat_exfil_co_location_finding, summarize, verdict_from_evidence, ArchiveContext,
+        ClassScanData, ScanData, ScanLimits, CREDENTIAL_WEBHOOK_CO_LOCATION_RULE_ID,
+        CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID, EXECUTABLE_DOWNLOAD_EXEC_CO_LOCATION_RULE_ID,
+        EXTERNAL_URLCLASSLOADER_SIGNAL, PRIVACY_NETWORK_SYNC_RULE_ID, REMOTE_CLASS_LOADING_SIGNAL,
         SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID, TIMESTAMP_OUTLIER_SIGNAL,
     };
 
@@ -4420,6 +4501,7 @@ mod tests {
             owner: CLASS_NAME.to_owned(),
             name: "payload".to_owned(),
             descriptor: "Ljava/lang/String;".to_owned(),
+            receiver_origin: None,
             value_origin: Some(ValueOrigin::Instruction(30)),
         };
         let decoder = MethodScanData {
@@ -4653,6 +4735,7 @@ mod tests {
                 owner: "mod/Config".to_owned(),
                 name: "webhookUrl".to_owned(),
                 descriptor: "Ljava/lang/String;".to_owned(),
+                receiver_origin: None,
                 value_origin: None,
             }],
             ..MethodScanData::default()
@@ -5238,10 +5321,93 @@ mod tests {
         assert!(executable_download_exec_co_location_finding(&no_launcher).is_none());
     }
 
-    /// A class that reads the account session or chat events and also opens an HTTP
-    /// client is a malicious exfiltration path, even when the call sites are obfuscated.
     #[test]
-    fn session_or_chat_with_http_client_in_one_class_is_malicious() {
+    fn packed_downloader_hint_does_not_require_executable_url_or_confirm_a_chain() {
+        let refs = [
+            "java/net/HttpURLConnection",
+            "java/util/zip/ZipInputStream",
+            "java/nio/file/Files.copy",
+            "java/lang/ProcessBuilder",
+        ];
+        let data_with_refs = |refs: Vec<&str>| ScanData {
+            class_files: vec![class_scan_data("example/Installer", refs, Vec::new())],
+            ..Default::default()
+        };
+        // No strings, domains, payload names or URL suffixes are required.
+        let finding = packed_download_exec_co_location_finding(&data_with_refs(refs.to_vec()))
+            .expect("packed downloader capabilities merit review");
+        assert_eq!(finding.confidence, Confidence::Low);
+        assert!(finding.related_chain_id.is_none());
+        let (verdict, _, _) = finalize_report(&[finding], &[], &Obfuscation::default());
+        assert_eq!(verdict, Verdict::Suspicious);
+        for omitted in 0..refs.len() {
+            let subset = refs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| (index != omitted).then_some(*value))
+                .collect();
+            assert!(packed_download_exec_co_location_finding(&data_with_refs(subset)).is_none());
+        }
+        let split = ScanData {
+            class_files: refs
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    class_scan_data(&format!("example/Part{index}"), vec![*value], Vec::new())
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(packed_download_exec_co_location_finding(&split).is_none());
+    }
+
+    #[test]
+    fn packed_downloader_helper_must_be_called_with_same_archive_and_signature() {
+        let loader = class_scan_data(
+            "example/Installer",
+            vec![
+                "java/util/zip/ZipInputStream",
+                "java/io/FileOutputStream",
+                "java/lang/ProcessBuilder",
+            ],
+            vec![method_scan_data(
+                "example/Installer",
+                vec![call_site("example/Http", "run")],
+            )],
+        );
+        let helper = class_scan_data(
+            "example/Http",
+            vec!["java/net/URL"],
+            vec![method_scan_data("example/Http", Vec::new())],
+        );
+        let mut data = ScanData {
+            class_files: vec![loader, helper],
+            ..Default::default()
+        };
+        assert!(packed_download_exec_co_location_finding(&data).is_some());
+        data.class_files[1].archive_id = "nested-archive".to_owned();
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+        data.class_files[1].archive_id = "archive-0".to_owned();
+        data.class_files[1].methods[0].descriptor = "(I)V".to_owned();
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+        data.class_files[1].methods[0].descriptor = "()V".to_owned();
+        data.class_files[0].methods[0].calls[0].owner = Some("example/Other".to_owned());
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+        data.class_files[0].methods[0].calls[0].owner = None;
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+        data.class_files[0].methods[0].calls[0].owner = Some("example/Http".to_owned());
+        // Duplicate class definitions must not hide a matching helper signature.
+        let matching_helper = data.class_files[1].clone();
+        data.class_files[1].methods[0].descriptor = "(I)V".to_owned();
+        data.class_files.push(matching_helper);
+        assert!(packed_download_exec_co_location_finding(&data).is_some());
+        data.class_files[0].methods[0].calls.clear();
+        assert!(packed_download_exec_co_location_finding(&data).is_none());
+    }
+
+    /// Co-located references cannot establish a credential source-to-sink chain.
+    #[test]
+    fn session_or_chat_with_http_client_is_only_a_review_hint() {
         let class = |refs: &[&str]| ClassScanData {
             class_name: Some("mezz/jei/ClientLifecycleHandler".to_owned()),
             scope: CodeScope::FirstParty,
@@ -5258,8 +5424,11 @@ mod tests {
         let finding = session_chat_exfil_co_location_finding(&exfil)
             .expect("session access and HTTP client in one class is reported");
         assert_eq!(finding.rule_id, SESSION_CHAT_EXFIL_CO_LOCATION_RULE_ID);
+        assert_eq!(finding.severity, Severity::Medium);
+        assert_eq!(finding.confidence, Confidence::Low);
+        assert!(finding.related_chain_id.is_none());
         let (verdict, _, _) = finalize_report(&[finding], &[], &Obfuscation::default());
-        assert_eq!(verdict, Verdict::Malicious);
+        assert_eq!(verdict, Verdict::Suspicious);
 
         let session_only = ScanData {
             class_files: vec![class(&["Lnet/minecraft/util/Session;"])],
@@ -5286,7 +5455,8 @@ mod tests {
     }
 
     /// Sending the session token only to Mojang/Microsoft account endpoints (skin upload in
-    /// Entity Texture Features) is not exfiltration; any other or hidden destination still is.
+    /// Entity Texture Features) is not reported by this heuristic. Other or unknown
+    /// destinations remain review hints, not proof of exfiltration.
     #[test]
     fn session_with_http_client_to_official_account_host_is_not_exfiltration() {
         let class = |strings: &[&str]| ScanData {
@@ -5328,7 +5498,7 @@ mod tests {
     /// A stealer that hides its webhook POST behind indy/condy bootstraps was
     /// previously reported as clean.
     #[test]
-    fn real_custom_bootstrap_stealer_is_not_clean() {
+    fn real_custom_bootstrap_chat_stealer_is_malicious() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let sample = root.join("tests/realmods/jei-7.8.0.1011.jar");
         if !sample.is_file() {
@@ -5347,12 +5517,44 @@ mod tests {
         let outcome = scan_file(&sample, limits, &rules);
 
         assert_eq!(outcome.report.verdict, Verdict::Malicious);
+        assert!(outcome
+            .report
+            .confirmed_chains
+            .iter()
+            .any(|chain| { chain.rule_id == super::CONFIRMED_WEBHOOK_EXFIL_RULE_ID }));
         assert_eq!(outcome.report.obfuscation.level, ObfuscationLevel::High);
         assert!(outcome
             .report
             .findings
             .iter()
             .any(|finding| finding.rule_id == CUSTOM_INVOKEDYNAMIC_BOOTSTRAP_RULE_ID));
+    }
+
+    #[test]
+    fn real_concealed_png_payload_loader_is_malicious() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sample = root.join("tests/realmods/resource-pack-hub-mc1.21.11.jar");
+        if !sample.is_file() {
+            // The real-mod corpus is local; the compiled synthetic fixture covers CI.
+            return;
+        }
+        let rules = RulesEngine::load_from_file(&root.join("config/rules.yaml"))
+            .expect("production rules load");
+        let outcome = scan_file(
+            &sample,
+            ScanLimits {
+                max_total_uncompressed_bytes: 200 * 1024 * 1024,
+                max_files_in_archive: 5_000,
+                max_nesting_depth: 3,
+                max_single_file_bytes: 50 * 1024 * 1024,
+            },
+            &rules,
+        );
+        assert_eq!(outcome.report.verdict, Verdict::Malicious);
+        assert!(outcome.report.findings.iter().any(|finding| {
+            finding.rule_id == super::super::packed_loader::RULE_ID
+                && finding.confidence == Confidence::High
+        }));
     }
 
     /// Real mods previously received false positives from isolated API, asset, and namespace facts.
@@ -5495,6 +5697,7 @@ mod tests {
             stack_origins: Vec::new(),
             return_origins: Vec::new(),
             array_elements: Vec::new(),
+            array_reads: Vec::new(),
             branch_conditions: Vec::new(),
         }
     }
